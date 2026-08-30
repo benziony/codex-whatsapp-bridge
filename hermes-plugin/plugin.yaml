@@ -1,0 +1,8 @@
+name: codex-whatsapp-bridge
+version: 0.1.0
+description: "Routes one dedicated WhatsApp chat to Codex while Hermes keeps owning WhatsApp connectivity and all unrelated traffic."
+author: Codex WhatsApp Bridge contributors
+kind: standalone
+platforms:
+  - macos
+

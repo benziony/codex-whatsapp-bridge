@@ -1,0 +1,1667 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index fede9adf49..111a9967ef 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -2909,6 +2909,7 @@ _RETRYABLE_ERROR_PATTERNS = (
+ # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
+ # ``None`` when the response was already delivered (e.g. via streaming).
+ MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
++ExclusiveInboundHandler = Callable[[MessageEvent], Awaitable[Union[bool, str]]]
+ 
+ 
+ def resolve_channel_prompt(
+@@ -3137,6 +3138,12 @@ class BasePlatformAdapter(ABC):
+         self.config = config
+         self.platform = platform
+         self._message_handler: Optional[MessageHandler] = None
++        # Optional runner-owned admission boundary for a core-configured,
++        # exact-chat exclusive claim. Platform adapters invoke this once per
++        # normalized native message, before any batching or session merging.
++        # ``True`` means the message was consumed (accepted or rejected) and
++        # must never enter the normal Hermes agent loop.
++        self._exclusive_inbound_handler: Optional[ExclusiveInboundHandler] = None
+         # Optional gateway-supplied fan-out for platform-native emoji
+         # reaction events (see ``set_reaction_handler``).
+         self._reaction_handler: Optional[
+@@ -3811,6 +3818,24 @@ class BasePlatformAdapter(ABC):
+         """
+         self._message_handler = handler
+ 
++    def set_exclusive_inbound_handler(
++        self,
++        handler: Optional[ExclusiveInboundHandler],
++    ) -> None:
++        """Install the runner-owned per-message exclusive admission boundary."""
++        self._exclusive_inbound_handler = handler
++
++    async def dispatch_exclusive_inbound(self, event: MessageEvent) -> bool:
++        """Return whether *event* was consumed by an exclusive claim.
++
++        Adapters must call this after normalizing one native message and before
++        any platform debounce/batching or :meth:`handle_message` call.
++        """
++        handler = getattr(self, "_exclusive_inbound_handler", None)
++        if handler is None:
++            return False
++        return await handler(event)
++
+     def set_platform_event_handler(
+         self,
+         handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
+@@ -4179,6 +4204,65 @@ class BasePlatformAdapter(ABC):
+     # property) so the stream consumer knows not to short-circuit.
+     REQUIRES_EDIT_FINALIZE: bool = False
+ 
++    # Whether this adapter can attach/retract emoji reactions on a message.
++    # Reactions are the lightweight "social acknowledgement" output channel —
++    # a participation primitive distinct from sending a message (a 👀 / 😂 /
++    # 👍 that says "seen / amused / agreed" without composing a reply). Most
++    # chat platforms support them, but with platform-specific call shapes, so
++    # the capability is advertised by this flag and normalized behind the two
++    # coroutines below. Adapters that implement reactions set this True; the
++    # default is False so callers (e.g. the ``send_message`` tool's ``react``
++    # action) can give a clean "not supported here" answer instead of probing
++    # for a method that may not exist.
++    SUPPORTS_REACTIONS: bool = False
++
++    async def add_reaction(
++        self,
++        chat_id: str,
++        emoji: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Attach an emoji reaction to a message in ``chat_id``.
++
++        This is the unified, cross-platform reaction contract. Each platform's
++        native reaction API differs (Signal needs the target author + Signal
++        timestamp; Telegram replaces all reactions in one call; Discord is
++        additive; WhatsApp routes through its bridge), so adapters normalize
++        their native call behind this signature.
++
++        Args:
++            chat_id: The chat/channel ID containing the target message.
++            emoji: The reaction emoji (e.g. "👀", "✅", "😂").
++            message_id: The target message ID. When ``None``, adapters that
++                track it react to the most recent inbound message in the chat
++                (the one being responded to); adapters that cannot resolve a
++                target without an explicit id return a ``success: False`` error.
++
++        Returns:
++            A dict with at least ``success: bool``; on failure it carries an
++            ``error`` string. The default implementation reports that the
++            platform does not support reactions.
++        """
++        return {
++            "success": False,
++            "error": f"{self.name} does not support message reactions",
++        }
++
++    async def remove_reaction(
++        self,
++        chat_id: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Retract a previously-added reaction (best-effort).
++
++        Mirror of :meth:`add_reaction`. The default is a no-op error for
++        adapters without reaction support.
++        """
++        return {
++            "success": False,
++            "error": f"{self.name} does not support message reactions",
++        }
++
+     async def create_handoff_thread(
+         self,
+         parent_chat_id: str,
+diff --git a/gateway/platforms/signal.py b/gateway/platforms/signal.py
+index 4e46f2b2b2..fb1cfd1cc5 100644
+--- a/gateway/platforms/signal.py
++++ b/gateway/platforms/signal.py
+@@ -282,6 +282,11 @@ class SignalAdapter(BasePlatformAdapter):
+     # square behind in chat clients when edit attempts fail.
+     SUPPORTS_MESSAGE_EDITING = False
+ 
++    # Native sendReaction (also drives the 👀/✅ processing-lifecycle hooks,
++    # gated by SIGNAL_REACTIONS). add_reaction below implements the unified
++    # cross-platform reaction contract for the agent.
++    SUPPORTS_REACTIONS = True
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.SIGNAL)
+ 
+@@ -1680,7 +1685,7 @@ class SignalAdapter(BasePlatformAdapter):
+     # Reactions
+     # ------------------------------------------------------------------
+ 
+-    async def send_reaction(
++    async def _send_reaction_raw(
+         self,
+         chat_id: str,
+         emoji: str,
+@@ -1713,7 +1718,7 @@ class SignalAdapter(BasePlatformAdapter):
+         logger.debug("Signal: sendReaction failed (chat=%s, emoji=%s)", chat_id[:20], emoji)
+         return False
+ 
+-    async def remove_reaction(
++    async def _remove_reaction_raw(
+         self,
+         chat_id: str,
+         target_author: str,
+@@ -1736,9 +1741,63 @@ class SignalAdapter(BasePlatformAdapter):
+         result = await self._rpc("sendReaction", params)
+         return result is not None
+ 
+-    # ------------------------------------------------------------------
+-    # Processing Lifecycle Hooks (reactions as progress indicators)
+-    # ------------------------------------------------------------------
++    async def add_reaction(
++        self,
++        chat_id: str,
++        emoji: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Unified reaction contract for Signal.
++
++        Signal addresses a message by (target_author, target_timestamp), not a
++        single opaque id, so the unified ``message_id`` is a composite token
++        ``"<author>:<timestamp_ms>"`` (as surfaced on inbound MessageEvents).
++        """
++        author, ts = self._parse_signal_message_id(message_id)
++        if not author or not ts:
++            return {
++                "success": False,
++                "error": "signal requires message_id as '<author>:<timestamp_ms>'",
++            }
++        ok = await self._send_reaction_raw(chat_id, emoji, author, ts)
++        return (
++            {"success": True, "message_id": message_id}
++            if ok
++            else {"success": False, "error": "signal sendReaction failed"}
++        )
++
++    async def remove_reaction(
++        self,
++        chat_id: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Unified reaction contract — retract a Signal reaction."""
++        author, ts = self._parse_signal_message_id(message_id)
++        if not author or not ts:
++            return {
++                "success": False,
++                "error": "signal requires message_id as '<author>:<timestamp_ms>'",
++            }
++        ok = await self._remove_reaction_raw(chat_id, author, ts)
++        return (
++            {"success": True, "message_id": message_id}
++            if ok
++            else {"success": False, "error": "signal remove reaction failed"}
++        )
++
++    @staticmethod
++    def _parse_signal_message_id(
++        message_id: Optional[str],
++    ) -> tuple[Optional[str], Optional[int]]:
++        """Split a composite ``"<author>:<timestamp_ms>"`` reaction target."""
++        if not message_id or ":" not in message_id:
++            return (None, None)
++        author, _, ts_raw = message_id.rpartition(":")
++        try:
++            return (author or None, int(ts_raw))
++        except (TypeError, ValueError):
++            return (None, None)
++
+ 
+     def _extract_reaction_target(self, event: MessageEvent) -> Optional[tuple]:
+         """Extract (target_author, target_timestamp) from a MessageEvent.
+@@ -1779,7 +1838,7 @@ class SignalAdapter(BasePlatformAdapter):
+             return
+         target = self._extract_reaction_target(event)
+         if target:
+-            await self.send_reaction(event.source.chat_id, "👀", *target)
++            await self._send_reaction_raw(event.source.chat_id, "👀", *target)
+ 
+     async def on_processing_complete(self, event: MessageEvent, outcome: "ProcessingOutcome") -> None:
+         """Swap the 👀 reaction for ✅ (success) or ❌ (failure).
+@@ -1796,11 +1855,11 @@ class SignalAdapter(BasePlatformAdapter):
+             return
+         chat_id = event.source.chat_id
+         # Remove the in-progress reaction, then add the final one
+-        await self.remove_reaction(chat_id, *target)
++        await self._remove_reaction_raw(chat_id, *target)
+         if outcome == ProcessingOutcome.SUCCESS:
+-            await self.send_reaction(chat_id, "✅", *target)
++            await self._send_reaction_raw(chat_id, "✅", *target)
+         elif outcome == ProcessingOutcome.FAILURE:
+-            await self.send_reaction(chat_id, "❌", *target)
++            await self._send_reaction_raw(chat_id, "❌", *target)
+ 
+     # ------------------------------------------------------------------
+     # Chat Info
+diff --git a/gateway/run.py b/gateway/run.py
+index 6c7838398b..405fc12045 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -13397,6 +13397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             adapter.set_message_handler(self._primary_message_handler())
+             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+             adapter.set_session_store(self.session_store)
++            self._configure_exclusive_inbound(adapter)
+             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+             _set_reaction = getattr(adapter, "set_reaction_handler", None)
+             if callable(_set_reaction):
+@@ -15201,6 +15202,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     adapter.set_message_handler(self._primary_message_handler())
+                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+                     adapter.set_session_store(self.session_store)
++                    self._configure_exclusive_inbound(adapter)
+                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
+                     if callable(_set_reaction):
+@@ -16303,6 +16305,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         _set_owner = getattr(adapter, "set_owner_profile", None)
+         if callable(_set_owner):
+             _set_owner(profile_name)
++        self._configure_exclusive_inbound(adapter, profile_name=profile_name)
+         adapter.set_busy_session_handler(
+             self._make_profile_busy_session_handler(profile_name)
+         )
+@@ -16703,6 +16706,187 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+         return _handler
+ 
++    @staticmethod
++    def _exclusive_inbound_claim(adapter: BasePlatformAdapter) -> Optional[dict]:
++        """Validate and return one adapter-scoped exclusive inbound claim."""
++        extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
++        raw = extra.get("exclusive_inbound")
++        if raw is None:
++            return None
++        if not isinstance(raw, dict):
++            raise ValueError("platform extra.exclusive_inbound must be a mapping")
++        chat_id = raw.get("chat_id")
++        handler = raw.get("handler")
++        if not isinstance(chat_id, str) or not chat_id.strip():
++            raise ValueError("exclusive_inbound.chat_id must be a non-empty string")
++        if not isinstance(handler, str) or not handler.strip():
++            raise ValueError("exclusive_inbound.handler must be a non-empty string")
++        allowed_senders = raw.get("allowed_senders")
++        if allowed_senders is not None and (
++            not isinstance(allowed_senders, list)
++            or not allowed_senders
++            or any(not isinstance(item, str) or not item.strip() for item in allowed_senders)
++        ):
++            raise ValueError(
++                "exclusive_inbound.allowed_senders must be a non-empty list of strings"
++            )
++        failure_message = raw.get("failure_message")
++        if failure_message is not None and (
++            not isinstance(failure_message, str) or not failure_message.strip()
++        ):
++            raise ValueError(
++                "exclusive_inbound.failure_message must be a non-empty string"
++            )
++        return {
++            "chat_id": chat_id.strip(),
++            "handler": handler.strip(),
++            "allowed_senders": (
++                {item.strip().lower() for item in allowed_senders}
++                if isinstance(allowed_senders, list)
++                else None
++            ),
++            "failure_message": (
++                failure_message.strip()
++                if isinstance(failure_message, str)
++                else "This message could not be accepted by the configured "
++                "inbound handler. Please try again or check Hermes."
++            ),
++        }
++
++    async def _send_exclusive_inbound_failure(
++        self,
++        adapter: BasePlatformAdapter,
++        event: MessageEvent,
++        message: str,
++    ) -> None:
++        """Best-effort visible failure for a consumed exclusive message."""
++        try:
++            result = await adapter.send(
++                event.source.chat_id,
++                message,
++                reply_to=event.message_id,
++            )
++            if not getattr(result, "success", False):
++                logger.error(
++                    "Exclusive inbound failure notice could not be sent on %s/%s: %s",
++                    adapter.platform.value,
++                    event.source.chat_id,
++                    getattr(result, "error", "unknown error"),
++                )
++        except Exception:
++            logger.exception(
++                "Exclusive inbound failure notice raised on %s/%s",
++                adapter.platform.value,
++                event.source.chat_id,
++            )
++
++    def _configure_exclusive_inbound(
++        self,
++        adapter: BasePlatformAdapter,
++        *,
++        profile_name: Optional[str] = None,
++    ) -> None:
++        """Install one exact-chat, runner-owned exclusive admission boundary."""
++        claim = self._exclusive_inbound_claim(adapter)
++        setter = getattr(adapter, "set_exclusive_inbound_handler", None)
++        if not callable(setter):
++            if claim is not None:
++                raise TypeError(
++                    "adapter with exclusive_inbound config does not support "
++                    "per-message admission"
++                )
++            return
++        if claim is None:
++            setter(None)
++            return
++
++        transport_home = Path(get_hermes_home())
++        if profile_name:
++            try:
++                from hermes_cli.profiles import get_profile_dir
++
++                transport_home = Path(get_profile_dir(profile_name))
++            except Exception:
++                logger.warning(
++                    "Could not resolve profile home for exclusive inbound claim: %s",
++                    profile_name,
++                    exc_info=True,
++                )
++
++        async def _handler(event: MessageEvent) -> bool:
++            source = event.source
++            if str(getattr(source, "chat_id", "")) != claim["chat_id"]:
++                return False
++
++            # A matched claim is always consumed. Missing plugins, collisions,
++            # callback failures, and authorization failures can never fall
++            # through into the normal Hermes agent loop.
++            source._authorization_profile_home = transport_home
++            if profile_name and not getattr(source, "profile", None):
++                source.profile = profile_name
++
++            with _profile_runtime_scope(transport_home):
++                claim_sender_allowed = (
++                    claim["allowed_senders"] is not None
++                    and str(getattr(source, "user_id", "")).strip().lower()
++                    in claim["allowed_senders"]
++                )
++                if not claim_sender_allowed and not self._is_user_authorized_for_source(source):
++                    logger.warning(
++                        "Unauthorized sender dropped from exclusive inbound claim "
++                        "on %s/%s",
++                        adapter.platform.value,
++                        source.chat_id,
++                    )
++                    return True
++
++                from hermes_cli.plugins import get_plugin_manager
++
++                callbacks = get_plugin_manager().iter_exclusive_inbound_handlers(
++                    claim["handler"]
++                )
++                if len(callbacks) != 1:
++                    logger.error(
++                        "Exclusive inbound handler %s has %d registrations for %s/%s",
++                        claim["handler"],
++                        len(callbacks),
++                        adapter.platform.value,
++                        source.chat_id,
++                    )
++                    await self._send_exclusive_inbound_failure(
++                        adapter, event, claim["failure_message"]
++                    )
++                    return True
++
++                try:
++                    accepted = callbacks[0](event)
++                    if not inspect.isawaitable(accepted):
++                        raise TypeError(
++                            "exclusive inbound handler must return an awaitable"
++                        )
++                    accepted = await accepted
++                    if isinstance(accepted, str) and accepted.strip():
++                        await self._send_exclusive_inbound_failure(
++                            adapter, event, accepted.strip()[:500]
++                        )
++                    elif accepted is not True:
++                        raise RuntimeError(
++                            "exclusive inbound handler did not durably accept message"
++                        )
++                except Exception:
++                    logger.exception(
++                        "Exclusive inbound handler %s failed for %s/%s",
++                        claim["handler"],
++                        adapter.platform.value,
++                        source.chat_id,
++                    )
++                    await self._send_exclusive_inbound_failure(
++                        adapter, event, claim["failure_message"]
++                    )
++                return True
++
++        setter(_handler)
++
+     def _is_user_authorized_for_source(
+         self,
+         source: SessionSource,
+@@ -16989,9 +17173,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             return self._is_user_authorized(source)
+         return check
+ 
++    def is_user_authorized(self, source: SessionSource) -> bool:
++        """Public, transport-profile-safe authorization wrapper for plugins.
+ 
+-
+-
++        ``pre_gateway_dispatch`` hooks run before normal gateway authorization.
++        Plugins that make an early trust decision can use this wrapper without
++        accidentally authorizing against a routed multiplex profile instead of
++        the profile that owns the inbound transport.
++        """
++        return self._is_user_authorized_for_source(source)
+ 
+ 
+     async def _deliver_platform_notice(self, source, content: str) -> None:
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 9028e28530..cb51614512 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -3409,6 +3409,38 @@ class PluginContext:
+         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
+         return handle
+ 
++    def register_exclusive_inbound_handler(
++        self,
++        name: str,
++        callback: Callable,
++    ) -> PluginRegistration:
++        """Register a named async admission for an exclusive inbound claim.
++
++        Core configuration owns which exact chat is claimed. A plugin owns
++        only durable admission of the normalized message. Multiple callbacks
++        remain visible so the runner can detect a collision and fail closed.
++        """
++        key = str(name or "").strip()
++        if not key:
++            raise ValueError("exclusive inbound handler name must not be empty")
++        if not callable(callback):
++            raise TypeError("exclusive inbound handler callback must be callable")
++        callbacks = self._manager._exclusive_inbound_handlers.setdefault(key, [])
++        callbacks.append(callback)
++        handle = self._track(
++            "exclusive_inbound_handler",
++            key,
++            lambda: self._manager._remove_callback(
++                self._manager._exclusive_inbound_handlers, key, callback
++            ),
++        )
++        logger.debug(
++            "Plugin %s registered exclusive inbound handler: %s",
++            self.manifest.name,
++            key,
++        )
++        return handle
++
+     def register_system_prompt_section(
+         self,
+         id: str,
+@@ -3747,6 +3779,10 @@ class PluginManager:
+         self._discovery_lock = threading.RLock()
+         self._plugins: Dict[str, LoadedPlugin] = {}
+         self._hooks: Dict[str, List[Callable]] = {}
++        # Named async admissions for core-configured exclusive inbound claims.
++        # Lists are intentional: the runner detects duplicate registrations
++        # and fails the claimed chat closed instead of choosing by load order.
++        self._exclusive_inbound_handlers: Dict[str, List[Callable]] = {}
+         self._middleware: Dict[str, List[Callable]] = {}
+         self._plugin_tool_names: Set[str] = set()
+         self._plugin_platform_names: Set[str] = set()
+@@ -4168,6 +4204,7 @@ class PluginManager:
+             self._ownership_ledger.clear()
+             self._plugins.clear()
+             self._hooks.clear()
++            self._exclusive_inbound_handlers.clear()
+             self._middleware.clear()
+             self._plugin_tool_names.clear()
+             self._plugin_platform_names.clear()
+@@ -5903,6 +5940,10 @@ class PluginManager:
+         """Return a stable snapshot of callbacks registered for a hook."""
+         return tuple(self._hooks.get(hook_name, ()))
+ 
++    def iter_exclusive_inbound_handlers(self, name: str) -> tuple[Callable, ...]:
++        """Return a stable snapshot of callbacks registered for *name*."""
++        return tuple(self._exclusive_inbound_handlers.get(name, ()))
++
+     def render_system_prompt_sections(
+         self, session_info: Mapping[str, Any]
+     ) -> List[RenderedPluginSystemPromptSection]:
+diff --git a/plugins/platforms/photon/adapter.py b/plugins/platforms/photon/adapter.py
+index 306e279802..f2dbaac460 100644
+--- a/plugins/platforms/photon/adapter.py
++++ b/plugins/platforms/photon/adapter.py
+@@ -720,6 +720,10 @@ class PhotonAdapter(BasePlatformAdapter):
+     # of leaving a stale tofu square (▉) behind when edit attempts fail.
+     SUPPORTS_MESSAGE_EDITING = False
+ 
++    # iMessage tapbacks via the sidecar's /react endpoint; add_reaction /
++    # remove_reaction already implement the unified base contract below.
++    SUPPORTS_REACTIONS = True
++
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform("photon"))
+         extra = config.extra or {}
+diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
+index c782bfe8be..2d6320696d 100644
+--- a/plugins/platforms/telegram/adapter.py
++++ b/plugins/platforms/telegram/adapter.py
+@@ -589,6 +589,11 @@ class TelegramAdapter(BasePlatformAdapter):
+     MAX_MESSAGE_LENGTH = 4096
+     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
+     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
++
++    # Native set_message_reaction (gated separately by TELEGRAM_REACTIONS for
++    # the automatic processing-lifecycle 👀/👍 indicators; add_reaction below
++    # implements the unified cross-platform reaction contract for the agent).
++    SUPPORTS_REACTIONS = True
+     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
+     # UTF-8 characters. Content above this is sent via the legacy chunking path.
+     RICH_MESSAGE_MAX_CHARS = 32768
+@@ -10859,6 +10864,49 @@ class TelegramAdapter(BasePlatformAdapter):
+         """Check if message reactions are enabled via config/env."""
+         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+ 
++    async def add_reaction(
++        self,
++        chat_id: str,
++        emoji: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Unified reaction contract — set a single emoji reaction on a message.
++
++        Telegram replaces all bot-set reactions in one call, so this maps
++        directly onto ``set_message_reaction``. A ``message_id`` is required
++        (Telegram has no "react to the latest message" affordance); callers
++        pass the id of the message being reacted to.
++        """
++        if not message_id:
++            return {
++                "success": False,
++                "error": "telegram requires an explicit message_id to react",
++            }
++        ok = await self._set_reaction(chat_id, message_id, emoji)
++        return (
++            {"success": True, "message_id": message_id}
++            if ok
++            else {"success": False, "error": "telegram set_message_reaction failed"}
++        )
++
++    async def remove_reaction(
++        self,
++        chat_id: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Unified reaction contract — clear bot-set reactions from a message."""
++        if not message_id:
++            return {
++                "success": False,
++                "error": "telegram requires an explicit message_id to unreact",
++            }
++        ok = await self._clear_reactions(chat_id, message_id)
++        return (
++            {"success": True, "message_id": message_id}
++            if ok
++            else {"success": False, "error": "telegram clear reactions failed"}
++        )
++
+     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+         """Set a single emoji reaction on a Telegram message."""
+         if not self._bot:
+diff --git a/plugins/platforms/whatsapp/adapter.py b/plugins/platforms/whatsapp/adapter.py
+index 282cb7c0cb..f950a42877 100644
+--- a/plugins/platforms/whatsapp/adapter.py
++++ b/plugins/platforms/whatsapp/adapter.py
+@@ -1029,6 +1029,65 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+         except Exception as e:
+             return SendResult(success=False, error=str(e))
+ 
++    # ------------------------------------------------------------------
++    # Reactions (unified cross-platform contract — see BasePlatformAdapter)
++    # ------------------------------------------------------------------
++    # Baileys natively supports reactions via
++    # ``sock.sendMessage(jid, { react: { text, key } })``. The bridge's
++    # ``/react`` endpoint resolves the original message from its bounded,
++    # TTL'd message store (populated as inbound + sent messages flow through,
++    # so the group ``participant`` on the key survives) and forwards the call.
++    # This is the same store the ``whatsapp_action`` tool reacts through.
++    SUPPORTS_REACTIONS = True
++
++    async def _bridge_react(
++        self,
++        chat_id: str,
++        message_id: Optional[str],
++        emoji: str,
++    ) -> Dict[str, Any]:
++        """POST to the bridge ``/react`` endpoint (emoji='' clears)."""
++        if not self._running or not self._http_session:
++            return {"success": False, "error": "Not connected"}
++        if not message_id:
++            return {"success": False, "error": "message_id is required to react"}
++        bridge_exit = await self._check_managed_bridge_exit()
++        if bridge_exit:
++            return {"success": False, "error": bridge_exit}
++        try:
++            import aiohttp
++            async with self._http_session.post(
++                f"http://127.0.0.1:{self._bridge_port}/react",
++                json={
++                    "chatId": to_whatsapp_jid(chat_id),
++                    "messageId": message_id,
++                    "emoji": emoji,
++                },
++                timeout=aiohttp.ClientTimeout(total=15),
++            ) as resp:
++                if resp.status == 200:
++                    return {"success": True}
++                return {"success": False, "error": await resp.text()}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    async def add_reaction(
++        self,
++        chat_id: str,
++        emoji: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Attach an emoji reaction to a message via the Baileys bridge."""
++        return await self._bridge_react(chat_id, message_id, emoji)
++
++    async def remove_reaction(
++        self,
++        chat_id: str,
++        message_id: Optional[str] = None,
++    ) -> Dict[str, Any]:
++        """Retract a reaction (Baileys clears with an empty reaction text)."""
++        return await self._bridge_react(chat_id, message_id, "")
++
+     async def _send_media_to_bridge(
+         self,
+         chat_id: str,
+@@ -1348,10 +1407,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+                         for msg_data in messages:
+                             event = await self._build_message_event(msg_data)
+                             if event:
++                                # Preserve one native message per exclusive
++                                # admission. This must precede WhatsApp text
++                                # debounce and BasePlatformAdapter's active-
++                                # session merging so quote/message identity is
++                                # never coalesced into another delivery.
++                                # Poll updates are native Hermes interaction
++                                # traffic, not ordinary inbox messages. Keep
++                                # them on the stock WhatsApp path even when the
++                                # containing chat has an exclusive text/media
++                                # claim.
++                                native_type = str(
++                                    (event.metadata or {}).get("whatsapp_native_type") or ""
++                                ).lower()
++                                is_poll_update = native_type.startswith("poll")
++                                claimed = (
++                                    False
++                                    if is_poll_update
++                                    else await self.dispatch_exclusive_inbound(event)
++                                )
+                                 # Fire-and-forget: a slow bridge /read must not
+                                 # delay message dispatch (matches BlueBubbles
+                                 # asyncio.create_task pattern for mark_read).
+                                 asyncio.create_task(self._send_read_receipt(msg_data))
++                                if claimed:
++                                    continue
+                                 if event.message_type == MessageType.TEXT:
+                                     self._enqueue_text_event(event)
+                                 else:
+@@ -1615,7 +1695,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+                         except Exception as e:
+                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
+ 
+-            metadata: Dict[str, Any] = {}
++            metadata: Dict[str, Any] = {
++                "whatsapp_original_body": str(data.get("body") or ""),
++            }
+             native_type = str(data.get("nativeType") or "").strip()
+             native_metadata = data.get("nativeMetadata")
+             if native_type:
+diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.js
+index 234cbef279..adff15b522 100644
+--- a/scripts/whatsapp-bridge/bridge.js
++++ b/scripts/whatsapp-bridge/bridge.js
+@@ -9,6 +9,7 @@
+  *   GET  /messages       - Long-poll for new incoming messages
+  *   POST /send           - Send a message { chatId, message, replyTo? }
+  *   POST /edit           - Edit a sent message { chatId, messageId, message }
++ *   POST /react          - React to a message { chatId, messageId, emoji, participant? }
+  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
+  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
+  *   POST /typing         - Send typing indicator { chatId }
+@@ -46,6 +47,7 @@ import {
+   mediaPayloadForFile,
+   pollCreationMessageFromPayload,
+   pollUpdateForAggregation,
++  resolveReactionTarget,
+ } from './bridge_helpers.js';
+ 
+ // Parse CLI args
+@@ -892,6 +894,28 @@ app.post('/edit', async (req, res) => {
+   }
+ });
+ 
++// React to a normal WhatsApp message cached by the bridge.
++// Pass an empty `emoji` ("") to retract a previously-sent reaction.
++app.post('/react', async (req, res) => {
++  if (!sock || connectionState !== 'connected') {
++    return res.status(503).json({ error: 'Not connected to WhatsApp' });
++  }
++  const { chatId, messageId, emoji, participant } = req.body;
++  if (!chatId || !messageId || emoji === undefined) {
++    return res.status(400).json({ error: 'chatId, messageId, and emoji are required' });
++  }
++  const target = resolveReactionTarget({ messageStore, chatId, messageId, participant });
++  if (!target.ok) return res.status(target.status).json({ error: target.error });
++  try {
++    const sent = await sock.sendMessage(chatId, { react: { text: emoji, key: target.key } });
++    trackSentMessageId(sent);
++    res.json({ success: true, messageId: sent?.key?.id });
++  } catch (err) {
++    res.status(500).json({ error: err.message });
++  }
++});
++
++
+ // Send media (image, video, document) natively
+ app.post('/send-media', async (req, res) => {
+   if (!sock || connectionState !== 'connected') {
+@@ -1114,12 +1138,15 @@ app.get('/health', (req, res) => {
+   });
+ });
+ 
+-// Start
+-if (PAIR_ONLY) {
++// Start when executed directly. Keep imports side-effect-light so the bridge's
++// node:test harness can import the message-store helpers without binding a port.
++const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
++
++if (isMain && PAIR_ONLY) {
+   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
+   if (PAIR_JSON) {
+     emitPairEvent({ event: 'started', session: SESSION_DIR });
+-  } else {
++  } else if (isMain) {
+     console.log('📱 WhatsApp pairing mode');
+     console.log(`📁 Session: ${SESSION_DIR}`);
+     console.log();
+@@ -1131,7 +1158,7 @@ if (PAIR_ONLY) {
+     }
+     process.exit(1);
+   });
+-} else {
++} else if (isMain) {
+   app.listen(PORT, '127.0.0.1', () => {
+     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
+     console.log(`📁 Session stored in: ${SESSION_DIR}`);
+diff --git a/scripts/whatsapp-bridge/bridge.test.mjs b/scripts/whatsapp-bridge/bridge.test.mjs
+new file mode 100644
+index 0000000000..ee9e37396f
+--- /dev/null
++++ b/scripts/whatsapp-bridge/bridge.test.mjs
+@@ -0,0 +1,100 @@
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++
++import { createBoundedMessageStore, resolveReactionTarget } from './bridge_helpers.js';
++
++const chatId = '5215550000013@s.whatsapp.net';
++const groupId = '120363000000000000@g.us';
++
++function textMessage(id, remoteJid = chatId, extra = {}) {
++  return {
++    key: { id, remoteJid, fromMe: false, ...extra },
++    message: { conversation: 'hola' },
++    messageTimestamp: 1710000000,
++  };
++}
++
++// The /react endpoint resolves the reaction target from the shared bounded
++// message store by id — Baileys needs the ORIGINAL message key (including the
++// group `participant`) to attach a reaction, so these tests pin the store
++// behavior /react depends on.
++
++test('store remembers and resolves a message by id', () => {
++  const store = createBoundedMessageStore(8);
++  const msg = textMessage('orig-1');
++  store.remember(msg);
++  assert.equal(store.get('orig-1'), msg);
++});
++
++test('store returns null for an unknown message id', () => {
++  const store = createBoundedMessageStore(8);
++  assert.equal(store.get('missing'), null);
++});
++
++test('stored group message retains participant on its key (needed for reactions)', () => {
++  const store = createBoundedMessageStore(8);
++  const msg = textMessage('grp-1', groupId, { participant: '5215550000023@s.whatsapp.net' });
++  store.remember(msg);
++  const resolved = store.get('grp-1');
++  assert.equal(resolved.key.participant, '5215550000023@s.whatsapp.net');
++  assert.equal(resolved.key.remoteJid, groupId);
++});
++
++test('store ignores messages without a usable key', () => {
++  const store = createBoundedMessageStore(8);
++  store.remember({ message: { conversation: 'no key' } });
++  store.remember(null);
++  assert.equal(store.get(''), null);
++});
++
++test('LRU eviction drops the oldest message once over capacity', () => {
++  const store = createBoundedMessageStore(2);
++  store.remember(textMessage('a'));
++  store.remember(textMessage('b'));
++  store.remember(textMessage('c'));
++  assert.equal(store.get('a'), null); // evicted
++  assert.ok(store.get('b'));
++  assert.ok(store.get('c'));
++});
++
++test('reaction lookup rejects a cached message from another chat', () => {
++  const store = createBoundedMessageStore(8);
++  store.remember(textMessage('same-id', chatId));
++  const result = resolveReactionTarget({
++    messageStore: store,
++    chatId: groupId,
++    messageId: 'same-id',
++    participant: '5215550000023@s.whatsapp.net',
++  });
++  assert.equal(result.ok, false);
++  assert.equal(result.status, 409);
++});
++
++test('durable group target survives cache eviction with participant intact', () => {
++  const store = createBoundedMessageStore(1);
++  store.remember(textMessage('old', groupId, { participant: '5215550000023@s.whatsapp.net' }));
++  store.remember(textMessage('new', groupId, { participant: '5215550000024@s.whatsapp.net' }));
++  const result = resolveReactionTarget({
++    messageStore: store,
++    chatId: groupId,
++    messageId: 'old',
++    participant: '5215550000023@s.whatsapp.net',
++  });
++  assert.equal(result.ok, true);
++  assert.deepEqual(result.key, {
++    id: 'old',
++    remoteJid: groupId,
++    fromMe: false,
++    participant: '5215550000023@s.whatsapp.net',
++  });
++});
++
++test('uncached group target fails closed without a participant', () => {
++  const result = resolveReactionTarget({
++    messageStore: createBoundedMessageStore(8),
++    chatId: groupId,
++    messageId: 'missing',
++  });
++  assert.equal(result.ok, false);
++  assert.equal(result.status, 404);
++});
+diff --git a/scripts/whatsapp-bridge/bridge_helpers.js b/scripts/whatsapp-bridge/bridge_helpers.js
+index 398521feee..c8299bcc43 100644
+--- a/scripts/whatsapp-bridge/bridge_helpers.js
++++ b/scripts/whatsapp-bridge/bridge_helpers.js
+@@ -65,6 +65,39 @@ export function createBoundedMessageStore(limit = 512) {
+   return { remember, get };
+ }
+ 
++export function resolveReactionTarget({ messageStore, chatId, messageId, participant = null }) {
++  const normalizedChat = normalizeWhatsAppId(chatId);
++  const normalizedParticipant = normalizeWhatsAppId(participant);
++  if (!normalizedChat || !messageId) {
++    return { ok: false, status: 400, error: 'chatId and messageId are required' };
++  }
++
++  const cached = messageStore?.get(messageId) || null;
++  if (cached) {
++    const cachedChat = normalizeWhatsAppId(cached.key?.remoteJid);
++    if (!cachedChat || cachedChat !== normalizedChat) {
++      return { ok: false, status: 409, error: 'Referenced message belongs to another chat' };
++    }
++    return { ok: true, key: cached.key };
++  }
++
++  // The Codex broker retains the exact inbound chat/message/participant tuple
++  // until its delayed receipt is delivered. That durable tuple is a safe
++  // fallback after a bridge restart or bounded-cache eviction.
++  if (normalizedChat.endsWith('@g.us') && !normalizedParticipant) {
++    return { ok: false, status: 404, error: 'Group reaction target is missing its participant' };
++  }
++  return {
++    ok: true,
++    key: {
++      id: String(messageId),
++      remoteJid: normalizedChat,
++      fromMe: false,
++      ...(normalizedParticipant ? { participant: normalizedParticipant } : {}),
++    },
++  };
++}
++
+ export function pollCreationMessageSecret(pollCreation) {
+   return pollCreation?.message?.messageContextInfo?.messageSecret
+     || pollCreation?.messageContextInfo?.messageSecret
+diff --git a/tests/gateway/test_exclusive_inbound.py b/tests/gateway/test_exclusive_inbound.py
+new file mode 100644
+index 0000000000..bbcc3e4f25
+--- /dev/null
++++ b/tests/gateway/test_exclusive_inbound.py
+@@ -0,0 +1,235 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from gateway.platforms.base import MessageEvent, Platform, SessionSource
++from gateway.run import GatewayRunner
++from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
++
++
++class _Adapter:
++    platform = Platform.WHATSAPP
++
++    def __init__(self, claim):
++        self.config = SimpleNamespace(extra={"exclusive_inbound": claim})
++        self.exclusive_handler = None
++        self.send = AsyncMock(
++            return_value=SimpleNamespace(success=True, error=None)
++        )
++
++    def set_exclusive_inbound_handler(self, handler):
++        self.exclusive_handler = handler
++
++
++def _event(chat_id="codex@g.us", user_id="15551234567", message_id="m1"):
++    return MessageEvent(
++        text="hello",
++        source=SessionSource(
++            platform=Platform.WHATSAPP,
++            chat_id=chat_id,
++            chat_type="group",
++            user_id=user_id,
++        ),
++        message_id=message_id,
++    )
++
++
++def _runner(authorized=True):
++    runner = object.__new__(GatewayRunner)
++    runner._is_user_authorized_for_source = MagicMock(return_value=authorized)
++    return runner
++
++
++def _claim():
++    return {"chat_id": "codex@g.us", "handler": "codex_bridge"}
++
++
++def _sender_claim():
++    return {
++        "chat_id": "codex@g.us",
++        "handler": "codex_bridge",
++        "allowed_senders": ["15551234567"],
++    }
++
++
++@pytest.mark.asyncio
++async def test_unrelated_chat_falls_through_without_auth_or_plugin(monkeypatch):
++    runner = _runner()
++    adapter = _Adapter(_claim())
++    get_manager = MagicMock()
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
++
++    runner._configure_exclusive_inbound(adapter)
++
++    assert await adapter.exclusive_handler(_event(chat_id="other@g.us")) is False
++    runner._is_user_authorized_for_source.assert_not_called()
++    get_manager.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_exact_chat_awaits_one_registered_durable_admission(monkeypatch):
++    runner = _runner()
++    adapter = _Adapter(_claim())
++    manager = PluginManager()
++    context = PluginContext(PluginManifest(name="bridge"), manager)
++    admitted = []
++
++    async def accept(event):
++        admitted.append(event.message_id)
++        return True
++
++    context.register_exclusive_inbound_handler("codex_bridge", accept)
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
++    runner._configure_exclusive_inbound(adapter)
++
++    event = _event()
++    assert await adapter.exclusive_handler(event) is True
++    assert admitted == ["m1"]
++    assert event.source._authorization_profile_home is not None
++    adapter.send.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_claim_sender_allowlist_authorizes_without_broad_gateway_grant(monkeypatch):
++    runner = _runner(authorized=False)
++    adapter = _Adapter(_sender_claim())
++    manager = PluginManager()
++    context = PluginContext(PluginManifest(name="bridge"), manager)
++    admitted = []
++
++    async def accept(event):
++        admitted.append(event.message_id)
++        return True
++
++    context.register_exclusive_inbound_handler("codex_bridge", accept)
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
++    runner._configure_exclusive_inbound(adapter)
++
++    assert await adapter.exclusive_handler(_event()) is True
++    assert admitted == ["m1"]
++
++
++@pytest.mark.asyncio
++async def test_claim_sender_allowlist_still_drops_other_sender(monkeypatch):
++    runner = _runner(authorized=False)
++    adapter = _Adapter(_sender_claim())
++    get_manager = MagicMock()
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
++    runner._configure_exclusive_inbound(adapter)
++
++    assert await adapter.exclusive_handler(_event(user_id="19990000000")) is True
++    get_manager.assert_not_called()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", ["missing", "duplicate", "raises", "rejects", "sync"])
++async def test_claimed_chat_fails_closed_when_handler_is_unavailable(
++    monkeypatch, mode
++):
++    runner = _runner()
++    adapter = _Adapter(_claim())
++    manager = PluginManager()
++    context = PluginContext(PluginManifest(name="bridge"), manager)
++
++    async def accept(_event):
++        return True
++
++    async def raises(_event):
++        raise RuntimeError("boom")
++
++    async def rejects(_event):
++        return False
++
++    if mode == "duplicate":
++        context.register_exclusive_inbound_handler("codex_bridge", accept)
++        context.register_exclusive_inbound_handler("codex_bridge", accept)
++    elif mode == "raises":
++        context.register_exclusive_inbound_handler("codex_bridge", raises)
++    elif mode == "rejects":
++        context.register_exclusive_inbound_handler("codex_bridge", rejects)
++    elif mode == "sync":
++        context.register_exclusive_inbound_handler(
++            "codex_bridge", lambda _event: True
++        )
++
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
++    runner._configure_exclusive_inbound(adapter)
++
++    assert await adapter.exclusive_handler(_event()) is True
++    adapter.send.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_handler_can_return_bounded_visible_rejection(monkeypatch):
++    runner = _runner()
++    adapter = _Adapter(_claim())
++    manager = PluginManager()
++    context = PluginContext(PluginManifest(name="bridge"), manager)
++
++    async def reject(_event):
++        return "That quoted Codex message is unknown or expired."
++
++    context.register_exclusive_inbound_handler("codex_bridge", reject)
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
++    runner._configure_exclusive_inbound(adapter)
++
++    assert await adapter.exclusive_handler(_event()) is True
++    assert adapter.send.await_args.args[1] == (
++        "That quoted Codex message is unknown or expired."
++    )
++
++
++@pytest.mark.asyncio
++async def test_unauthorized_claim_is_consumed_without_invoking_plugin(monkeypatch):
++    runner = _runner(authorized=False)
++    adapter = _Adapter(_claim())
++    get_manager = MagicMock()
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
++    runner._configure_exclusive_inbound(adapter)
++
++    assert await adapter.exclusive_handler(_event()) is True
++    get_manager.assert_not_called()
++    adapter.send.assert_not_awaited()
++
++
++@pytest.mark.parametrize(
++    "claim",
++    [
++        None,
++        [],
++        {},
++        {"chat_id": "codex@g.us"},
++        {"handler": "bridge"},
++        {"chat_id": "codex@g.us", "handler": "bridge", "allowed_senders": []},
++    ],
++)
++def test_malformed_claim_is_rejected_at_adapter_configuration(claim):
++    runner = _runner()
++    adapter = _Adapter(claim)
++    if claim is None:
++        adapter.config.extra["exclusive_inbound"] = None
++        runner._configure_exclusive_inbound(adapter)
++        assert adapter.exclusive_handler is None
++    else:
++        with pytest.raises(ValueError):
++            runner._configure_exclusive_inbound(adapter)
++
++
++def test_registration_cleanup_removes_handler():
++    manager = PluginManager()
++    context = PluginContext(PluginManifest(name="bridge"), manager)
++
++    async def accept(_event):
++        return True
++
++    registration = context.register_exclusive_inbound_handler(
++        "codex_bridge", accept
++    )
++    assert manager.iter_exclusive_inbound_handlers("codex_bridge") == (accept,)
++
++    registration.dispose()
++
++    assert manager.iter_exclusive_inbound_handlers("codex_bridge") == ()
+diff --git a/tests/gateway/test_pre_gateway_dispatch.py b/tests/gateway/test_pre_gateway_dispatch.py
+index a52194e51b..6377e56657 100644
+--- a/tests/gateway/test_pre_gateway_dispatch.py
++++ b/tests/gateway/test_pre_gateway_dispatch.py
+@@ -60,6 +60,18 @@ def _make_runner(platform: Platform):
+     return runner, adapter
+ 
+ 
++def test_public_auth_wrapper_uses_transport_profile_safe_boundary():
++    """Plugin auth never bypasses multiplex transport-profile resolution."""
++    from gateway.run import GatewayRunner
++
++    runner = object.__new__(GatewayRunner)
++    runner._is_user_authorized_for_source = MagicMock(return_value=True)
++    source = _make_event().source
++
++    assert runner.is_user_authorized(source) is True
++    runner._is_user_authorized_for_source.assert_called_once_with(source)
++
++
+ @pytest.mark.asyncio
+ async def test_internal_events_bypass_hook(monkeypatch):
+     """Internal events (event.internal=True) skip the plugin hook entirely."""
+diff --git a/tests/gateway/test_unified_reactions_contract.py b/tests/gateway/test_unified_reactions_contract.py
+new file mode 100644
+index 0000000000..f1246c9c83
+--- /dev/null
++++ b/tests/gateway/test_unified_reactions_contract.py
+@@ -0,0 +1,83 @@
++"""Unified cross-platform reaction contract (BasePlatformAdapter).
++
++Pins the *invariants* of the reaction channel rather than any single platform's
++wire format:
++
++  * The base adapter always defines add_reaction / remove_reaction (so callers
++    never have to probe for method existence), defaulting to a structured
++    "not supported" result gated by SUPPORTS_REACTIONS=False.
++  * Adapters that advertise SUPPORTS_REACTIONS=True override both coroutines and
++    keep the unified add_reaction(self, chat_id, emoji, message_id=None)
++    signature, returning a dict carrying ``success``.
++  * Signal's composite "<author>:<timestamp_ms>" message-id parsing round-trips.
++"""
++
++import asyncio
++import inspect
++
++import pytest
++
++from gateway.platforms.base import BasePlatformAdapter
++
++
++def _run(coro):
++    return asyncio.new_event_loop().run_until_complete(coro)
++
++
++def test_base_defines_reaction_methods():
++    assert inspect.iscoroutinefunction(BasePlatformAdapter.add_reaction)
++    assert inspect.iscoroutinefunction(BasePlatformAdapter.remove_reaction)
++    assert BasePlatformAdapter.SUPPORTS_REACTIONS is False
++
++
++def test_default_reaction_is_structured_not_supported():
++    # Call the base coroutines directly without instantiating the ABC — the
++    # default implementation only reads ``self.name``.
++    fake = type("X", (), {"name": "bare"})()
++    add = _run(BasePlatformAdapter.add_reaction(fake, "chat", "👍", "m1"))
++    rem = _run(BasePlatformAdapter.remove_reaction(fake, "chat", "m1"))
++    for res in (add, rem):
++        assert isinstance(res, dict)
++        assert res["success"] is False
++        assert "does not support" in res["error"]
++
++
++def test_signal_message_id_round_trip():
++    pytest.importorskip("aiohttp")
++    from gateway.platforms.signal import SignalAdapter
++
++    parse = SignalAdapter._parse_signal_message_id
++    assert parse("uuid-abc:1718900000000") == ("uuid-abc", 1718900000000)
++    # author may itself contain ':' — rpartition keeps the last segment as ts
++    assert parse("a:b:1700000000000") == ("a:b", 1700000000000)
++    # malformed inputs degrade to (None, None) rather than raising
++    assert parse(None) == (None, None)
++    assert parse("no-timestamp") == (None, None)
++    assert parse("author:notanumber") == (None, None)
++
++
++@pytest.mark.parametrize(
++    "module_path,class_name",
++    [
++        ("gateway.platforms.signal", "SignalAdapter"),
++        ("plugins.platforms.telegram.adapter", "TelegramAdapter"),
++        ("plugins.platforms.photon.adapter", "PhotonAdapter"),
++        ("plugins.platforms.whatsapp.adapter", "WhatsAppAdapter"),
++    ],
++)
++def test_reaction_capable_adapters_advertise_and_implement(module_path, class_name):
++    """Each reaction-capable adapter sets the flag AND overrides both coroutines
++    with the unified signature."""
++    try:
++        mod = __import__(module_path, fromlist=[class_name])
++    except Exception:  # optional deps (telegram/aiohttp) absent in this env
++        pytest.skip(f"{module_path} not importable here")
++        return
++    cls = getattr(mod, class_name)
++    assert cls.SUPPORTS_REACTIONS is True
++    assert cls.add_reaction is not BasePlatformAdapter.add_reaction
++    assert cls.remove_reaction is not BasePlatformAdapter.remove_reaction
++    sig = inspect.signature(cls.add_reaction)
++    params = list(sig.parameters)
++    assert params[:3] == ["self", "chat_id", "emoji"]
++    assert "message_id" in sig.parameters
+diff --git a/tests/gateway/test_whatsapp_exclusive_inbound.py b/tests/gateway/test_whatsapp_exclusive_inbound.py
+new file mode 100644
+index 0000000000..7f417a3800
+--- /dev/null
++++ b/tests/gateway/test_whatsapp_exclusive_inbound.py
+@@ -0,0 +1,119 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
++from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
++
++
++class _Response:
++    status = 200
++
++    def __init__(self, messages):
++        self._messages = messages
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, *_args):
++        return None
++
++    async def json(self):
++        return self._messages
++
++
++@pytest.mark.asyncio
++async def test_each_native_quote_is_claimed_before_whatsapp_text_batching():
++    adapter = object.__new__(WhatsAppAdapter)
++    adapter.platform = Platform.WHATSAPP
++    adapter._bridge_port = 3000
++    adapter._running = True
++    adapter._http_session = SimpleNamespace(
++        get=MagicMock(
++            return_value=_Response(
++                [
++                    {"messageId": "m1", "quotedMessageId": "q1"},
++                    {"messageId": "m2", "quotedMessageId": "q2"},
++                ]
++            )
++        )
++    )
++    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
++    adapter._send_read_receipt = AsyncMock()
++    adapter._enqueue_text_event = MagicMock()
++    adapter.handle_message = AsyncMock()
++    seen = []
++
++    async def build(data):
++        return MessageEvent(
++            text=data["messageId"],
++            message_type=MessageType.TEXT,
++            source=SessionSource(
++                platform=Platform.WHATSAPP,
++                chat_id="codex@g.us",
++                chat_type="group",
++                user_id="15551234567",
++            ),
++            message_id=data["messageId"],
++            reply_to_message_id=data["quotedMessageId"],
++        )
++
++    async def claim(event):
++        seen.append((event.message_id, event.reply_to_message_id))
++        if len(seen) == 2:
++            adapter._running = False
++        return True
++
++    adapter._build_message_event = build
++    adapter.dispatch_exclusive_inbound = claim
++
++    await adapter._poll_messages()
++
++    assert seen == [("m1", "q1"), ("m2", "q2")]
++    adapter._enqueue_text_event.assert_not_called()
++    adapter.handle_message.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "native_type",
++    ["pollUpdateMessage", "pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3"],
++)
++async def test_native_polls_bypass_exclusive_claim(native_type):
++    adapter = object.__new__(WhatsAppAdapter)
++    adapter.platform = Platform.WHATSAPP
++    adapter._bridge_port = 3000
++    adapter._running = True
++    adapter._http_session = SimpleNamespace(
++        get=MagicMock(return_value=_Response([{"messageId": "poll-update"}]))
++    )
++    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
++    adapter._send_read_receipt = AsyncMock()
++    adapter.handle_message = AsyncMock()
++    adapter.dispatch_exclusive_inbound = AsyncMock(return_value=True)
++
++    async def build(_data):
++        adapter._running = False
++        return MessageEvent(
++            text="Option A",
++            message_type=MessageType.TEXT,
++            source=SessionSource(
++                platform=Platform.WHATSAPP,
++                chat_id="codex@g.us",
++                chat_type="group",
++                user_id="15551234567",
++            ),
++            message_id="poll-update",
++            metadata={"whatsapp_native_type": native_type},
++        )
++
++    adapter._build_message_event = build
++    adapter._enqueue_text_event = MagicMock()
++
++    await adapter._poll_messages()
++
++    adapter.dispatch_exclusive_inbound.assert_not_awaited()
++    adapter._enqueue_text_event.assert_called_once()
+diff --git a/tests/gateway/test_whatsapp_formatting.py b/tests/gateway/test_whatsapp_formatting.py
+index 79e1dacb78..0f300533bc 100644
+--- a/tests/gateway/test_whatsapp_formatting.py
++++ b/tests/gateway/test_whatsapp_formatting.py
+@@ -215,6 +215,7 @@ class TestBridgeEventMetadata:
+         assert event.raw_message["quotedParticipant"] == "99999999999@s.whatsapp.net"
+         assert event.raw_message["quotedRemoteJid"] == "15551234567@s.whatsapp.net"
+         assert event.raw_message["hasQuotedMessage"] is True
++        assert event.metadata["whatsapp_original_body"] == "approved"
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -228,4 +229,3 @@ class TestWhatsAppTier:
+         from gateway.display_config import resolve_display_setting
+         # TIER_MEDIUM has streaming: None (follow global), not False
+         assert resolve_display_setting({}, "whatsapp", "streaming") is None
+-
+diff --git a/tests/gateway/test_whatsapp_reactions.py b/tests/gateway/test_whatsapp_reactions.py
+new file mode 100644
+index 0000000000..d2505721ea
+--- /dev/null
++++ b/tests/gateway/test_whatsapp_reactions.py
+@@ -0,0 +1,138 @@
++"""WhatsApp (Baileys) reaction behavior.
++
++Verifies the adapter implements the unified reaction contract by POSTing to the
++bridge ``/react`` endpoint with the right payload, and that ``remove_reaction``
++clears by sending an empty emoji. The bridge resolves the original message from
++its TTL'd message store and calls
++``sock.sendMessage(jid, { react: { text, key } })`` — the same store and endpoint
++the ``whatsapp_action`` tool reacts through.
++"""
++
++import asyncio
++from unittest.mock import AsyncMock, MagicMock
++
++from gateway.config import Platform
++
++
++class _AsyncCM:
++    """Minimal async context manager returning a fixed value."""
++
++    def __init__(self, value):
++        self.value = value
++
++    async def __aenter__(self):
++        return self.value
++
++    async def __aexit__(self, *exc):
++        return False
++
++
++def _make_adapter():
++    """Create a connected WhatsAppAdapter with a mocked HTTP session."""
++    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
++
++    adapter = WhatsAppAdapter.__new__(WhatsAppAdapter)
++    adapter.platform = Platform.WHATSAPP
++    adapter._bridge_port = 19876
++    adapter._running = True
++    adapter._bridge_process = None
++    # _check_managed_bridge_exit() returns falsy when we don't manage a proc
++    adapter._http_session = MagicMock()
++    return adapter
++
++
++def _mock_post(status=200, text="ok"):
++    resp = MagicMock()
++    resp.status = status
++    resp.text = AsyncMock(return_value=text)
++    post = MagicMock(return_value=_AsyncCM(resp))
++    return post
++
++
++def test_supports_reactions_flag():
++    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
++
++    assert WhatsAppAdapter.SUPPORTS_REACTIONS is True
++
++
++def test_add_reaction_posts_emoji():
++    adapter = _make_adapter()
++    post = _mock_post()
++    adapter._http_session.post = post
++
++    res = asyncio.new_event_loop().run_until_complete(
++        adapter.add_reaction("12345@s.whatsapp.net", "👍", "MSGID1")
++    )
++
++    assert res["success"] is True
++    url = post.call_args[0][0]
++    payload = post.call_args.kwargs["json"]
++    assert url.endswith("/react")
++    assert payload["messageId"] == "MSGID1"
++    assert payload["emoji"] == "👍"
++    assert payload["chatId"].endswith("@s.whatsapp.net")
++
++
++def test_remove_reaction_sends_empty_emoji():
++    adapter = _make_adapter()
++    post = _mock_post()
++    adapter._http_session.post = post
++
++    res = asyncio.new_event_loop().run_until_complete(
++        adapter.remove_reaction("12345@s.whatsapp.net", "MSGID1")
++    )
++
++    assert res["success"] is True
++    assert post.call_args.kwargs["json"]["emoji"] == ""
++
++
++def test_react_requires_message_id():
++    adapter = _make_adapter()
++    adapter._http_session.post = _mock_post()
++
++    res = asyncio.new_event_loop().run_until_complete(
++        adapter.add_reaction("12345@s.whatsapp.net", "👍", None)
++    )
++
++    assert res["success"] is False
++    assert "message_id" in res["error"]
++
++
++def test_react_propagates_bridge_error():
++    adapter = _make_adapter()
++    adapter._http_session.post = _mock_post(status=503, text="Not connected to WhatsApp")
++
++    res = asyncio.new_event_loop().run_until_complete(
++        adapter.add_reaction("12345@s.whatsapp.net", "👍", "MSGID1")
++    )
++
++    assert res["success"] is False
++    assert "Not connected" in res["error"]
++
++
++def test_react_propagates_uncached_message_404():
++    # The bridge returns 404 when the target message isn't in its store
++    # (resolveStoredMessage miss); the adapter surfaces that as a failure.
++    adapter = _make_adapter()
++    adapter._http_session.post = _mock_post(
++        status=404, text="Referenced message not found in bridge cache"
++    )
++
++    res = asyncio.new_event_loop().run_until_complete(
++        adapter.add_reaction("12345@s.whatsapp.net", "👍", "MSGID1")
++    )
++
++    assert res["success"] is False
++    assert "not found" in res["error"]
++
++
++def test_react_not_connected_short_circuits():
++    adapter = _make_adapter()
++    adapter._running = False
++    adapter._http_session.post = _mock_post()
++
++    res = asyncio.new_event_loop().run_until_complete(
++        adapter.add_reaction("12345@s.whatsapp.net", "👍", "MSGID1")
++    )
++
++    assert res["success"] is False
+diff --git a/tests/tools/test_send_message_react.py b/tests/tools/test_send_message_react.py
+index 6538e24237..762931746c 100644
+--- a/tests/tools/test_send_message_react.py
++++ b/tests/tools/test_send_message_react.py
+@@ -14,6 +14,10 @@ import tools.send_message_tool as smt
+ class _FakePhotonAdapter:
+     """Adapter exposing add_reaction/remove_reaction coroutines."""
+ 
++    # Advertises reaction support via the unified capability flag (mirrors the
++    # real PhotonAdapter). The send_message tool gates on SUPPORTS_REACTIONS.
++    SUPPORTS_REACTIONS = True
++
+     def __init__(self):
+         self.calls = []
+ 
+@@ -27,7 +31,9 @@ class _FakePhotonAdapter:
+ 
+ 
+ class _NoReactionAdapter:
+-    """Adapter with no reaction support at all."""
++    """Adapter with no reaction support (SUPPORTS_REACTIONS defaults False)."""
++
++    SUPPORTS_REACTIONS = False
+ 
+ 
+ def _runner_with(adapter):
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index 9d64123909..4d41128ebd 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -338,7 +338,10 @@ def _handle_react(args, remove=False):
+         )
+     fn_name = "remove_reaction" if remove else "add_reaction"
+     react_fn = getattr(adapter, fn_name, None)
+-    if not callable(react_fn):
++    # The base adapter now always defines add_reaction/remove_reaction (default
++    # no-op), so advertise support via the SUPPORTS_REACTIONS capability flag
++    # rather than method presence.
++    if not callable(react_fn) or not getattr(adapter, "SUPPORTS_REACTIONS", False):
+         return tool_error(
+             f"Platform '{platform_name}' does not support message reactions."
+         )
+diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
+index 8ef9e7b180..756fa3a751 100644
+--- a/website/docs/user-guide/features/hooks.md
++++ b/website/docs/user-guide/features/hooks.md
+@@ -1181,7 +1181,11 @@ def my_callback(event, gateway, session_store, **kwargs):
+ | `gateway` | `GatewayRunner` | The active gateway runner, so plugins can call `gateway.adapters[platform].send(...)` for side-channel replies (owner notifications, etc.). |
+ | `session_store` | `SessionStore` | For silent transcript ingestion via `session_store.append_to_transcript(...)`. |
+ 
+-**Fires:** In `gateway/run.py`, inside `GatewayRunner._handle_message()`, immediately after `is_internal` is computed. **Internal events skip the hook entirely** (they are system-generated — background-process completions, etc. — and must not be gate-kept by user-facing policy).
++**Fires:** In `gateway/run.py`, inside `GatewayRunner._handle_message()`, immediately after `is_internal` is computed — **before** the gateway's own auth/pairing step. **Internal events skip the hook entirely** (they are system-generated — background-process completions, etc. — and must not be gate-kept by user-facing policy).
++
++:::caution
++The hook runs **before** the gateway checks `_is_user_authorized(source)`. This is intentional — it lets plugins handle unauthorized senders without triggering the pairing flow. If your hook returns `"allow"` for a user-originated message, call `gateway.is_user_authorized(source)` to ensure the sender passes the gateway's normal allowlist / pairing checks. Otherwise the gateway will still run its own auth check after your hook returns.
++:::
+ 
+ **Return value:** `None` or a dict. The first recognized action dict wins; remaining plugin results are ignored. Exceptions in plugin callbacks are caught and logged; the gateway always falls through to normal dispatch on error.
+ 
