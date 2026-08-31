@@ -12,7 +12,7 @@
     "setup": "node scripts/setup.mjs",
     "setup:apply": "node scripts/setup.mjs --apply",
     "status": "node scripts/codex-whatsapp-client.mjs status",
-    "test": "node --test && PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s test -p 'test_*.py'",
+    "test": "node --test && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test -p 'test_*.py'",
     "update:check": "node scripts/update-check.mjs"
   },
   "license": "MIT"
