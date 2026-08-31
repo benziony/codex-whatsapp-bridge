@@ -39,6 +39,12 @@ def main() -> int:
     if not isinstance(free, list):
         raise SystemExit("Hermes whatsapp free_response_chats must be a list or comma-separated text")
     extra["free_response_chats"] = list(dict.fromkeys([*map(str, free), args.chat_id]))
+    users = extra.get("allow_from") or []
+    if isinstance(users, str):
+        users = [item.strip() for item in users.split(",") if item.strip()]
+    if not isinstance(users, list):
+        raise SystemExit("Hermes whatsapp allow_from must be a list or comma-separated text")
+    extra["allow_from"] = list(dict.fromkeys([*map(str, users), *args.allowed_sender]))
     extra["exclusive_inbound"] = {
         "chat_id": args.chat_id,
         "handler": "codex_whatsapp_bridge",

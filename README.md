@@ -45,6 +45,10 @@ Polls and unrelated Hermes/WhatsApp traffic stay on stock Hermes.
 Both Macs use the same repository version and their own reviewed config. Live
 Hermes/Codex state is never synchronized between them.
 
+A combined gateway may still designate the other Mac as the destination for
+new unquoted messages while continuing to route quoted replies to Codex tasks
+that originated on either Mac.
+
 ## Install with Codex
 
 Clone this repository and tell Codex:
@@ -68,6 +72,10 @@ session on the gateway Mac. On the currently supported release, use Hermes
 commit `4f22543509d1b91dc45bcb369447126c5eb14fb7`; setup verifies this before
 changing runtime configuration. See
 [Hermes compatibility](docs/hermes-compatibility.md).
+Hermes virtual environments may live inside or outside the checkout; use
+`--hermes-python=/absolute/path/to/python` for an external environment.
+Hermes-derived patch licensing and contributor attribution are in
+[third-party notices](THIRD_PARTY_NOTICES.md).
 
 Setup asks whether progress updates should be mirrored. Finals-only is the
 default. See [configuration](docs/configuration.md),

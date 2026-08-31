@@ -46,3 +46,66 @@ test("failed setup restores the prior runtime configuration", (t) => {
   assert.equal(fs.readFileSync(configPath, "utf8"), original);
   assert.equal(fs.existsSync(path.join(home, ".hermes", "plugins", "codex-whatsapp-bridge")), false);
 });
+
+test("setup refuses a role transition before touching installed state", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-role-change-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configPath = path.join(root, "config.json");
+  const original = `${JSON.stringify({ schemaVersion: 1, role: "gateway", hostId: "gateway" })}\n`;
+  fs.writeFileSync(configPath, original, { mode: 0o600 });
+  const result = spawnSync(
+    process.execPath,
+    [path.resolve("scripts/setup.mjs"), "--non-interactive", "--role=codex"],
+    { cwd: path.resolve("."), encoding: "utf8", env: { ...process.env, CODEX_WHATSAPP_CONFIG: configPath } },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /requires a reviewed migration/);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+});
+
+test("split setup rejects remote executable paths containing whitespace", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-space-path-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const result = spawnSync(
+    process.execPath,
+    [
+      path.resolve("scripts/setup.mjs"),
+      "--non-interactive",
+      "--role=codex",
+      "--host-id=codex",
+      `--default-cwd=${root}`,
+      "--gateway-ssh=gateway",
+      "--gateway-repository=/tmp/bridge path",
+      "--gateway-node=/opt/homebrew/bin/node",
+      "--gateway-attachments=/tmp/attachments",
+    ],
+    { cwd: path.resolve("."), encoding: "utf8", env: { ...process.env, CODEX_WHATSAPP_CONFIG: path.join(root, "config.json") } },
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /without whitespace/);
+});
+
+test("gateway dry-run accepts an external Hermes Python and redacts the dedicated chat", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-external-python-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const hermes = path.join(root, "hermes");
+  const external = path.join(root, "venv", "bin", "python");
+  fs.mkdirSync(path.dirname(external), { recursive: true });
+  fs.symlinkSync("/usr/bin/python3", external);
+  fs.mkdirSync(path.join(hermes, "gateway", "platforms"), { recursive: true });
+  fs.mkdirSync(path.join(hermes, "plugins", "platforms", "whatsapp"), { recursive: true });
+  fs.writeFileSync(path.join(hermes, "gateway", "platforms", "base.py"), "dispatch_exclusive_inbound\n");
+  fs.writeFileSync(path.join(hermes, "plugins", "platforms", "whatsapp", "adapter.py"), "async def add_reaction(): pass\n");
+  const chat = "123-456@g.us";
+  const result = spawnSync(process.execPath, [
+    path.resolve("scripts/setup.mjs"), "--non-interactive", "--role=gateway", "--host-id=gateway",
+    `--chat-id=${chat}`, "--allowed-senders=15551234567@s.whatsapp.net", "--codex-host-id=codex",
+    `--codex-cwd=${root}`, `--hermes-checkout=${hermes}`, `--hermes-python=${external}`,
+  ], { cwd: path.resolve("."), encoding: "utf8", env: { ...process.env, HOME: home, CODEX_WHATSAPP_CONFIG: path.join(root, "config.json") } });
+  assert.equal(result.status, 0, result.stderr);
+  const plan = JSON.parse(result.stdout);
+  assert.equal(plan.gateway.hermesPython, external);
+  assert.equal(plan.dedicatedChatConfigured, true);
+  assert.doesNotMatch(result.stdout, new RegExp(chat.replaceAll("-", "\\-")));
+});

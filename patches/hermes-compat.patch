@@ -240,7 +240,7 @@ index 4e46f2b2b2..fb1cfd1cc5 100644
      # ------------------------------------------------------------------
      # Chat Info
 diff --git a/gateway/run.py b/gateway/run.py
-index 6c7838398b..405fc12045 100644
+index 6c7838398b..6eb1a8d4a0 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -13397,6 +13397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
@@ -392,11 +392,11 @@ index 6c7838398b..405fc12045 100644
 +
 +            with _profile_runtime_scope(transport_home):
 +                claim_sender_allowed = (
-+                    claim["allowed_senders"] is not None
-+                    and str(getattr(source, "user_id", "")).strip().lower()
++                    claim["allowed_senders"] is None
++                    or str(getattr(source, "user_id", "")).strip().lower()
 +                    in claim["allowed_senders"]
 +                )
-+                if not claim_sender_allowed and not self._is_user_authorized_for_source(source):
++                if not claim_sender_allowed or not self._is_user_authorized_for_source(source):
 +                    logger.warning(
 +                        "Unauthorized sender dropped from exclusive inbound claim "
 +                        "on %s/%s",
@@ -628,7 +628,7 @@ index c782bfe8be..2d6320696d 100644
          """Set a single emoji reaction on a Telegram message."""
          if not self._bot:
 diff --git a/plugins/platforms/whatsapp/adapter.py b/plugins/platforms/whatsapp/adapter.py
-index 282cb7c0cb..f950a42877 100644
+index 282cb7c0cb..4f63692af2 100644
 --- a/plugins/platforms/whatsapp/adapter.py
 +++ b/plugins/platforms/whatsapp/adapter.py
 @@ -1029,6 +1029,65 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
@@ -714,10 +714,10 @@ index 282cb7c0cb..f950a42877 100644
 +                                native_type = str(
 +                                    (event.metadata or {}).get("whatsapp_native_type") or ""
 +                                ).lower()
-+                                is_poll_update = native_type.startswith("poll")
++                                is_stock_interaction = native_type.startswith(("poll", "reaction"))
 +                                claimed = (
 +                                    False
-+                                    if is_poll_update
++                                    if is_stock_interaction
 +                                    else await self.dispatch_exclusive_inbound(event)
 +                                )
                                  # Fire-and-forget: a slow bridge /read must not
@@ -969,10 +969,10 @@ index 398521feee..c8299bcc43 100644
      || pollCreation?.messageContextInfo?.messageSecret
 diff --git a/tests/gateway/test_exclusive_inbound.py b/tests/gateway/test_exclusive_inbound.py
 new file mode 100644
-index 0000000000..bbcc3e4f25
+index 0000000000..79042d27b3
 --- /dev/null
 +++ b/tests/gateway/test_exclusive_inbound.py
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,247 @@
 +from __future__ import annotations
 +
 +from types import SimpleNamespace
@@ -1068,8 +1068,8 @@ index 0000000000..bbcc3e4f25
 +
 +
 +@pytest.mark.asyncio
-+async def test_claim_sender_allowlist_authorizes_without_broad_gateway_grant(monkeypatch):
-+    runner = _runner(authorized=False)
++async def test_claim_sender_allowlist_and_gateway_authorization_are_both_required(monkeypatch):
++    runner = _runner(authorized=True)
 +    adapter = _Adapter(_sender_claim())
 +    manager = PluginManager()
 +    context = PluginContext(PluginManifest(name="bridge"), manager)
@@ -1088,8 +1088,20 @@ index 0000000000..bbcc3e4f25
 +
 +
 +@pytest.mark.asyncio
-+async def test_claim_sender_allowlist_still_drops_other_sender(monkeypatch):
++async def test_claim_sender_allowlist_cannot_bypass_revoked_gateway_authorization(monkeypatch):
 +    runner = _runner(authorized=False)
++    adapter = _Adapter(_sender_claim())
++    get_manager = MagicMock()
++    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
++    runner._configure_exclusive_inbound(adapter)
++
++    assert await adapter.exclusive_handler(_event()) is True
++    get_manager.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_claim_sender_allowlist_still_drops_other_sender(monkeypatch):
++    runner = _runner(authorized=True)
 +    adapter = _Adapter(_sender_claim())
 +    get_manager = MagicMock()
 +    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", get_manager)
@@ -1322,10 +1334,10 @@ index 0000000000..f1246c9c83
 +    assert "message_id" in sig.parameters
 diff --git a/tests/gateway/test_whatsapp_exclusive_inbound.py b/tests/gateway/test_whatsapp_exclusive_inbound.py
 new file mode 100644
-index 0000000000..7f417a3800
+index 0000000000..fae1ee29b0
 --- /dev/null
 +++ b/tests/gateway/test_whatsapp_exclusive_inbound.py
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,125 @@
 +from __future__ import annotations
 +
 +from types import SimpleNamespace
@@ -1408,9 +1420,15 @@ index 0000000000..7f417a3800
 +@pytest.mark.asyncio
 +@pytest.mark.parametrize(
 +    "native_type",
-+    ["pollUpdateMessage", "pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3"],
++    [
++        "pollUpdateMessage",
++        "pollCreationMessage",
++        "pollCreationMessageV2",
++        "pollCreationMessageV3",
++        "reactionMessage",
++    ],
 +)
-+async def test_native_polls_bypass_exclusive_claim(native_type):
++async def test_native_interactions_bypass_exclusive_claim(native_type):
 +    adapter = object.__new__(WhatsAppAdapter)
 +    adapter.platform = Platform.WHATSAPP
 +    adapter._bridge_port = 3000

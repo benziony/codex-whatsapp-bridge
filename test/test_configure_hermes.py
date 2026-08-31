@@ -36,6 +36,7 @@ class ConfigureHermesTests(unittest.TestCase):
         self.assertEqual(extra["group_policy"], "allowlist")
         self.assertEqual(extra["group_allow_from"], ["123-456@g.us"])
         self.assertEqual(extra["free_response_chats"], ["123-456@g.us"])
+        self.assertEqual(extra["allow_from"], ["15551234567@s.whatsapp.net"])
         self.assertEqual(
             extra["exclusive_inbound"]["allowed_senders"],
             ["15551234567@s.whatsapp.net"],

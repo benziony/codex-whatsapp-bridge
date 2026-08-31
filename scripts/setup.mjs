@@ -23,6 +23,13 @@ const exactUser = /^[0-9]{1,32}@(s\.whatsapp\.net|lid)$/;
 const supportedHermesCommit = "4f22543509d1b91dc45bcb369447126c5eb14fb7";
 const hermesPatch = path.join(root, "patches", "hermes-compat.patch");
 
+function shellTransportSafePath(value, name) {
+  if (!path.isAbsolute(value) || /\s/.test(value)) {
+    throw new Error(`${name} must be an absolute path without whitespace`);
+  }
+  return value;
+}
+
 async function answer(rl, name, question, fallback) {
   const supplied = valueFor(name);
   if (supplied !== undefined) return supplied;
@@ -134,8 +141,15 @@ function installPlist(label, content, snapshot) {
 async function main() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
+    shellTransportSafePath(root, "Bridge repository path");
+    shellTransportSafePath(process.execPath, "Local Node binary");
     const role = await answer(rl, "role", "Role (combined, gateway, codex)", existing?.role ?? "combined");
     if (!new Set(["combined", "gateway", "codex"]).has(role)) throw new Error("Invalid role");
+    if (existing?.role && existing.role !== role) {
+      throw new Error(
+        `Changing an installed role from ${existing.role} to ${role} requires a reviewed migration so stale hooks, plugins, and LaunchAgents cannot remain active`,
+      );
+    }
     const hostId = await answer(rl, "host-id", "Stable name for this Mac", existing?.hostId ?? os.hostname().split(".")[0]);
     const isGateway = role !== "codex";
     const isCodex = role !== "gateway";
@@ -153,11 +167,11 @@ async function main() {
     const defaultCwd = isCodex
       ? path.resolve(await answer(rl, "default-cwd", "Working directory for new Codex tasks", existing?.codex?.defaultCwd ?? process.cwd()))
       : existing?.codex?.defaultCwd ?? "";
-    const codexTargetHost = role === "gateway"
-      ? await answer(rl, "codex-host-id", "Host ID of the Mac running Codex", existing?.codexInbox?.originHost ?? "")
+    const codexTargetHost = isGateway
+      ? await answer(rl, "codex-host-id", "Host ID for new unquoted Codex tasks", existing?.codexInbox?.originHost ?? (isCodex ? hostId : ""))
       : hostId;
-    const codexTargetCwd = role === "gateway"
-      ? await answer(rl, "codex-cwd", "New-task working directory on the Codex Mac", existing?.codexInbox?.cwd ?? "")
+    const codexTargetCwd = isGateway
+      ? await answer(rl, "codex-cwd", "New-task working directory on that Codex Mac", existing?.codexInbox?.cwd ?? defaultCwd)
       : defaultCwd;
     if (isGateway && (!codexTargetHost || !path.isAbsolute(codexTargetCwd))) {
       throw new Error("The gateway needs an exact Codex host ID and absolute new-task directory");
@@ -168,29 +182,32 @@ async function main() {
     const hermesCheckout = isGateway
       ? path.resolve(await answer(rl, "hermes-checkout", "Hermes checkout", existing?.gateway?.hermesCheckout ?? path.join(home, ".hermes", "hermes-agent")))
       : existing?.gateway?.hermesCheckout ?? "";
+    const hermesPythonOverride = isGateway
+      ? await answer(rl, "hermes-python", "Hermes Python binary", existing?.gateway?.hermesPython ?? "")
+      : existing?.gateway?.hermesPython ?? "";
     const gatewaySsh = role === "codex"
       ? await answer(rl, "gateway-ssh", "Gateway SSH host", existing?.gateway?.sshHost ?? "")
       : existing?.gateway?.sshHost ?? "";
     const gatewayRepo = role === "codex"
       ? await answer(rl, "gateway-repository", "Bridge repository path on gateway", existing?.gateway?.repositoryPath ?? root)
       : root;
-    if (!path.isAbsolute(gatewayRepo)) throw new Error("gateway-repository must be an absolute path");
+    shellTransportSafePath(gatewayRepo, "gateway-repository");
     const gatewayNode = role === "codex"
       ? await answer(rl, "gateway-node", "Node binary path on gateway", existing?.gateway?.node ?? "/opt/homebrew/bin/node")
       : process.execPath;
-    if (!path.isAbsolute(gatewayNode)) throw new Error("gateway-node must be an absolute path");
+    shellTransportSafePath(gatewayNode, "gateway-node");
     const gatewayAttachments = role === "codex"
       ? await answer(rl, "gateway-attachments", "Broker attachment directory on gateway", existing?.gateway?.attachmentPath ?? "")
       : existing?.gateway?.attachmentPath ?? path.join(path.dirname(targetConfig), "broker", "attachments");
-    if (role === "codex" && !path.isAbsolute(gatewayAttachments)) {
-      throw new Error("gateway-attachments must be an absolute path on the gateway Mac");
-    }
+    if (role === "codex") shellTransportSafePath(gatewayAttachments, "gateway-attachments");
     if (role === "codex" && !gatewaySsh.trim()) throw new Error("gateway-ssh is required for split topology");
     const hermesPythonCandidates = [
       path.join(hermesCheckout, ".venv", "bin", "python"),
       path.join(hermesCheckout, "venv", "bin", "python"),
     ];
-    const hermesPython = hermesPythonCandidates.find(fs.existsSync) ?? "";
+    const hermesPython = hermesPythonOverride
+      ? shellTransportSafePath(path.resolve(hermesPythonOverride), "hermes-python")
+      : (hermesPythonCandidates.find(fs.existsSync) ?? "");
     let attachmentSourceRoots = existing?.whatsapp?.attachmentSourceRoots ?? [];
     if (isGateway && hermesPython) {
       const roots = command(hermesPython, [path.join(root, "scripts", "hermes-media-roots.py")], { cwd: hermesCheckout });
@@ -203,7 +220,10 @@ async function main() {
       gateway: {
         repositoryPath: gatewayRepo,
         hermesCheckout,
+        ...(hermesPython ? { hermesPython } : {}),
         node: gatewayNode,
+        ...(existing?.gateway?.statePath ? { statePath: existing.gateway.statePath } : {}),
+        ...(existing?.gateway?.brokerPath ? { brokerPath: existing.gateway.brokerPath } : {}),
         ...(gatewaySsh ? { sshHost: gatewaySsh } : {}),
         ...(existing?.gateway?.lanHost ? { lanHost: existing.gateway.lanHost } : {}),
         ...(existing?.gateway?.hostKeyAlias ? { hostKeyAlias: existing.gateway.hostKeyAlias } : {}),
@@ -219,6 +239,8 @@ async function main() {
         binary: existing?.codex?.binary ?? "/opt/homebrew/bin/codex",
         defaultCwd,
         mirrorProgress: /^y(es)?$/i.test(progressAnswer),
+        ...(existing?.codex?.statePath ? { statePath: existing.codex.statePath } : {}),
+        ...(existing?.codex?.attachmentPath ? { attachmentPath: existing.codex.attachmentPath } : {}),
       },
       codexInbox: isGateway
         ? { originHost: codexTargetHost, cwd: codexTargetCwd }
@@ -229,12 +251,13 @@ async function main() {
       configPath: targetConfig,
       role,
       hostId,
-      dedicatedChat: chatId,
+      dedicatedChatConfigured: Boolean(chatId),
       allowedSenderCount: allowedSenders.length,
       mirrorProgress: config.codex.mirrorProgress,
       gateway: {
         repositoryPath: gatewayRepo,
         node: gatewayNode,
+        ...(hermesPython ? { hermesPython } : {}),
         ...(gatewaySsh ? { sshHost: gatewaySsh } : {}),
         ...(gatewayAttachments ? { attachmentPath: gatewayAttachments } : {}),
       },
