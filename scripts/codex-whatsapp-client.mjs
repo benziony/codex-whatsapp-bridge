@@ -312,19 +312,21 @@ function repositoryNameFromOrigin(value) {
 }
 
 export function projectLabelFromWorkingDirectory(cwd, git = spawnSync, { projectName = null, gitOriginUrl = null } = {}) {
+  if (typeof cwd === "string" && path.isAbsolute(cwd)) {
+    try {
+      const remote = git("git", ["-C", cwd, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
+      const repository = remote?.status === 0 ? repositoryNameFromOrigin(remote.stdout) : null;
+      if (repository) return repository;
+      const result = git("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
+      if (result?.status === 0 && String(result.stdout ?? "").trim()) {
+        return safeLabel(path.basename(String(result.stdout).trim()), "No project");
+      }
+    } catch { /* saved metadata or the workspace folder can still provide a label */ }
+  }
   if (projectName) return safeLabel(projectName, "No project");
   const storedRepository = repositoryNameFromOrigin(gitOriginUrl);
   if (storedRepository) return storedRepository;
   if (typeof cwd !== "string" || !path.isAbsolute(cwd)) return "No project";
-  try {
-    const remote = git("git", ["-C", cwd, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
-    const repository = remote?.status === 0 ? repositoryNameFromOrigin(remote.stdout) : null;
-    if (repository) return repository;
-    const result = git("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] });
-    if (result?.status === 0 && String(result.stdout ?? "").trim()) {
-      return safeLabel(path.basename(String(result.stdout).trim()), "No project");
-    }
-  } catch { /* a workspace folder is still useful metadata */ }
   const parts = path.normalize(cwd).split(path.sep).filter(Boolean);
   const repositories = parts.lastIndexOf("repos");
   if (repositories >= 0 && parts[repositories + 1]) return safeLabel(parts[repositories + 1], "No project");

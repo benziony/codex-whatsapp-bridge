@@ -174,6 +174,7 @@ test("project label prefers the Git root and falls back to the workspace folder"
   const success = () => ({ status: 0, stdout: "/worktrees/codex-whatsapp-bridge\n" });
   const failure = () => ({ status: 1, stdout: "" });
   assert.equal(projectLabelFromWorkingDirectory("/tmp/worktree", success), "codex-whatsapp-bridge");
+  assert.equal(projectLabelFromWorkingDirectory("/tmp/worktree", success, { gitOriginUrl: "https://github.com/example/HomeLife.git" }), "codex-whatsapp-bridge");
   assert.equal(projectLabelFromWorkingDirectory("/tmp/Plain Workspace", failure), "Plain Workspace");
   assert.equal(projectLabelFromWorkingDirectory("/Users/operator/dev/repos/Hermes-agent", failure), "Hermes-agent");
   assert.equal(projectLabelFromWorkingDirectory("/Users/operator/Documents/Codex/2026/task", failure), "Codex");
