@@ -4,6 +4,22 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { launchAgentPlist } from "../scripts/lib/launch-agent.mjs";
+
+test("launch agents expose the configured Node directory to env-based tools", () => {
+  const content = launchAgentPlist({
+    label: "test",
+    args: ["/opt/node/bin/node", "/tmp/client.mjs"],
+    interval: 5,
+    stdout: "/tmp/out.log",
+    stderr: "/tmp/error.log",
+    workingDirectory: "/tmp/bridge",
+    home: "/Users/test",
+    configPath: "/Users/test/.config/bridge.json",
+    nodeBinary: "/opt/node/bin/node",
+  });
+  assert.match(content, /<key>PATH<\/key><string>\/opt\/node\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin<\/string>/);
+});
 
 test("failed setup restores the prior runtime configuration", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-setup-rollback-"));
