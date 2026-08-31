@@ -24,8 +24,8 @@ const supportedHermesCommit = "4f22543509d1b91dc45bcb369447126c5eb14fb7";
 const hermesPatch = path.join(root, "patches", "hermes-compat.patch");
 
 function shellTransportSafePath(value, name) {
-  if (!path.isAbsolute(value) || /\s/.test(value)) {
-    throw new Error(`${name} must be an absolute path without whitespace`);
+  if (!path.isAbsolute(value) || !/^\/[A-Za-z0-9._/@+-]+$/.test(value)) {
+    throw new Error(`${name} must be an absolute path using only shell-safe path characters`);
   }
   return value;
 }

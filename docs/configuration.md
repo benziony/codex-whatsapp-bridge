@@ -40,7 +40,8 @@ absolute new-task directory on the Codex Mac. The Codex host configures
 `lanHost` plus `hostKeyAlias` provides a pinned LAN fallback. SSH must already
 work non-interactively; setup does not install keys or weaken host checking.
 Bridge repository, Node, and split-host attachment paths must be absolute and
-contain no whitespace because OpenSSH reconstructs the remote broker command.
+use only letters, digits, `/`, `.`, `_`, `-`, `+`, and `@` because OpenSSH
+reconstructs the remote broker command through a shell.
 `gateway.hermesPython` is optional; when omitted, setup checks
 `.venv/bin/python` and `venv/bin/python` inside `gateway.hermesCheckout`.
 
