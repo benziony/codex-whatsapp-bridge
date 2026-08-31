@@ -7,6 +7,7 @@ import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { configPath, readConfig } from "./lib/runtime-config.mjs";
+import { launchAgentPlist } from "./lib/launch-agent.mjs";
 
 const apply = process.argv.includes("--apply");
 const nonInteractive = process.argv.includes("--non-interactive");
@@ -111,19 +112,8 @@ function mergeHooks(current, hookCommand) {
   return result;
 }
 
-function plist({ label, args, interval, stdout, stderr }) {
-  const escape = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;");
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>${escape(label)}</string>
-<key>ProgramArguments</key><array>${args.map((arg) => `<string>${escape(arg)}</string>`).join("")}</array>
-<key>WorkingDirectory</key><string>${escape(root)}</string>
-<key>EnvironmentVariables</key><dict><key>HOME</key><string>${escape(home)}</string><key>CODEX_WHATSAPP_CONFIG</key><string>${escape(targetConfig)}</string></dict>
-<key>RunAtLoad</key><true/><key>StartInterval</key><integer>${interval}</integer>
-<key>StandardOutPath</key><string>${escape(stdout)}</string>
-<key>StandardErrorPath</key><string>${escape(stderr)}</string>
-</dict></plist>\n`;
+function plist(options) {
+  return launchAgentPlist({ ...options, workingDirectory: root, home, configPath: targetConfig, nodeBinary: process.execPath });
 }
 
 function installPlist(label, content, snapshot) {
