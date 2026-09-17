@@ -93,7 +93,9 @@ function approvalNotification(event, config) {
     };
   if (!isCurrentWhatsappPermit(permit, { caseId: event.caseId, rev: event.rev, digest: event.digest, scope: approvals.scope })) return null;
   const text = `Council approval available\nCase: ${event.caseId} rev ${event.rev}\nDigest: ${event.digest.toLowerCase()}\nScope: ${permit.scope}\n\nApprove: APPROVE ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}\nReject: REJECT ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}`;
-  return { target: approvals.chatId, text, deliveryKey: `council-appr-${createHash("sha256").update(event.eventId).digest("hex").slice(0, 48)}` };
+  const keyHash = createHash("sha256").update(event.eventId).digest("hex").slice(0, 32);
+  const deliveryKey = `${keyHash.slice(0, 8)}-${keyHash.slice(8, 12)}-${keyHash.slice(12, 16)}-${keyHash.slice(16, 20)}-${keyHash.slice(20)}`;
+  return { target: approvals.chatId, text, deliveryKey };
 }
 
 async function* sseEvents(response) {
