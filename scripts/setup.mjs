@@ -60,9 +60,20 @@ function secureJson(target, value) {
 function hermesCompatibilityReady(checkout) {
   const base = path.join(checkout, "gateway", "platforms", "base.py");
   const adapter = path.join(checkout, "plugins", "platforms", "whatsapp", "adapter.py");
-  if (!fs.existsSync(base) || !fs.existsSync(adapter)) return false;
+  const bridge = path.join(checkout, "scripts", "whatsapp-bridge", "bridge.js");
+  if (!fs.existsSync(base) || !fs.existsSync(adapter) || !fs.existsSync(bridge)) return false;
   return fs.readFileSync(base, "utf8").includes("dispatch_exclusive_inbound")
-    && fs.readFileSync(adapter, "utf8").includes("async def add_reaction");
+    && fs.readFileSync(adapter, "utf8").includes("async def add_reaction")
+    && fs.readFileSync(bridge, "utf8").includes("native-polls-ledger-v1")
+    && fs.readFileSync(bridge, "utf8").includes("/send-poll")
+    && fs.readFileSync(bridge, "utf8").includes("pollUpdateMessage");
+}
+
+function validateHermesBridgeSyntax(checkout) {
+  const bridge = path.join(checkout, "scripts", "whatsapp-bridge", "bridge.js");
+  if (!fs.existsSync(bridge)) throw new Error("Hermes WhatsApp bridge target is missing");
+  const checked = command(process.execPath, ["--check", bridge], { cwd: checkout });
+  if (checked.status !== 0) throw new Error(checked.stderr || "Hermes WhatsApp bridge syntax validation failed");
 }
 
 function ensureHermesCompatibility(checkout) {
@@ -83,6 +94,12 @@ function ensureHermesCompatibility(checkout) {
   const applied = command("/usr/bin/git", ["apply", hermesPatch], { cwd: checkout });
   if (applied.status !== 0) {
     throw new Error(applied.stderr || "Hermes compatibility patch could not be verified");
+  }
+  try {
+    validateHermesBridgeSyntax(checkout);
+  } catch (error) {
+    command("/usr/bin/git", ["apply", "--reverse", hermesPatch], { cwd: checkout });
+    throw error;
   }
   if (!hermesCompatibilityReady(checkout)) {
     command("/usr/bin/git", ["apply", "--reverse", hermesPatch], { cwd: checkout });
@@ -291,6 +308,7 @@ async function main() {
           ...(councilTokenEnv ? { codexTokenEnv: councilTokenEnv } : {}),
           scope: existing?.councilApprovals?.scope ?? "design",
           workspace: councilWorkspace,
+          nativePolls: existing?.councilApprovals?.nativePolls ?? true,
         },
       } : {}),
       ...(councilPushEnabled ? {

@@ -31,6 +31,8 @@ test("failed setup restores the prior runtime configuration", (t) => {
   const original = `${JSON.stringify({ schemaVersion: 1, role: "gateway", hostId: "old-gateway" })}\n`;
   fs.writeFileSync(configPath, original, { mode: 0o600 });
   fs.mkdirSync(path.join(hermes, ".venv", "bin"), { recursive: true });
+  fs.mkdirSync(path.join(hermes, "scripts", "whatsapp-bridge"), { recursive: true });
+  fs.writeFileSync(path.join(hermes, "scripts", "whatsapp-bridge", "bridge.js"), "console.log('bridge');\n");
   fs.symlinkSync("/usr/bin/python3", path.join(hermes, ".venv", "bin", "python"));
   assert.equal(spawnSync("/usr/bin/git", ["init", "-q"], { cwd: hermes }).status, 0);
   fs.writeFileSync(path.join(hermes, "README"), "test\n");
@@ -113,17 +115,28 @@ test("gateway dry-run accepts an external Hermes Python and redacts the dedicate
   fs.symlinkSync("/usr/bin/python3", external);
   fs.mkdirSync(path.join(hermes, "gateway", "platforms"), { recursive: true });
   fs.mkdirSync(path.join(hermes, "plugins", "platforms", "whatsapp"), { recursive: true });
+  fs.mkdirSync(path.join(hermes, "scripts", "whatsapp-bridge"), { recursive: true });
   fs.writeFileSync(path.join(hermes, "gateway", "platforms", "base.py"), "dispatch_exclusive_inbound\n");
   fs.writeFileSync(path.join(hermes, "plugins", "platforms", "whatsapp", "adapter.py"), "async def add_reaction(): pass\n");
+  // A previously patched runtime has the old interaction seams but not the
+  // native-poll ledger capability marker, so setup must schedule the upgrade.
+  const bridgePath = path.join(hermes, "scripts", "whatsapp-bridge", "bridge.js");
+  fs.writeFileSync(bridgePath, "// /send-poll pollUpdateMessage\n");
   const chat = "123-456@g.us";
-  const result = spawnSync(process.execPath, [
+  const args = [
     path.resolve("scripts/setup.mjs"), "--non-interactive", "--role=gateway", "--host-id=gateway",
     `--chat-id=${chat}`, "--allowed-senders=15551234567@s.whatsapp.net", "--codex-host-id=codex",
     `--codex-cwd=${root}`, `--hermes-checkout=${hermes}`, `--hermes-python=${external}`,
-  ], { cwd: path.resolve("."), encoding: "utf8", env: { ...process.env, HOME: home, CODEX_WHATSAPP_CONFIG: path.join(root, "config.json") } });
+  ];
+  const result = spawnSync(process.execPath, args, { cwd: path.resolve("."), encoding: "utf8", env: { ...process.env, HOME: home, CODEX_WHATSAPP_CONFIG: path.join(root, "config.json") } });
   assert.equal(result.status, 0, result.stderr);
   const plan = JSON.parse(result.stdout);
   assert.equal(plan.gateway.hermesPython, external);
+  assert.equal(plan.hermesCompatibility, `patch for ${"4f22543509d1b91dc45bcb369447126c5eb14fb7"}`);
   assert.equal(plan.dedicatedChatConfigured, true);
   assert.doesNotMatch(result.stdout, new RegExp(chat.replaceAll("-", "\\-")));
+  fs.writeFileSync(bridgePath, "// /send-poll pollUpdateMessage native-polls-ledger-v1\n");
+  const upgraded = spawnSync(process.execPath, args, { cwd: path.resolve("."), encoding: "utf8", env: { ...process.env, HOME: home, CODEX_WHATSAPP_CONFIG: path.join(root, "config.json") } });
+  assert.equal(upgraded.status, 0, upgraded.stderr);
+  assert.equal(JSON.parse(upgraded.stdout).hermesCompatibility, "native");
 });

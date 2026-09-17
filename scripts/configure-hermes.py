@@ -71,8 +71,13 @@ def main() -> int:
                 ),
             },
         ]
+        # Native poll updates are admitted only by the external plugin's
+        # exact-chat/owner Council path; unrelated poll and reaction traffic
+        # remains Hermes-native.
+        extra["native_council_polls"] = True
     else:
         extra["exclusive_inbound"] = primary_claim
+        extra.pop("native_council_polls", None)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

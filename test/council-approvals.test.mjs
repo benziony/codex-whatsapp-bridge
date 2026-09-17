@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isCurrentWhatsappPermit, parseCouncilApproval, processCouncilApproval } from "../scripts/lib/council-approvals.mjs";
+import { isCurrentWhatsappPermit, parseCouncilApproval, processCouncilApproval, processCouncilPollVote } from "../scripts/lib/council-approvals.mjs";
 
 const digest = "a".repeat(64);
 const permitId = "wp_opaque_permit_123456";
@@ -23,6 +23,38 @@ test("owner permit is exact, current, and bound to case revision digest and scop
   assert.equal(isCurrentWhatsappPermit({ ...permit(), expiresAt: new Date(Date.now() - 1).toISOString() }), false);
   assert.equal(isCurrentWhatsappPermit({ ...permit(), caseId: "other" }), false);
   assert.equal(isCurrentWhatsappPermit({ ...permit(), extra: "agent supplied" }), false);
+});
+
+test("native Council poll vote is exact-chat owner-only and maps to the poll decision route", async () => {
+  const { config, directory } = fixture();
+  config.councilApprovals.nativePolls = true;
+  const calls = [];
+  const vote = { pollMessageId: "WA.poll-1", selectedOptions: ["Approve"], chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "vote-1" };
+  const fetcher = async (url, token, init = {}) => { calls.push({ url, token, init }); return String(url).includes("/status?") ? { registered: true, status: "active", pollId: "WA.poll-1" } : { acknowledgement: "Council approved." }; };
+  const result = await processCouncilPollVote(vote, config, { fetcher });
+  await processCouncilPollVote(vote, config, { fetcher });
+  assert.deepEqual(result, { ok: true, status: "accepted", message: "Council approved." });
+  const decisionCalls = calls.filter((call) => call.init.method === "POST");
+  assert.match(decisionCalls[0].url, /\/api\/whatsapp\/poll\/decision$/);
+  assert.deepEqual(JSON.parse(decisionCalls[0].init.body), { pollId: "WA.poll-1", verdict: "approved" });
+  assert.match(decisionCalls[0].init.headers["x-request-id"], /^council-poll-vote:[a-f0-9]{48}$/);
+  assert.equal(decisionCalls[0].init.headers["x-request-id"], decisionCalls[1].init.headers["x-request-id"]);
+  await processCouncilPollVote({ ...vote, messageId: "vote-2" }, config, { fetcher });
+  const allDecisionCalls = calls.filter((call) => call.init.method === "POST");
+  assert.notEqual(allDecisionCalls[0].init.headers["x-request-id"], allDecisionCalls[2].init.headers["x-request-id"]);
+  assert.equal(calls[0].init.headers["x-council-workspace"], "solar_ops");
+  const unrelated = await processCouncilPollVote({ pollMessageId: "WA.poll-2", selectedOptions: ["Approve"], chatId: "999@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "vote-2" }, config, { fetcher: async () => { throw new Error("unrelated vote must not call Council"); } });
+  assert.equal(unrelated.ok, false);
+  const unknown = await processCouncilPollVote({ ...vote, pollMessageId: "foreign-poll" }, config, { registrationWaitMs: 0, fetcher: async () => { const error = new Error("not found"); error.status = 404; throw error; } });
+  assert.deepEqual(unknown, { ok: false, status: "unclaimed", message: "This poll is not a registered Council approval." });
+  let statusAttempts = 0;
+  const delayed = await processCouncilPollVote({ ...vote, pollMessageId: "delayed-poll" }, config, { registrationWaitMs: 1_200, fetcher: async (url, token, init = {}) => {
+    if (String(url).includes("/status?")) { statusAttempts += 1; if (statusAttempts < 12) { const error = new Error("not found yet"); error.status = 404; throw error; } return { registered: true, status: "active", pollId: "delayed-poll" }; }
+    return { acknowledgement: "Council approved." };
+  } });
+  assert.equal(delayed.ok, true);
+  assert.ok(statusAttempts >= 12);
+  fs.rmSync(directory, { recursive: true, force: true });
 });
 
 function fixture() {
