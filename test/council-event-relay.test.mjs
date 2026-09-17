@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CouncilCursorTooOldError, eventPrompt, openStream, reconciliationPrompt, relayConfig, runRelay, safeReconcileSnapshot, sseEvents } from "../scripts/council-event-relay.mjs";
+import { sendWhatsAppNotification } from "../scripts/lib/bridge-state.mjs";
 const permit = (caseId = "case_a", rev = 2, digest = "a".repeat(64), scope = "design") => ({ caseId, rev, digest, scope, issuedBy: "owner", issuedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
 
 const event = { seq: 4, eventId: "evt-4", kind: "whatsapp.permit", caseId: "case_a", rev: 2, digest: "a".repeat(64), permitId: "wp_opaque_permit_123456", summary: "Review the bounded plan.", approvalChannels: ["web"], riskClass: "financial", scope: "design", whatsappPermit: permit() };
@@ -88,7 +89,17 @@ test("relay wakes one configured task, writes a private cursor only after comple
   assert.doesNotMatch(turn.prompt, /wp_opaque_permit_123456/);
   assert.match(notices[0].text, /APPROVE case_a REV 2 DIGEST/);
   assert.doesNotMatch(notices[0].text, /wp_opaque_permit_123456/);
-  assert.match(notices[0].deliveryKey, /^council-approval:[a-f0-9]{48}$/);
+  assert.match(notices[0].deliveryKey, /^council-appr-[a-f0-9]{48}$/);
+  assert.doesNotMatch(notices[0].deliveryKey, /:/);
+  let sentBody;
+  await sendWhatsAppNotification(notices[0], {
+    bridgeUrl: config.whatsapp.bridgeUrl,
+    fetchImpl: async (_url, init) => {
+      sentBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ messageIds: ["wamid.valid"] }), { status: 200 });
+    },
+  });
+  assert.equal(sentBody.deliveryKey, notices[0].deliveryKey);
   const stored = fs.readFileSync(statePath, "utf8");
   assert.equal(JSON.parse(stored).cursor, 4);
   assert.doesNotMatch(stored, /wp_opaque_permit_123456/);
