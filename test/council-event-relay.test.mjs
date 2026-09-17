@@ -89,8 +89,7 @@ test("relay wakes one configured task, writes a private cursor only after comple
   assert.doesNotMatch(turn.prompt, /wp_opaque_permit_123456/);
   assert.match(notices[0].text, /APPROVE case_a REV 2 DIGEST/);
   assert.doesNotMatch(notices[0].text, /wp_opaque_permit_123456/);
-  assert.match(notices[0].deliveryKey, /^council-appr-[a-f0-9]{48}$/);
-  assert.doesNotMatch(notices[0].deliveryKey, /:/);
+  assert.match(notices[0].deliveryKey, /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
   let sentBody;
   await sendWhatsAppNotification(notices[0], {
     bridgeUrl: config.whatsapp.bridgeUrl,
