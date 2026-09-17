@@ -63,6 +63,32 @@ class ConfigureHermesTests(unittest.TestCase):
         self.assertEqual(extra["group_allow_from"], ["older@g.us", "123-456@g.us"])
         self.assertEqual(extra["free_response_chats"], ["older@g.us", "123-456@g.us"])
 
+    def test_optional_council_claim_is_exactly_scoped_without_replacing_codex_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "config.yaml"
+            target.write_text(yaml.safe_dump({}), encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable, str(SCRIPT), "--config", str(target),
+                    "--chat-id", "123-456@g.us", "--allowed-sender", "15551234567@s.whatsapp.net",
+                    "--council-chat-id", "789-012@g.us", "--council-allowed-sender", "15551234567@s.whatsapp.net",
+                ], check=True,
+            )
+            extra = yaml.safe_load(target.read_text(encoding="utf-8"))["gateway"]["platforms"]["whatsapp"]["extra"]
+            self.assertEqual([claim["chat_id"] for claim in extra["exclusive_inbound"]], ["123-456@g.us", "789-012@g.us"])
+            self.assertEqual(extra["exclusive_inbound"][1]["allowed_senders"], ["15551234567@s.whatsapp.net"])
+
+    def test_council_claim_requires_a_sender(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "config.yaml"
+            target.write_text(yaml.safe_dump({}), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--config", str(target), "--chat-id", "123-456@g.us",
+                 "--allowed-sender", "15551234567@s.whatsapp.net", "--council-chat-id", "789-012@g.us"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

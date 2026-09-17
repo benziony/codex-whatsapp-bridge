@@ -26,6 +26,8 @@ _MAX_ATTACHMENT_COUNT = 10
 _MAX_ATTACHMENT_BYTES = 128 * 1024 * 1024
 _MAX_AUDIO_BYTES = 25 * 1024 * 1024
 _TRANSCRIBE_TIMEOUT = 90
+_COUNCIL_APPROVAL_TIMEOUT = 75
+_COUNCIL_RECOVERY_TIMEOUT = 15
 _TRANSCRIBER = Path(__file__).with_name("voice_transcriber.py")
 
 
@@ -76,6 +78,23 @@ def _authorized(event: Any, config: dict[str, Any]) -> tuple[str, str, str] | No
     message_id = _message_id(getattr(event, "message_id", None))
     configured_chat = _normalize_jid(whatsapp.get("chatId"), group=True)
     raw_allowed = whatsapp.get("allowedSenders")
+    if not isinstance(raw_allowed, list) or not raw_allowed:
+        return None
+    allowed = {_normalize_jid(value) for value in raw_allowed}
+    if None in allowed or chat_id != configured_chat or sender_id not in allowed:
+        return None
+    return sender_id, chat_id, message_id if message_id else ""
+
+
+def _council_authorized(event: Any, config: dict[str, Any]) -> tuple[str, str, str] | None:
+    council = config.get("councilApprovals")
+    if not isinstance(council, dict):
+        return None
+    chat_id = _normalize_jid(getattr(event.source, "chat_id", None), group=True)
+    sender_id = _normalize_jid(getattr(event.source, "user_id", None))
+    message_id = _message_id(getattr(event, "message_id", None))
+    configured_chat = _normalize_jid(council.get("chatId"), group=True)
+    raw_allowed = council.get("allowedSenders")
     if not isinstance(raw_allowed, list) or not raw_allowed:
         return None
     allowed = {_normalize_jid(value) for value in raw_allowed}
@@ -256,9 +275,24 @@ async def _broker(command: str, payload: dict[str, Any], config: dict[str, Any])
             raise RuntimeError("Codex WhatsApp broker returned invalid data")
         return result
 
+    council_command = command in {"council-approval", "council-approval-recover"}
     try:
-        return await invoke(command, payload, 120 if payload.get("attachments") else 15)
+        # A Council approval includes bounded dashboard, permit, decision, and
+        # possible exact-readback calls. Keep that end-to-end budget separate
+        # from ordinary Codex admission and never mix recovery stores.
+        timeout = 120 if payload.get("attachments") else _COUNCIL_APPROVAL_TIMEOUT if command == "council-approval" else 15
+        return await invoke(command, payload, timeout)
     except asyncio.TimeoutError as error:
+        if council_command:
+            if command == "council-approval-recover":
+                raise RuntimeError("Council approval readback timed out") from error
+            try:
+                recovery = await invoke("council-approval-recover", payload, _COUNCIL_RECOVERY_TIMEOUT)
+            except asyncio.TimeoutError as recovery_error:
+                raise RuntimeError("Council approval exact readback timed out") from recovery_error
+            if recovery.get("status") == "accepted" and recovery.get("ok") is True:
+                return recovery
+            raise RuntimeError("Council approval outcome is uncertain; no exact decision readback") from error
         # The timed-out process is dead and reaped before we inspect durable
         # state. If it committed immediately before termination, return a
         # duplicate-success result so WhatsApp is never told a queued delivery
@@ -279,6 +313,25 @@ async def _broker(command: str, payload: dict[str, Any], config: dict[str, Any])
 
 async def _admit(event: Any) -> bool | str:
     config = _read_config()
+    council_context = _council_authorized(event, config) if config else None
+    if council_context is not None:
+        sender_id, chat_id, message_id = council_context
+        if not message_id:
+            return "This Council approval message has no valid message identity."
+        if getattr(getattr(event, "message_type", None), "value", "") in {"voice", "audio"}:
+            return "Council approvals require exact text commands."
+        metadata = getattr(event, "metadata", None)
+        original_body = metadata.get("whatsapp_original_body") if isinstance(metadata, dict) else None
+        body = str(original_body if isinstance(original_body, str) else (getattr(event, "text", "") or ""))
+        if not body.strip():
+            return "Council approval message is empty."
+        try:
+            result = await _broker("council-approval", {"text": body, "chatId": chat_id, "senderId": sender_id, "messageId": message_id}, config)
+        except Exception:
+            return "Council approval could not be verified. No decision was recorded."
+        acknowledgement = result.get("acknowledgement")
+        return acknowledgement[:500] if isinstance(acknowledgement, str) and acknowledgement.strip() else "Council approval was not recorded."
+
     context = _authorized(event, config) if config else None
     if context is None or not context[2]:
         return "This WhatsApp sender or message identity is not allowed for Codex."

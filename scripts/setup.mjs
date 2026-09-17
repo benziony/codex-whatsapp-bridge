@@ -154,9 +154,66 @@ async function main() {
     if (isGateway && (!allowedSenders.length || allowedSenders.some((value) => !exactUser.test(value)))) {
       throw new Error("allowed-senders must contain exact @s.whatsapp.net or @lid JIDs");
     }
+    const councilChatId = isGateway
+      ? await answer(rl, "council-chat-id", "Optional Council Approvals group JID", existing?.councilApprovals?.chatId ?? "")
+      : existing?.councilApprovals?.chatId ?? "";
+    const councilEnabled = Boolean(councilChatId);
+    if (councilEnabled && !exactChat.test(councilChatId)) throw new Error("council-chat-id must be an exact @g.us JID");
+    const councilSenderText = councilEnabled
+      ? await answer(rl, "council-allowed-senders", "Council approval sender JIDs, comma separated", (existing?.councilApprovals?.allowedSenders ?? []).join(","))
+      : "";
+    const councilAllowedSenders = councilSenderText.split(",").map((value) => value.trim()).filter(Boolean);
+    if (councilEnabled && (!councilAllowedSenders.length || councilAllowedSenders.some((value) => !exactUser.test(value)))) {
+      throw new Error("council-allowed-senders must contain exact @s.whatsapp.net or @lid JIDs");
+    }
+    const councilUrl = councilEnabled
+      ? await answer(rl, "council-url", "Council HTTPS URL", existing?.councilApprovals?.councilUrl ?? "https://council.panelsgroup.com")
+      : "";
+    if (councilEnabled && !/^https:\/\/[^/]+$/i.test(councilUrl)) throw new Error("council-url must be an HTTPS origin");
+    const councilWorkspace = councilEnabled
+      ? await answer(rl, "council-workspace", "Council workspace", existing?.councilApprovals?.workspace ?? "default")
+      : "";
+    if (councilEnabled && !/^[A-Za-z0-9_-]{1,64}$/.test(councilWorkspace)) throw new Error("council-workspace must be a bounded workspace identifier");
+    const councilCredentialFile = councilEnabled
+      ? await answer(rl, "council-codex-credential-file", "Private Codex Council token file (leave blank to use env)", existing?.councilApprovals?.codexCredentialFile ?? "")
+      : "";
+    const councilTokenEnv = councilEnabled
+      ? await answer(rl, "council-codex-token-env", "Codex Council token environment variable (if no file)", existing?.councilApprovals?.codexTokenEnv ?? "")
+      : "";
+    if (councilEnabled && ((Boolean(councilCredentialFile) && Boolean(councilTokenEnv)) || (!councilCredentialFile && !councilTokenEnv))) throw new Error("Council approvals need exactly one credential file or environment variable");
+    if (councilCredentialFile && !path.isAbsolute(councilCredentialFile)) throw new Error("council-codex-credential-file must be absolute");
+    if (councilTokenEnv && !/^[A-Z_][A-Z0-9_]*$/.test(councilTokenEnv)) throw new Error("council-codex-token-env must be an uppercase environment variable name");
     const defaultCwd = isCodex
       ? path.resolve(await answer(rl, "default-cwd", "Working directory for new Codex tasks", existing?.codex?.defaultCwd ?? process.cwd()))
       : existing?.codex?.defaultCwd ?? "";
+    const councilPushUrl = isCodex
+      ? await answer(rl, "council-push-url", "Optional Council event stream HTTPS URL", existing?.councilPush?.councilUrl ?? "")
+      : existing?.councilPush?.councilUrl ?? "";
+    const councilPushEnabled = Boolean(councilPushUrl);
+    if (councilPushEnabled && !/^https:\/\/[^/]+$/i.test(councilPushUrl)) throw new Error("council-push-url must be an HTTPS origin");
+    const councilPushCredentialFile = councilPushEnabled
+      ? await answer(rl, "council-push-codex-credential-file", "Private Codex Council token file (leave blank to use env)", existing?.councilPush?.codexCredentialFile ?? "")
+      : "";
+    const councilPushTokenEnv = councilPushEnabled
+      ? await answer(rl, "council-push-codex-token-env", "Codex Council token environment variable (if no file)", existing?.councilPush?.codexTokenEnv ?? "")
+      : "";
+    if (councilPushEnabled && ((Boolean(councilPushCredentialFile) && Boolean(councilPushTokenEnv)) || (!councilPushCredentialFile && !councilPushTokenEnv))) throw new Error("Council push needs exactly one Codex credential file or environment variable");
+    if (councilPushCredentialFile && !path.isAbsolute(councilPushCredentialFile)) throw new Error("council-push-codex-credential-file must be absolute");
+    if (councilPushTokenEnv && !/^[A-Z_][A-Z0-9_]*$/.test(councilPushTokenEnv)) throw new Error("council-push-codex-token-env must be an uppercase environment variable name");
+    const councilPushSessionId = councilPushEnabled
+      ? await answer(rl, "council-push-session-id", "Optional existing Codex task ID for Council events (leave blank for fresh tasks)", existing?.councilPush?.sessionId ?? "")
+      : "";
+    const councilPushCwd = councilPushEnabled
+      ? path.resolve(await answer(rl, "council-push-cwd", "Working directory for Council event tasks", existing?.councilPush?.cwd ?? defaultCwd))
+      : "";
+    const councilPushWorkspace = councilPushEnabled
+      ? await answer(rl, "council-push-workspace", "Council event workspace", existing?.councilPush?.workspace ?? "default")
+      : "";
+    if (councilPushEnabled && !/^[A-Za-z0-9_-]{1,64}$/.test(councilPushWorkspace)) throw new Error("council-push-workspace must be a bounded workspace identifier");
+    const councilApprovalRef = councilCredentialFile ? `file:${councilCredentialFile}` : councilTokenEnv ? `env:${councilTokenEnv}` : "";
+    const councilPushRef = councilPushCredentialFile ? `file:${councilPushCredentialFile}` : councilPushTokenEnv ? `env:${councilPushTokenEnv}` : "";
+    if (councilEnabled && councilPushEnabled && councilApprovalRef !== councilPushRef) throw new Error("Council approvals and push must use the same Codex credential reference");
+    if (councilEnabled && councilPushEnabled && councilWorkspace !== councilPushWorkspace) throw new Error("Council approvals and push must use the same workspace");
     const codexTargetHost = isGateway
       ? await answer(rl, "codex-host-id", "Host ID for new unquoted Codex tasks", existing?.codexInbox?.originHost ?? (isCodex ? hostId : ""))
       : hostId;
@@ -225,6 +282,29 @@ async function main() {
         bridgeUrl: existing?.whatsapp?.bridgeUrl ?? "http://127.0.0.1:3000",
         attachmentSourceRoots,
       },
+      ...(councilEnabled ? {
+        councilApprovals: {
+          chatId: councilChatId,
+          allowedSenders: councilAllowedSenders,
+          councilUrl,
+          ...(councilCredentialFile ? { codexCredentialFile: councilCredentialFile } : {}),
+          ...(councilTokenEnv ? { codexTokenEnv: councilTokenEnv } : {}),
+          scope: existing?.councilApprovals?.scope ?? "design",
+          workspace: councilWorkspace,
+        },
+      } : {}),
+      ...(councilPushEnabled ? {
+        councilPush: {
+          enabled: true,
+          councilUrl: councilPushUrl,
+          ...(councilPushCredentialFile ? { codexCredentialFile: councilPushCredentialFile } : {}),
+          ...(councilPushTokenEnv ? { codexTokenEnv: councilPushTokenEnv } : {}),
+          ...(councilPushSessionId ? { sessionId: councilPushSessionId } : {}),
+          cwd: councilPushCwd,
+          workspace: councilPushWorkspace,
+          ...(existing?.councilPush?.statePath ? { statePath: existing.councilPush.statePath } : {}),
+        },
+      } : {}),
       codex: {
         binary: existing?.codex?.binary ?? "/opt/homebrew/bin/codex",
         defaultCwd,
@@ -243,6 +323,8 @@ async function main() {
       hostId,
       dedicatedChatConfigured: Boolean(chatId),
       allowedSenderCount: allowedSenders.length,
+      councilApprovals: councilEnabled ? { chatId: councilChatId, allowedSenderCount: councilAllowedSenders.length, councilUrl } : null,
+      councilPush: councilPushEnabled ? { councilUrl: councilPushUrl, cwd: councilPushCwd, freshTasks: !councilPushSessionId } : null,
       mirrorProgress: config.codex.mirrorProgress,
       gateway: {
         repositoryPath: gatewayRepo,
@@ -257,7 +339,7 @@ async function main() {
         ? (hermesCompatibilityReady(hermesCheckout) ? "native" : `patch for ${supportedHermesCommit}`)
         : null,
       codexHooks: isCodex ? path.join(home, ".codex", "hooks.json") : null,
-      launchAgents: [isCodex ? "com.codex-whatsapp-bridge.client" : null, isGateway ? "com.codex-whatsapp-bridge.updates" : null].filter(Boolean),
+      launchAgents: [isCodex ? "com.codex-whatsapp-bridge.client" : null, isCodex && councilPushEnabled ? "com.codex-whatsapp-bridge.council-events" : null, isGateway ? "com.codex-whatsapp-bridge.updates" : null].filter(Boolean),
     };
     console.log(JSON.stringify(plan, null, 2));
     if (!apply) return;
@@ -317,6 +399,7 @@ async function main() {
           "--config", hermesConfig,
           "--chat-id", chatId,
           ...allowedSenders.flatMap((sender) => ["--allowed-sender", sender]),
+          ...(councilEnabled ? ["--council-chat-id", councilChatId, ...councilAllowedSenders.flatMap((sender) => ["--council-allowed-sender", sender])] : []),
         ], { cwd: hermesCheckout });
         if (configured.status !== 0) throw new Error(configured.stderr || "Could not configure Hermes");
       }
@@ -333,6 +416,16 @@ async function main() {
           stdout: path.join(logs, "client.log"),
           stderr: path.join(logs, "client.error.log"),
         }), snapshot);
+        if (councilPushEnabled) {
+          touchedServices.push("com.codex-whatsapp-bridge.council-events");
+          installPlist("com.codex-whatsapp-bridge.council-events", plist({
+            label: "com.codex-whatsapp-bridge.council-events",
+            args: [process.execPath, path.join(root, "scripts", "council-event-relay.mjs"), "run"],
+            keepAlive: true,
+            stdout: path.join(logs, "council-events.log"),
+            stderr: path.join(logs, "council-events.error.log"),
+          }), snapshot);
+        }
       }
       if (isGateway) {
         touchedServices.push("com.codex-whatsapp-bridge.updates");

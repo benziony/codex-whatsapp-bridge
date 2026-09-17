@@ -21,6 +21,21 @@ Runtime configuration is stored at
     "bridgeUrl": "http://127.0.0.1:3000",
     "attachmentSourceRoots": ["/absolute/hermes/media/cache"]
   },
+  "councilApprovals": {
+    "chatId": "2345678901-2345678901@g.us",
+    "allowedSenders": ["15551234567@s.whatsapp.net"],
+    "councilUrl": "https://council.panelsgroup.com",
+    "codexCredentialFile": "/absolute/private/codex-council-token",
+    "scope": "design",
+    "workspace": "default"
+  },
+  "councilPush": {
+    "enabled": true,
+    "councilUrl": "https://council.panelsgroup.com",
+    "codexCredentialFile": "/absolute/private/codex-council-token",
+    "workspace": "default",
+    "cwd": "/absolute/project/or/inbox/directory"
+  },
   "codex": {
     "binary": "/opt/homebrew/bin/codex",
     "defaultCwd": "/absolute/project/or/inbox/directory",
@@ -32,6 +47,42 @@ Runtime configuration is stored at
   }
 }
 ```
+
+`councilApprovals` is optional and is deliberately a separate exact-chat
+claim. It uses the Codex principal credential reference (`codexCredentialFile`
+or `codexTokenEnv`), not an owner credential. When push is also enabled, both
+sections must name the same file or environment variable and workspace.
+Every dashboard, permit, decision, and readback request carries that explicit
+workspace. Incoming commands
+must be exactly `APPROVE|REJECT case_id REV n DIGEST sha256`. The bridge
+fetches current Council state before every decision, requires the exact
+owner-issued unexpired `whatsappPermit` metadata and opaque permit reference,
+then refetches that reference from the exact Codex-authenticated
+`GET /api/whatsapp/permit?caseId=...&rev=...&digest=...` route immediately
+before the decision. It sends the reference only in the authenticated HTTPS
+`POST /api/whatsapp/decision` call.
+It never trusts agent-supplied risk or channel fields, and never puts the
+permit reference in WhatsApp, prompts, logs, or replay state. Credential
+creation, permission broadening, destructive, and financial approvals remain
+web-only in Council. Existing Codex Blockers routing remains independent.
+
+`councilPush` is an optional outbound-only Council event consumer for the
+Codex-role Mac. It uses a separate Codex-principal credential reference (never
+the owner credential), keeps a `0600` replay cursor, reconnects with bounded
+backoff, and wakes a fresh Codex task per event by default. An explicit
+`sessionId` is supported only for a reviewed task-owned setup. It opens no
+inbound Mac port. If an event is explicitly WhatsApp-eligible, the consumer
+also sends a bounded approval notice to the configured Council Approvals chat
+using a stable delivery key; the event summary is included only when marked
+safe by the Council event.
+
+If the Council stream returns `410 Gone` because the cursor is older than the
+replay floor, the relay calls the authenticated
+`GET /api/events/reconcile?since=N&workspace=...` endpoint. Council must return
+the flat bounded shape `{latestCursor,replayFloor,pendingProposals,activeJobs,inboxRefs}`.
+The relay sends only an allowlisted redacted snapshot to a fresh reconciliation
+task and advances the cursor after that task completes; it never silently
+resets or discards a cursor.
 
 For split topology the gateway configures `codexInbox.originHost` and the
 absolute new-task directory on the Codex Mac. The Codex host configures
@@ -67,6 +118,11 @@ gateway:
           allowed_senders:
             - "15551234567@s.whatsapp.net"
 ```
+
+When Council approvals are enabled, `extra.exclusive_inbound` is a list of
+two claims (the normal Codex claim and the Council Approvals claim), each with
+its own exact chat and sender allowlist. Older Hermes compatibility patches
+that only accept one mapping must be upgraded before applying this setting.
 
 Setup also makes the exact dedicated group reachable under Hermes' normal
 group intake rules and exempts only that group from mention requirements. It
