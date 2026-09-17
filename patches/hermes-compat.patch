@@ -267,56 +267,49 @@ index 6c7838398b..6eb1a8d4a0 100644
          adapter.set_busy_session_handler(
              self._make_profile_busy_session_handler(profile_name)
          )
-@@ -16703,6 +16706,187 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -16703,6 +16706,181 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
  
          return _handler
  
 +    @staticmethod
-+    def _exclusive_inbound_claim(adapter: BasePlatformAdapter) -> Optional[dict]:
-+        """Validate and return one adapter-scoped exclusive inbound claim."""
++    def _exclusive_inbound_claim(adapter: BasePlatformAdapter) -> Optional[list[dict]]:
++        """Validate and return adapter-scoped exact-chat inbound claims."""
 +        extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
 +        raw = extra.get("exclusive_inbound")
 +        if raw is None:
 +            return None
-+        if not isinstance(raw, dict):
-+            raise ValueError("platform extra.exclusive_inbound must be a mapping")
-+        chat_id = raw.get("chat_id")
-+        handler = raw.get("handler")
-+        if not isinstance(chat_id, str) or not chat_id.strip():
-+            raise ValueError("exclusive_inbound.chat_id must be a non-empty string")
-+        if not isinstance(handler, str) or not handler.strip():
-+            raise ValueError("exclusive_inbound.handler must be a non-empty string")
-+        allowed_senders = raw.get("allowed_senders")
-+        if allowed_senders is not None and (
-+            not isinstance(allowed_senders, list)
-+            or not allowed_senders
-+            or any(not isinstance(item, str) or not item.strip() for item in allowed_senders)
-+        ):
-+            raise ValueError(
-+                "exclusive_inbound.allowed_senders must be a non-empty list of strings"
-+            )
-+        failure_message = raw.get("failure_message")
-+        if failure_message is not None and (
-+            not isinstance(failure_message, str) or not failure_message.strip()
-+        ):
-+            raise ValueError(
-+                "exclusive_inbound.failure_message must be a non-empty string"
-+            )
-+        return {
-+            "chat_id": chat_id.strip(),
-+            "handler": handler.strip(),
-+            "allowed_senders": (
-+                {item.strip().lower() for item in allowed_senders}
-+                if isinstance(allowed_senders, list)
-+                else None
-+            ),
-+            "failure_message": (
-+                failure_message.strip()
-+                if isinstance(failure_message, str)
-+                else "This message could not be accepted by the configured "
-+                "inbound handler. Please try again or check Hermes."
-+            ),
-+        }
++        claims = raw if isinstance(raw, list) else [raw]
++        if not claims or any(not isinstance(item, dict) for item in claims):
++            raise ValueError("platform extra.exclusive_inbound must be a mapping or list of mappings")
++        result = []
++        seen_chats = set()
++        for item in claims:
++            chat_id = item.get("chat_id")
++            handler = item.get("handler")
++            if not isinstance(chat_id, str) or not chat_id.strip():
++                raise ValueError("exclusive_inbound.chat_id must be a non-empty string")
++            if not isinstance(handler, str) or not handler.strip():
++                raise ValueError("exclusive_inbound.handler must be a non-empty string")
++            if chat_id.strip() in seen_chats:
++                raise ValueError("exclusive_inbound chat IDs must be unique")
++            seen_chats.add(chat_id.strip())
++            allowed_senders = item.get("allowed_senders")
++            if allowed_senders is not None and (
++                not isinstance(allowed_senders, list)
++                or not allowed_senders
++                or any(not isinstance(value, str) or not value.strip() for value in allowed_senders)
++            ):
++                raise ValueError("exclusive_inbound.allowed_senders must be a non-empty list of strings")
++            failure_message = item.get("failure_message")
++            if failure_message is not None and (not isinstance(failure_message, str) or not failure_message.strip()):
++                raise ValueError("exclusive_inbound.failure_message must be a non-empty string")
++            result.append({
++                "chat_id": chat_id.strip(),
++                "handler": handler.strip(),
++                "allowed_senders": ({value.strip().lower() for value in allowed_senders} if isinstance(allowed_senders, list) else None),
++                "failure_message": (failure_message.strip() if isinstance(failure_message, str) else "This message could not be accepted by the configured inbound handler. Please try again or check Hermes."),
++            })
++        return result
 +
 +    async def _send_exclusive_inbound_failure(
 +        self,
@@ -352,16 +345,16 @@ index 6c7838398b..6eb1a8d4a0 100644
 +        profile_name: Optional[str] = None,
 +    ) -> None:
 +        """Install one exact-chat, runner-owned exclusive admission boundary."""
-+        claim = self._exclusive_inbound_claim(adapter)
++        claims = self._exclusive_inbound_claim(adapter)
 +        setter = getattr(adapter, "set_exclusive_inbound_handler", None)
 +        if not callable(setter):
-+            if claim is not None:
++            if claims is not None:
 +                raise TypeError(
 +                    "adapter with exclusive_inbound config does not support "
 +                    "per-message admission"
 +                )
 +            return
-+        if claim is None:
++        if claims is None:
 +            setter(None)
 +            return
 +
@@ -380,7 +373,8 @@ index 6c7838398b..6eb1a8d4a0 100644
 +
 +        async def _handler(event: MessageEvent) -> bool:
 +            source = event.source
-+            if str(getattr(source, "chat_id", "")) != claim["chat_id"]:
++            claim = next((item for item in claims if str(getattr(source, "chat_id", "")) == item["chat_id"]), None)
++            if claim is None:
 +                return False
 +
 +            # A matched claim is always consumed. Missing plugins, collisions,

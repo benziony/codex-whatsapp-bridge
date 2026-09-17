@@ -5,6 +5,7 @@ import {
   sendWhatsAppNotification,
   sendWhatsAppReaction,
 } from "./lib/bridge-state.mjs";
+import { processCouncilApproval, recoverCouncilApproval } from "./lib/council-approvals.mjs";
 import { bridgePaths, readConfig } from "./lib/runtime-config.mjs";
 
 async function readStandardInput() {
@@ -104,6 +105,26 @@ async function execute(broker, command, payload, bridgeUrl) {
   }
   if (command === "ingest") return broker.ingest(payload);
   if (command === "ingest-new-task") return broker.ingestNewTask(payload);
+  if (command === "council-approval") {
+    const result = await processCouncilApproval(payload.text, readConfig({ required: true }), {
+      context: { chatId: payload.chatId, senderId: payload.senderId, messageId: payload.messageId },
+    });
+    return {
+      ok: result.ok,
+      status: result.ok ? "accepted" : "rejected",
+      acknowledgement: result.message,
+    };
+  }
+  if (command === "council-approval-recover") {
+    const result = await recoverCouncilApproval(payload.text, readConfig({ required: true }), {
+      context: { chatId: payload.chatId, senderId: payload.senderId, messageId: payload.messageId },
+    });
+    return {
+      ok: result.ok,
+      status: result.ok ? "accepted" : "rejected",
+      acknowledgement: result.message,
+    };
+  }
   if (command === "inbox-target") return broker.inboxTarget();
   if (command === "admission-status") return broker.admissionStatus(payload);
   if (command === "bind-task") return broker.bindTask(payload);

@@ -15,6 +15,8 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--chat-id", required=True)
     parser.add_argument("--allowed-sender", action="append", default=[])
+    parser.add_argument("--council-chat-id")
+    parser.add_argument("--council-allowed-sender", action="append", default=[])
     args = parser.parse_args()
     target = Path(args.config).expanduser()
     data = yaml.safe_load(target.read_text(encoding="utf-8")) if target.exists() else {}
@@ -45,7 +47,7 @@ def main() -> int:
     if not isinstance(users, list):
         raise SystemExit("Hermes whatsapp allow_from must be a list or comma-separated text")
     extra["allow_from"] = list(dict.fromkeys([*map(str, users), *args.allowed_sender]))
-    extra["exclusive_inbound"] = {
+    primary_claim = {
         "chat_id": args.chat_id,
         "handler": "codex_whatsapp_bridge",
         "allowed_senders": args.allowed_sender,
@@ -54,6 +56,23 @@ def main() -> int:
             "Please try again or open Codex."
         ),
     }
+    if args.council_chat_id:
+        if not args.council_allowed_sender:
+            raise SystemExit("council approval claim requires at least one allowed sender")
+        extra["exclusive_inbound"] = [
+            primary_claim,
+            {
+                "chat_id": args.council_chat_id,
+                "handler": "codex_whatsapp_bridge",
+                "allowed_senders": args.council_allowed_sender,
+                "failure_message": (
+                    "This Council approval could not be verified. "
+                    "No decision was recorded."
+                ),
+            },
+        ]
+    else:
+        extra["exclusive_inbound"] = primary_claim
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
