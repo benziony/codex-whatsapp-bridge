@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { runCodexAppServerTurn } from "./lib/codex-app-server.mjs";
-import { sendWhatsAppNotification } from "./lib/bridge-state.mjs";
+import { sendWhatsAppNotification, sendWhatsAppPoll } from "./lib/bridge-state.mjs";
 import { bridgePaths, codexBinaryPath, readConfig } from "./lib/runtime-config.mjs";
 import { isCurrentWhatsappPermit, readBearerCredential } from "./lib/council-approvals.mjs";
 
@@ -92,10 +92,53 @@ function approvalNotification(event, config) {
       expiresAt: event.expiresAt,
     };
   if (!isCurrentWhatsappPermit(permit, { caseId: event.caseId, rev: event.rev, digest: event.digest, scope: approvals.scope })) return null;
+  const safeSummary = typeof event.safeSummary === "string" && event.safeSummary.trim()
+    ? event.safeSummary.trim().slice(0, 500)
+    : "A Council proposal is ready for owner review.";
+  const proposalBody = typeof event.proposalBody === "string" && event.proposalBody.trim()
+    ? event.proposalBody.trim().slice(0, 900)
+    : "";
+  const fixedContext = [
+    "Council approval requested.",
+    `Case ${event.caseId}, revision ${event.rev}.`,
+    `Risk: ${typeof event.riskClass === "string" ? event.riskClass.slice(0, 64) : "unspecified"}.`,
+    `Channels: ${Array.isArray(event.approvalChannels) ? event.approvalChannels.slice(0, 4).map((value) => String(value).slice(0, 32)).join(", ") : "web"}.`,
+    `Digest fingerprint: ${event.digest.slice(0, 12)}.`,
+    `Scope: ${permit.scope}`,
+    `Expires: ${String(permit.expiresAt).slice(0, 32)}`,
+  ].join("\n");
+  const details = [safeSummary, proposalBody ? `Proposal: ${proposalBody}` : ""].filter(Boolean).join("\n");
+  const context = `${fixedContext}\n${details.slice(0, Math.max(0, 1_200 - fixedContext.length - 1))}`.slice(0, 1_200);
   const text = `Council approval available\nCase: ${event.caseId} rev ${event.rev}\nDigest: ${event.digest.toLowerCase()}\nScope: ${permit.scope}\n\nApprove: APPROVE ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}\nReject: REJECT ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}`;
-  const keyHash = createHash("sha256").update(event.eventId).digest("hex").slice(0, 32);
+  // Keep the event-derived key stable across retries while conforming to the
+  // bridge's UUID-v4 delivery-key contract.
+  const keyBytes = Buffer.from(createHash("sha256").update(event.eventId).digest("hex").slice(0, 32), "hex");
+  keyBytes[6] = (keyBytes[6] & 0x0f) | 0x40;
+  keyBytes[8] = (keyBytes[8] & 0x3f) | 0x80;
+  const keyHash = keyBytes.toString("hex");
   const deliveryKey = `${keyHash.slice(0, 8)}-${keyHash.slice(8, 12)}-${keyHash.slice(12, 16)}-${keyHash.slice(16, 20)}-${keyHash.slice(20)}`;
+  if (approvals.nativePolls === true) {
+    const question = `Approve ${safeSummary.slice(0, 72)} (case ${event.caseId} r${event.rev})?`.slice(0, 500);
+    return { target: approvals.chatId, deliveryKey, poll: { target: approvals.chatId, context, question, options: ["Approve", "Reject"], selectableCount: 1, deliveryKey } };
+  }
   return { target: approvals.chatId, text, deliveryKey };
+}
+
+async function registerCouncilPoll(options, event, delivery, config) {
+  const approvals = config?.councilApprovals;
+  if (!approvals?.nativePolls || !delivery?.pollMessageId) return { ok: true, status: "disabled" };
+  if (typeof event?.permitId !== "string" || !/^[A-Za-z0-9_-]{22,256}$/.test(event.permitId)) throw new Error("Council poll permit reference is invalid");
+  const token = readBearerCredential({ credentialFile: options.credentialFile, tokenEnv: options.tokenEnv });
+  const requestId = `council-poll-register:${createHash("sha256").update(String(delivery.pollMessageId)).digest("hex").slice(0, 48)}`;
+  const response = await fetch(`${options.councilUrl}/api/whatsapp/poll/register`, {
+    method: "POST",
+    redirect: "error",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-council-workspace": options.workspace, "x-request-id": requestId },
+    body: JSON.stringify({ pollId: delivery.pollMessageId, permitId: event.permitId, caseId: event.caseId, rev: event.rev, digest: event.digest.toLowerCase(), scope: event.scope ?? approvals.scope }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`Council poll registration failed (${response.status})`);
+  return { ok: true, status: "registered" };
 }
 
 async function* sseEvents(response) {
@@ -233,7 +276,7 @@ async function reconcileCursor(options, cursor, config, turnRunner) {
   return { currentCursor, requestId };
 }
 
-export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
   const options = relayConfig(config);
   if (!options) throw new Error("Council push is not configured");
   let state = readState(options.statePath);
@@ -260,11 +303,20 @@ export async function runRelay(config, { signal = new AbortController().signal, 
         const requestId = `council-event:${event.eventId}`;
         const notification = approvalNotification(event, config);
         if (notification && !(state.notified ?? []).includes(event.eventId)) {
-          try {
+          // Delivery is part of the event's durable processing boundary.  Do not
+          // mark the notification or run the Codex turn until the WhatsApp send
+          // and (for native polls) Council registration both succeed.  A bridge
+          // 425/transport failure must escape this loop so the cursor remains at
+          // the prior event and the next stream connection replays it using the
+          // same stable delivery key.
+          if (notification.poll) {
+            const delivery = await pollSender(notification.poll, { bridgeUrl: config.whatsapp?.bridgeUrl });
+            await pollRegistrar(options, event, { ...delivery, deliveryKey: notification.deliveryKey }, config);
+          } else {
             await notificationSender(notification, { bridgeUrl: config.whatsapp?.bridgeUrl });
-            state = { ...state, notified: [...(state.notified ?? []), event.eventId].slice(-256) };
-            writeState(options.statePath, state);
-          } catch { /* Codex wake remains authoritative; delivery is retried by stable key on replay. */ }
+          }
+          state = { ...state, notified: [...(state.notified ?? []), event.eventId].slice(-256) };
+          writeState(options.statePath, state);
         }
         await turnRunner({ codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt: eventPrompt(event), requestId, sessionId: options.sessionId || null, title: "Agent Council event", turnTimeoutMs: 15 * 60 * 1000 });
         state = { ...state, cursor: event.seq };
@@ -296,4 +348,4 @@ if (process.argv[2] === "run") {
   }
 }
 
-export { CouncilCursorTooOldError, eventPrompt, openStream, readState, reconciliationPrompt, relayConfig, safeReconcileSnapshot, sseEvents, writeState };
+export { CouncilCursorTooOldError, approvalNotification, eventPrompt, openStream, readState, reconciliationPrompt, registerCouncilPoll, relayConfig, safeReconcileSnapshot, sseEvents, writeState };

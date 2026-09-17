@@ -5,7 +5,7 @@ import {
   sendWhatsAppNotification,
   sendWhatsAppReaction,
 } from "./lib/bridge-state.mjs";
-import { processCouncilApproval, recoverCouncilApproval } from "./lib/council-approvals.mjs";
+import { processCouncilApproval, processCouncilPollVote, recoverCouncilApproval } from "./lib/council-approvals.mjs";
 import { bridgePaths, readConfig } from "./lib/runtime-config.mjs";
 
 async function readStandardInput() {
@@ -124,6 +124,10 @@ async function execute(broker, command, payload, bridgeUrl) {
       status: result.ok ? "accepted" : "rejected",
       acknowledgement: result.message,
     };
+  }
+  if (command === "council-poll-vote") {
+    const result = await processCouncilPollVote(payload, readConfig({ required: true }));
+    return { ok: result.ok, status: result.ok ? "accepted" : result.status ?? "rejected", acknowledgement: result.message };
   }
   if (command === "inbox-target") return broker.inboxTarget();
   if (command === "admission-status") return broker.admissionStatus(payload);

@@ -20,7 +20,7 @@ sys.modules[SPEC.name] = plugin
 SPEC.loader.exec_module(plugin)
 
 
-def event(*, chat="123-456@g.us", sender="15551234567@s.whatsapp.net", message="m1", quoted=None):
+def event(*, chat="123-456@g.us", sender="15551234567@s.whatsapp.net", message="m1", quoted=None, metadata=None):
     return SimpleNamespace(
         source=SimpleNamespace(chat_id=chat, user_id=sender),
         message_id=message,
@@ -30,7 +30,7 @@ def event(*, chat="123-456@g.us", sender="15551234567@s.whatsapp.net", message="
         media_urls=[],
         media_types=[],
         raw_message={},
-        metadata={},
+        metadata=metadata or {},
     )
 
 
@@ -52,11 +52,51 @@ def council_config():
         "allowedSenders": ["15551234567@s.whatsapp.net"],
         "councilUrl": "https://council.example",
         "codexCredentialFile": "/private/codex-council-token",
+        "nativePolls": True,
     }
     return value
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_council_poll_vote_is_owner_chat_only_and_brokers_exact_poll(self):
+        calls = []
+        original_config = plugin._read_config
+        original_broker = plugin._broker
+        try:
+            plugin._read_config = council_config
+
+            async def broker(command, payload, _config):
+                calls.append((command, payload))
+                return {"status": "accepted", "acknowledgement": "Council approved."}
+
+            plugin._broker = broker
+            poll = event(chat="789-012@g.us", metadata={"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.poll-1", "selectedOptions": ["Approve"]}}})
+            result = await plugin._admit(poll)
+            unrelated = await plugin._admit(event(chat="999-999@g.us", metadata={"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.poll-2", "selectedOptions": ["Approve"]}}}))
+        finally:
+            plugin._read_config = original_config
+            plugin._broker = original_broker
+        self.assertEqual(result, "Council approved.")
+        self.assertIs(unrelated, False)
+        self.assertEqual(calls, [("council-poll-vote", {"pollMessageId": "WA.poll-1", "selectedOptions": ["Approve"], "chatId": "789-012@g.us", "senderId": "15551234567@s.whatsapp.net", "messageId": "m1"})])
+
+    async def test_invalid_council_poll_vote_is_consumed_without_decision(self):
+        original_config = plugin._read_config
+        original_broker = plugin._broker
+        try:
+            plugin._read_config = council_config
+
+            async def broker(*_args):
+                raise AssertionError("invalid poll must not reach Council")
+
+            plugin._broker = broker
+            poll = event(chat="789-012@g.us", metadata={"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.poll-1", "selectedOptions": ["Approve", "Reject"]}}})
+            result = await plugin._admit(poll)
+        finally:
+            plugin._read_config = original_config
+            plugin._broker = original_broker
+        self.assertIn("could not be identified", result)
+
     async def test_council_timeout_uses_exact_readback_not_admission_status(self):
         calls = []
         original_spawn = plugin.asyncio.create_subprocess_exec
@@ -103,6 +143,41 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(calls, ["council-approval", "council-approval-recover"])
         self.assertNotIn("admission-status", calls)
+
+    async def test_poll_timeout_is_uncertain_without_admission_probe(self):
+        calls = []
+        original_spawn = plugin.asyncio.create_subprocess_exec
+        original_killpg = plugin.os.killpg
+        original_timeout = plugin._COUNCIL_POLL_TIMEOUT
+
+        class Process:
+            returncode = None
+            pid = 1234
+            async def communicate(self, _payload):
+                await asyncio.sleep(1)
+            async def wait(self):
+                self.returncode = -9
+                return self.returncode
+            def kill(self):
+                self.returncode = -9
+
+        async def spawn(*args, **_kwargs):
+            calls.append(args[2])
+            return Process()
+
+        try:
+            plugin.asyncio.create_subprocess_exec = spawn
+            plugin.os.killpg = lambda *_args: None
+            plugin._COUNCIL_POLL_TIMEOUT = 0.01
+            test_config = council_config()
+            test_config["gateway"] = {"repositoryPath": str(PLUGIN.parents[2]), "node": sys.executable}
+            with self.assertRaisesRegex(RuntimeError, "outcome is uncertain"):
+                await plugin._broker("council-poll-vote", {"pollMessageId": "poll-1", "selectedOptions": ["Approve"], "chatId": "789-012@g.us", "senderId": "15551234567@s.whatsapp.net", "messageId": "m1"}, test_config)
+        finally:
+            plugin.asyncio.create_subprocess_exec = original_spawn
+            plugin.os.killpg = original_killpg
+            plugin._COUNCIL_POLL_TIMEOUT = original_timeout
+        self.assertEqual(calls, ["council-poll-vote"])
 
     def test_narrow_sender_and_chat_boundary(self):
         self.assertEqual(

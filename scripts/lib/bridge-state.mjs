@@ -930,6 +930,37 @@ export async function sendWhatsAppNotification(notification, { bridgeUrl, fetchI
   return { ok: true, status: "sent", messageIds };
 }
 
+export async function sendWhatsAppPoll(poll, { bridgeUrl, fetchImpl = globalThis.fetch, timeoutMs = NOTIFICATION_TIMEOUT_MS } = {}) {
+  if (!poll || typeof poll !== "object") throw new Error("Poll is invalid");
+  const target = text(poll.target, "poll target", 192);
+  const question = text(poll.question, "poll question", 500, true);
+  const context = text(poll.context, "poll context", 1_200, true);
+  const options = Array.isArray(poll.options) ? poll.options.map((item, index) => text(item, `poll option ${index + 1}`, 100)) : [];
+  if (options.length < 2 || options.length > 12 || new Set(options).size !== options.length) throw new Error("Poll options are invalid");
+  const selectableCount = poll.selectableCount ?? 1;
+  if (!Number.isSafeInteger(selectableCount) || selectableCount < 1 || selectableCount > options.length) throw new Error("Poll selectable count is invalid");
+  const deliveryKey = text(poll.deliveryKey, "poll delivery key", 64);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deliveryKey)) throw new Error("Poll delivery key must be a UUID");
+  const url = new URL(text(bridgeUrl, "WhatsApp bridge URL", 512));
+  if (url.protocol !== "http:" || !new Set(["127.0.0.1", "localhost", "[::1]"]).has(url.hostname)) throw new Error("WhatsApp bridge URL must use loopback HTTP");
+  url.pathname = "/send-poll";
+  let response;
+  try {
+    response = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chatId: target, context, question, options, selectableCount, deliveryKey }), signal: AbortSignal.timeout(timeoutMs) });
+  } catch (cause) {
+    const error = new Error("WhatsApp poll delivery is uncertain", { cause });
+    error.deliveryUncertain = true;
+    throw error;
+  }
+  let payload;
+  try { payload = await response?.json(); } catch { payload = null; }
+  if (!response?.ok) throw new Error("WhatsApp bridge rejected the poll");
+  const pollMessageId = validMessageId(payload?.pollMessageId, "pollMessageId");
+  const messageIds = Array.isArray(payload?.messageIds) ? [...new Set(payload.messageIds.map((item) => validMessageId(item)))] : [];
+  if (!messageIds.includes(pollMessageId)) throw new Error("WhatsApp bridge returned inconsistent poll message IDs");
+  return { ok: true, status: "sent", pollMessageId, messageIds };
+}
+
 export async function sendWhatsAppReaction(reaction, { bridgeUrl, fetchImpl = globalThis.fetch, timeoutMs = RECEIPT_TIMEOUT_MS } = {}) {
   if (!reaction || typeof reaction !== "object") throw new Error("Reaction is invalid");
   const chatId = jid(reaction.chatId);

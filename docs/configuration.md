@@ -27,7 +27,8 @@ Runtime configuration is stored at
     "councilUrl": "https://council.panelsgroup.com",
     "codexCredentialFile": "/absolute/private/codex-council-token",
     "scope": "design",
-    "workspace": "default"
+    "workspace": "default",
+    "nativePolls": true
   },
   "councilPush": {
     "enabled": true,
@@ -66,15 +67,21 @@ permit reference in WhatsApp, prompts, logs, or replay state. Credential
 creation, permission broadening, destructive, and financial approvals remain
 web-only in Council. Existing Codex Blockers routing remains independent.
 
+`nativePolls` enables the contextual native Approve/Reject poll for Council
+permit events. The relay uses a deterministic UUID delivery key, registers the
+poll against the exact case, revision, digest, scope, and owner permit, and
+accepts votes only from the exact configured Council chat and owner sender.
+The permit reference never appears in WhatsApp text, poll context, prompts, or
+replay state. Set it to `false` to retain the bounded text-command fallback.
+
 `councilPush` is an optional outbound-only Council event consumer for the
 Codex-role Mac. It uses a separate Codex-principal credential reference (never
 the owner credential), keeps a `0600` replay cursor, reconnects with bounded
 backoff, and wakes a fresh Codex task per event by default. An explicit
 `sessionId` is supported only for a reviewed task-owned setup. It opens no
 inbound Mac port. If an event is explicitly WhatsApp-eligible, the consumer
-also sends a bounded approval notice to the configured Council Approvals chat
-using a stable delivery key; the event summary is included only when marked
-safe by the Council event.
+also sends the bounded native poll or text fallback described above to the
+configured Council Approvals chat using a stable delivery key.
 
 If the Council stream returns `410 Gone` because the cursor is older than the
 replay floor, the relay calls the authenticated

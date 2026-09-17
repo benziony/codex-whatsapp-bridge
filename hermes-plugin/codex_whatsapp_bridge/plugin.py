@@ -28,6 +28,7 @@ _MAX_AUDIO_BYTES = 25 * 1024 * 1024
 _TRANSCRIBE_TIMEOUT = 90
 _COUNCIL_APPROVAL_TIMEOUT = 75
 _COUNCIL_RECOVERY_TIMEOUT = 15
+_COUNCIL_POLL_TIMEOUT = 45
 _TRANSCRIBER = Path(__file__).with_name("voice_transcriber.py")
 
 
@@ -67,6 +68,22 @@ def _normalize_jid(value: object, *, group: bool = False) -> str | None:
 def _message_id(value: object) -> str | None:
     result = str(value or "").strip()
     return result if _MESSAGE_ID.fullmatch(result) else None
+
+
+def _native_poll_vote(event: Any) -> tuple[str, list[str]] | None:
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    native = metadata.get("whatsapp_native")
+    update = native.get("pollUpdate") if isinstance(native, dict) else None
+    # The nested shape is Hermes' canonical pollUpdate contract. Keep the
+    # top-level aliases for older adapter builds while they are being retired.
+    source = update if isinstance(update, dict) else metadata
+    poll_message_id = _message_id(source.get("pollId") or source.get("pollMessageId") or source.get("poll_message_id"))
+    selected = source.get("selectedOptions") or source.get("selected_options")
+    if not poll_message_id or not isinstance(selected, list):
+        return None
+    return poll_message_id, [str(value).strip() for value in selected]
 
 
 def _authorized(event: Any, config: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -275,15 +292,18 @@ async def _broker(command: str, payload: dict[str, Any], config: dict[str, Any])
             raise RuntimeError("Codex WhatsApp broker returned invalid data")
         return result
 
-    council_command = command in {"council-approval", "council-approval-recover"}
+    council_poll_command = command == "council-poll-vote"
+    council_command = command in {"council-approval", "council-approval-recover"} or council_poll_command
     try:
         # A Council approval includes bounded dashboard, permit, decision, and
         # possible exact-readback calls. Keep that end-to-end budget separate
         # from ordinary Codex admission and never mix recovery stores.
-        timeout = 120 if payload.get("attachments") else _COUNCIL_APPROVAL_TIMEOUT if command == "council-approval" else 15
+        timeout = 120 if payload.get("attachments") else _COUNCIL_POLL_TIMEOUT if council_poll_command else _COUNCIL_APPROVAL_TIMEOUT if command == "council-approval" else 15
         return await invoke(command, payload, timeout)
     except asyncio.TimeoutError as error:
         if council_command:
+            if council_poll_command:
+                raise RuntimeError("Council poll decision outcome is uncertain; exact poll readback failed") from error
             if command == "council-approval-recover":
                 raise RuntimeError("Council approval readback timed out") from error
             try:
@@ -314,6 +334,28 @@ async def _broker(command: str, payload: dict[str, Any], config: dict[str, Any])
 async def _admit(event: Any) -> bool | str:
     config = _read_config()
     council_context = _council_authorized(event, config) if config else None
+    native_type = str((getattr(event, "metadata", None) or {}).get("whatsapp_native_type") or "").strip().lower()
+    if native_type == "pollupdatemessage":
+        # Poll votes are intercepted only in the exact configured Council chat
+        # and only from the configured owner sender. Everything else must fall
+        # through to Hermes' native poll aggregation.
+        if council_context is None:
+            return False
+        sender_id, chat_id, message_id = council_context
+        if not message_id:
+            return "This Council poll vote has no valid message identity."
+        vote = _native_poll_vote(event)
+        if vote is None:
+            return "This Council poll vote could not be identified. No decision was recorded."
+        poll_message_id, selected_options = vote
+        try:
+            result = await _broker("council-poll-vote", {"pollMessageId": poll_message_id, "selectedOptions": selected_options, "chatId": chat_id, "senderId": sender_id, "messageId": message_id}, config)
+        except Exception:
+            return "Council poll vote could not be identified or verified. No decision was recorded."
+        if result.get("status") == "unclaimed":
+            return False
+        acknowledgement = result.get("acknowledgement")
+        return acknowledgement[:500] if isinstance(acknowledgement, str) and acknowledgement.strip() else "Council poll vote was not recorded."
     if council_context is not None:
         sender_id, chat_id, message_id = council_context
         if not message_id:

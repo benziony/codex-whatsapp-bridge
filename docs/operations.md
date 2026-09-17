@@ -11,11 +11,11 @@ Production validation should cover:
 5. image, PDF, and another arbitrary attachment;
 6. unknown/expired quote visible failure without new-task fallback;
 7. unauthorized sender and unrelated chat/poll isolation;
-8. busy-task FIFO queuing and restart replay;
-9. 👍 after App Server acceptance, plus reaction retry after bridge restart;
-10. weekly update notification deduplication.
+8. native Council poll delivery/retry, exact poll registration, and owner-only vote interception;
+9. busy-task FIFO queuing and restart replay;
+10. 👍 after App Server acceptance, plus reaction retry after bridge restart;
+11. weekly update notification deduplication.
 
 Setup stores timestamped backups under
 `~/.config/codex-whatsapp-bridge/backups`. Restore the most recent backup and
 reload the affected LaunchAgent/Hermes process to roll back.
-

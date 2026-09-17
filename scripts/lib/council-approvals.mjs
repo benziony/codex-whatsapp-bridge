@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 const CASE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const DIGEST = /^[a-f0-9]{64}$/i;
@@ -8,6 +9,12 @@ const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$/;
 const OWNER_MARKER = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 const PERMIT_KEYS = ["caseId", "rev", "digest", "scope", "issuedBy", "issuedAt", "expiresAt"];
 const PERMIT_ID = /^[A-Za-z0-9_-]{22,256}$/;
+const POLL_MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$/;
+
+function stablePollRequestId(pollMessageId, messageId, verdict) {
+  const digest = createHash("sha256").update(`${messageId}\n${pollMessageId}\n${verdict}`).digest("hex").slice(0, 48);
+  return `council-poll-vote:${digest}`;
+}
 
 function normalizeJid(value, group = false) {
   const text = String(value ?? "").trim();
@@ -73,7 +80,7 @@ async function councilJson(url, token, init = {}) {
     });
     let data = null;
     try { data = await response.json(); } catch { /* normalized below */ }
-    if (!response.ok) throw new Error(`Council request failed (${response.status})`);
+    if (!response.ok) { const error = new Error(`Council request failed (${response.status})`); error.status = response.status; throw error; }
     if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Council returned invalid data");
     return data;
   } finally {
@@ -172,6 +179,48 @@ export async function recoverCouncilApproval(text, config, { fetcher = councilJs
     // A missing or unavailable readback is not evidence that the decision failed.
   }
   return { ok: false, message: "Council approval outcome is uncertain; no exact decision readback was available." };
+}
+
+export async function processCouncilPollVote(payload, config, { fetcher = councilJson, registrationWaitMs = 15_000 } = {}) {
+  const configured = configuredApproval(config);
+  if (!configured || config?.councilApprovals?.nativePolls !== true) return { ok: false, status: "ignored", message: "Native Council polls are not configured." };
+  const chatId = normalizeJid(payload?.chatId, true);
+  const senderId = normalizeJid(payload?.senderId, false);
+  const messageId = String(payload?.messageId ?? "").trim();
+  const pollMessageId = String(payload?.pollMessageId ?? "").trim();
+  const allowedSenders = configured.allowedSenders.map((value) => normalizeJid(value, false));
+  const selectedOptions = Array.isArray(payload?.selectedOptions) ? payload.selectedOptions.map((value) => String(value).trim()) : [];
+  if (!chatId || chatId !== normalizeJid(configured.chatId, true) || !senderId || !allowedSenders.includes(senderId) || !MESSAGE_ID.test(messageId) || !POLL_MESSAGE_ID.test(pollMessageId) || selectedOptions.length !== 1 || !new Set(["Approve", "Reject"]).has(selectedOptions[0])) {
+    return { ok: false, status: "rejected", message: "This Council poll vote is not valid for the configured owner chat." };
+  }
+  const token = readBearerCredential(configured);
+  const statusUrl = `${configured.councilUrl}/api/whatsapp/poll/status?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}`;
+  let pollStatus;
+  const registrationAttempts = Math.max(1, Math.ceil(registrationWaitMs / 100));
+  for (let attempt = 0; attempt < registrationAttempts; attempt += 1) {
+    try { pollStatus = await fetcher(statusUrl, token, workspaceRequest(configured)); break; }
+    catch (error) {
+      if (error?.status === 404) { if (attempt + 1 < registrationAttempts) await new Promise((resolve) => setTimeout(resolve, 100)); else return { ok: false, status: "unclaimed", message: "This poll is not a registered Council approval." }; }
+      else throw new Error(`Council poll status is uncertain; decision was not attempted (${error?.message ?? "request failure"})`);
+    }
+  }
+  if (!pollStatus || pollStatus.registered !== true) return { ok: false, status: "unclaimed", message: "This poll is not a registered Council approval." };
+  if (pollStatus.status !== "active") return { ok: false, status: "bound-failed", message: `This Council poll is ${pollStatus.status}; no decision was recorded.` };
+  const verdict = selectedOptions[0] === "Approve" ? "approved" : "rejected";
+  const requestId = stablePollRequestId(pollMessageId, messageId, verdict);
+  let result;
+  try {
+    result = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision`, token, workspaceRequest(configured, { method: "POST", headers: { "content-type": "application/json", "x-request-id": requestId }, body: JSON.stringify({ pollId: pollMessageId, verdict }) }));
+  } catch (error) {
+    try {
+      const readback = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}&verdict=${verdict}`, token, workspaceRequest(configured, { headers: { "x-request-id": requestId } }));
+      const decision = readback?.decision && typeof readback.decision === "object" ? readback.decision : readback;
+      if (decision?.verdict === verdict && decision?.pollId === pollMessageId) return { ok: true, status: "accepted", recovered: true, message: "Council poll decision was recorded." };
+    } catch { /* preserve uncertainty below */ }
+    throw new Error(`Council poll decision outcome is uncertain; exact readback failed (${error?.message ?? "request failure"})`);
+  }
+  const acknowledgement = result?.acknowledgement;
+  return { ok: true, status: "accepted", message: typeof acknowledgement === "string" && acknowledgement.trim() ? acknowledgement.slice(0, 500) : `Council ${selectedOptions[0].toLowerCase()} vote recorded.` };
 }
 
 export { configuredApproval };

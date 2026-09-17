@@ -7,8 +7,8 @@ index fede9adf49..111a9967ef 100644
  # ``None`` when the response was already delivered (e.g. via streaming).
  MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
 +ExclusiveInboundHandler = Callable[[MessageEvent], Awaitable[Union[bool, str]]]
- 
- 
+
+
  def resolve_channel_prompt(
 @@ -3137,6 +3138,12 @@ class BasePlatformAdapter(ABC):
          self.config = config
@@ -26,7 +26,7 @@ index fede9adf49..111a9967ef 100644
 @@ -3811,6 +3818,24 @@ class BasePlatformAdapter(ABC):
          """
          self._message_handler = handler
- 
+
 +    def set_exclusive_inbound_handler(
 +        self,
 +        handler: Optional[ExclusiveInboundHandler],
@@ -691,7 +691,7 @@ index 282cb7c0cb..4f63692af2 100644
      async def _send_media_to_bridge(
          self,
          chat_id: str,
-@@ -1348,10 +1407,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+@@ -1348,10 +1407,33 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                          for msg_data in messages:
                              event = await self._build_message_event(msg_data)
                              if event:
@@ -700,15 +700,17 @@ index 282cb7c0cb..4f63692af2 100644
 +                                # debounce and BasePlatformAdapter's active-
 +                                # session merging so quote/message identity is
 +                                # never coalesced into another delivery.
-+                                # Poll updates are native Hermes interaction
-+                                # traffic, not ordinary inbox messages. Keep
-+                                # them on the stock WhatsApp path even when the
-+                                # containing chat has an exclusive text/media
-+                                # claim.
++                                # Poll creation and reactions are native Hermes
++                                # interaction traffic. Poll updates must still
++                                # reach the exclusive handler so the Council
++                                # plugin can consume only its exact owner/chat.
 +                                native_type = str(
 +                                    (event.metadata or {}).get("whatsapp_native_type") or ""
 +                                ).lower()
-+                                is_stock_interaction = native_type.startswith(("poll", "reaction"))
++                                is_stock_interaction = native_type.startswith("reaction") or (
++                                    native_type.startswith("poll")
++                                    and native_type != "pollUpdateMessage".lower()
++                                )
 +                                claimed = (
 +                                    False
 +                                    if is_stock_interaction
@@ -746,15 +748,99 @@ index 234cbef279..adff15b522 100644
   *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
   *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
   *   POST /typing         - Send typing indicator { chatId }
-@@ -46,6 +47,7 @@ import {
+@@ -46,6 +47,51 @@ import {
    mediaPayloadForFile,
    pollCreationMessageFromPayload,
    pollUpdateForAggregation,
 +  resolveReactionTarget,
  } from './bridge_helpers.js';
++
++import fs from 'node:fs';
++const POLL_LEDGER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
++const POLL_LEDGER_MAX = 512;
++const CODEX_WHATSAPP_BRIDGE_CAPABILITIES = 'native-polls-ledger-v1';
++const pollInFlight = new Map();
++const pollLedgerPath = () => path.join(SESSION_DIR, 'poll-ledger.json');
++function loadPollLedger() {
++  const validId = (value) => typeof value === 'string' && /^[A-Za-z0-9._:+-]{1,256}$/.test(value);
++  const validRecord = (item) => {
++    if (!item || typeof item.deliveryKey !== 'string' || !/^[0-9a-f-]{36}$/i.test(item.deliveryKey) || typeof item.payloadFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(item.payloadFingerprint) || !Number.isSafeInteger(item.createdAt) || !Number.isSafeInteger(item.expiresAt) || item.expiresAt <= Date.now()) return false;
++    if (item.phase === 'context-pending') return !item.contextMessageId && !item.pollMessageId;
++    if (item.phase === 'context-sent' || item.phase === 'poll-pending') return validId(item.contextMessageId) && !item.pollMessageId;
++    if (item.phase === 'complete') return validId(item.contextMessageId) && validId(item.pollMessageId);
++    return false;
++  };
++  try {
++    const value = JSON.parse(fs.readFileSync(pollLedgerPath(), 'utf8'));
++    if (!Array.isArray(value)) return new Map();
++    return new Map(value.filter(validRecord).slice(-POLL_LEDGER_MAX).map((item) => [item.deliveryKey, item]));
++  } catch { return new Map(); }
++}
++let pollLedger;
++function getPollLedger() { return pollLedger || (pollLedger = loadPollLedger()); }
++function restorePollIdsFromLedger() {
++  const ledger = getPollLedger();
++  // Restore poll-origin recognition after a bridge restart. The poll IDs are
++  // the only ledger values exposed to this tracker; no content is rehydrated.
++  for (const item of ledger.values()) if (item.pollMessageId) recentlySentIds.remember(item.pollMessageId);
++}
++// Defer until the original bridge has initialized its outbound ID tracker and
++// SESSION_DIR constants; this also makes corrupt/missing ledgers fail closed.
++queueMicrotask(restorePollIdsFromLedger);
++function persistPollLedger() {
++  fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
++  const ledgerPath = pollLedgerPath();
++  const tmp = `${ledgerPath}.${process.pid}.tmp`;
++  fs.writeFileSync(tmp, JSON.stringify([...pollLedger.values()].slice(-POLL_LEDGER_MAX)), { mode: 0o600 });
++  fs.renameSync(tmp, ledgerPath);
++}
++function prunePollLedger() {
++  const cutoff = Date.now() - POLL_LEDGER_TTL_MS;
++  for (const [key, item] of pollLedger) if (item.createdAt <= cutoff) pollLedger.delete(key);
++}
  
  // Parse CLI args
-@@ -892,6 +894,28 @@ app.post('/edit', async (req, res) => {
+@@ -135,25 +180,26 @@ function enqueueSend(fn) {
+ function enqueueSend(fn) {
+   const task = _sendQueue.then(() => fn(), () => fn());
+   _sendQueue = task.catch(() => {});
+   return task;
+ }
+
+ function sleep(ms) {
+   return new Promise(resolve => setTimeout(resolve, ms));
+ }
+
+-function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
+-  let timer;
+-  const timeoutPromise = new Promise((_, reject) => {
+-    timer = setTimeout(
+-      () => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)),
+-      timeoutMs,
+-    );
+-  });
+-  return enqueueSend(() =>
+-    Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
+-      .finally(() => clearTimeout(timer))
+-  );
+-}
++function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
++  let timer;
++  const sendPromise = enqueueSend(() => sock.sendMessage(chatId, payload, options));
++  return Promise.race([sendPromise, new Promise((_, reject) => {
++    timer = setTimeout(() => reject(new Error(`sendMessage timed out after ${timeoutMs / 1000}s`)), timeoutMs);
++  })]).finally(() => clearTimeout(timer));
++}
++
++function sendPollWithLateRecovery(chatId, payload, onResolved) {
++  const sendPromise = enqueueSend(() => sock.sendMessage(chatId, payload));
++  sendPromise.then((result) => { try { onResolved(result); } catch (error) { console.warn('[bridge] failed to persist late poll result:', error.message); } }, () => {});
++  let timer;
++  return Promise.race([sendPromise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`poll send timed out after ${SEND_TIMEOUT_MS / 1000}s`)), SEND_TIMEOUT_MS); })]).finally(() => clearTimeout(timer));
++}
+
+ function formatOutgoingMessage(message) {
+@@ -892,6 +894,93 @@ app.post('/edit', async (req, res) => {
    }
  });
  
@@ -779,6 +865,71 @@ index 234cbef279..adff15b522 100644
 +  }
 +});
 +
++
++// Send a contextual, single-choice native poll. deliveryKey is required so
++// replay after a lost HTTP response returns the original message IDs instead
++// of creating a second poll.
++app.post('/send-poll', async (req, res) => {
++  if (!sock || connectionState !== 'connected') {
++    return res.status(503).json({ error: 'Not connected to WhatsApp' });
++  }
++  const { chatId, context, question, options, selectableCount, deliveryKey } = req.body;
++  if (!chatId || typeof context !== 'string' || context.length < 1 || context.length > 1200 || typeof question !== 'string' || question.length < 1 || question.length > 500 || !Array.isArray(options) || options.length < 2 || options.length > 12 || options.some((value) => typeof value !== 'string' || !value.trim() || value.length > 100) || new Set(options).size !== options.length || !Number.isSafeInteger(selectableCount) || selectableCount < 1 || selectableCount > options.length || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(deliveryKey || ''))) {
++    return res.status(400).json({ error: 'Invalid poll payload' });
++  }
++  const pollLedger = getPollLedger();
++  prunePollLedger();
++  const key = String(deliveryKey);
++  const payloadFingerprint = createHash('sha256').update(JSON.stringify({ chatId, context, question, options, selectableCount })).digest('hex');
++  const prior = pollLedger.get(key);
++  if (prior && prior.payloadFingerprint !== payloadFingerprint) return res.status(409).json({ error: 'deliveryKey payload mismatch' });
++  if (prior?.phase === 'context-pending' || prior?.phase === 'poll-pending') return res.status(425).json({ error: 'poll delivery outcome uncertain', retryAfter: 5 });
++  if (prior?.pollMessageId) return res.json({ success: true, pollMessageId: prior.pollMessageId, messageIds: [prior.contextMessageId, prior.pollMessageId].filter(Boolean) });
++  const existing = pollInFlight.get(key);
++  if (existing) {
++    try { return res.json(await existing); } catch (err) { return res.status(500).json({ error: err.message }); }
++  }
++  const operation = (async () => {
++    const createdAt = Date.now();
++    let contextMessageId = prior?.contextMessageId;
++    if (!contextMessageId) {
++      const createdAt = Date.now();
++      pollLedger.set(key, { deliveryKey: key, payloadFingerprint, phase: 'context-pending', createdAt, expiresAt: createdAt + POLL_LEDGER_TTL_MS });
++      persistPollLedger();
++      const contextMessage = await sendPollWithLateRecovery(chatId, { text: context }, (late) => {
++        const id = late?.key?.id;
++        if (!id) return;
++        const current = getPollLedger().get(key);
++        if (current?.phase === 'context-pending') { current.contextMessageId = id; current.phase = 'context-sent'; persistPollLedger(); trackSentMessageId(late); }
++      });
++      contextMessageId = contextMessage?.key?.id;
++      if (!contextMessageId) throw new Error('WhatsApp did not confirm context message ID');
++      pollLedger.set(key, { deliveryKey: key, payloadFingerprint, phase: 'context-sent', contextMessageId, createdAt, expiresAt: createdAt + POLL_LEDGER_TTL_MS });
++      persistPollLedger();
++      trackSentMessageId(contextMessage);
++    }
++    pollLedger.set(key, { deliveryKey: key, payloadFingerprint, phase: 'poll-pending', contextMessageId, createdAt, expiresAt: createdAt + POLL_LEDGER_TTL_MS });
++    persistPollLedger();
++    const pollMessage = await sendPollWithLateRecovery(chatId, { poll: { name: question, values: options, selectableCount } }, (late) => {
++      const id = late?.key?.id;
++      if (!id) return;
++      const current = getPollLedger().get(key);
++      if (current?.phase === 'poll-pending') { current.pollMessageId = id; current.phase = 'complete'; persistPollLedger(); trackSentMessageId(late); }
++    });
++    const pollMessageId = pollMessage?.key?.id;
++    if (!pollMessageId) throw new Error('WhatsApp did not confirm poll message ID');
++    pollLedger.set(key, { deliveryKey: key, payloadFingerprint, phase: 'complete', contextMessageId, pollMessageId, createdAt, expiresAt: createdAt + POLL_LEDGER_TTL_MS });
++    while (pollLedger.size > POLL_LEDGER_MAX) pollLedger.delete(pollLedger.keys().next().value);
++    persistPollLedger();
++    const result = { success: true, pollMessageId, messageIds: [contextMessageId, pollMessageId] };
++    trackSentMessageId(pollMessage);
++    return result;
++  })();
++  pollInFlight.set(key, operation);
++  try { return res.json(await operation); }
++  catch (err) { return res.status(/timed out/i.test(err.message) ? 425 : 500).json({ error: /timed out/i.test(err.message) ? 'poll delivery outcome uncertain' : err.message, ...( /timed out/i.test(err.message) ? { retryAfter: 5 } : {}) }); }
++  finally { if (pollInFlight.get(key) === operation) pollInFlight.delete(key); }
++});
 +
  // Send media (image, video, document) natively
  app.post('/send-media', async (req, res) => {
@@ -1331,7 +1482,7 @@ new file mode 100644
 index 0000000000..fae1ee29b0
 --- /dev/null
 +++ b/tests/gateway/test_whatsapp_exclusive_inbound.py
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,160 @@
 +from __future__ import annotations
 +
 +from types import SimpleNamespace
@@ -1412,17 +1563,7 @@ index 0000000000..fae1ee29b0
 +
 +
 +@pytest.mark.asyncio
-+@pytest.mark.parametrize(
-+    "native_type",
-+    [
-+        "pollUpdateMessage",
-+        "pollCreationMessage",
-+        "pollCreationMessageV2",
-+        "pollCreationMessageV3",
-+        "reactionMessage",
-+    ],
-+)
-+async def test_native_interactions_bypass_exclusive_claim(native_type):
++async def test_council_poll_update_attempts_exclusive_claim():
 +    adapter = object.__new__(WhatsAppAdapter)
 +    adapter.platform = Platform.WHATSAPP
 +    adapter._bridge_port = 3000
@@ -1447,6 +1588,51 @@ index 0000000000..fae1ee29b0
 +                user_id="15551234567",
 +            ),
 +            message_id="poll-update",
++            metadata={
++                "whatsapp_native_type": "pollUpdateMessage",
++                "whatsapp_native": {"pollUpdate": {"pollId": "poll-1", "selectedOptions": ["Approve"]}},
++            },
++        )
++
++    adapter._build_message_event = build
++    adapter._enqueue_text_event = MagicMock()
++
++    await adapter._poll_messages()
++
++    adapter.dispatch_exclusive_inbound.assert_awaited_once()
++    adapter._enqueue_text_event.assert_not_called()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "native_type",
++    ["pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3", "reactionMessage"],
++)
++async def test_stock_native_interactions_bypass_exclusive_claim(native_type):
++    adapter = object.__new__(WhatsAppAdapter)
++    adapter.platform = Platform.WHATSAPP
++    adapter._bridge_port = 3000
++    adapter._running = True
++    adapter._http_session = SimpleNamespace(
++        get=MagicMock(return_value=_Response([{"messageId": "native-update"}]))
++    )
++    adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
++    adapter._send_read_receipt = AsyncMock()
++    adapter.handle_message = AsyncMock()
++    adapter.dispatch_exclusive_inbound = AsyncMock(return_value=True)
++
++    async def build(_data):
++        adapter._running = False
++        return MessageEvent(
++            text="Option A",
++            message_type=MessageType.TEXT,
++            source=SessionSource(
++                platform=Platform.WHATSAPP,
++                chat_id="codex@g.us",
++                chat_type="group",
++                user_id="15551234567",
++            ),
++            message_id="native-update",
 +            metadata={"whatsapp_native_type": native_type},
 +        )
 +
