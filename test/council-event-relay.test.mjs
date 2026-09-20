@@ -17,6 +17,13 @@ test("event prompt is bounded, enum-scoped, and ignores malicious summaries", ()
   assert.ok(prompt.length < 5000);
 });
 
+test("decision prompts require exact-revision authoritative readback", () => {
+  const prompt = eventPrompt({ seq: 9, eventId: "evt-9", kind: "decision.owner", caseId: "case_scope", rev: 3 });
+  assert.match(prompt, /GET \/api\/decision\/get\?caseId=case_scope&rev=3/);
+  assert.match(prompt, /approved verdict/);
+  assert.match(prompt, /scope that contains the proposed work scope/);
+});
+
 test("approval notices require an owner permit-created event", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-notice-"));
   const credentialFile = path.join(directory, "codex-token");
