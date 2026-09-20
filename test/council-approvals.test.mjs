@@ -8,7 +8,7 @@ import { isCurrentWhatsappPermit, parseCouncilApproval, processCouncilApproval, 
 const digest = "a".repeat(64);
 const permitId = "wp_opaque_permit_123456";
 const permit = (caseId = "case_mu4vrfky_2", rev = 1, scope = "design") => ({ caseId, rev, digest, scope, issuedBy: "owner", issuedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
-const pollStatus = (pollId = "WA.poll-1", status = "active", scope = "design") => ({ registered: true, status, pollId, caseId: "case_mu4vrfky_2", rev: 1, digest, scope });
+const pollStatus = (pollId = "WA.poll-1", status = "active", scope = "design") => ({ registered: true, status, pollId, caseId: "case_mu4vrfky_2", rev: 1, digest, scope, consumedAt: status === "consumed" ? "2026-09-20T12:00:00.000Z" : null });
 
 test("Council command syntax is exact and case/revision/digest are captured", () => {
   assert.deepEqual(parseCouncilApproval(`APPROVE case_mu4vrfky_2 REV 1 DIGEST ${digest}`), {
@@ -30,8 +30,14 @@ test("native Council poll vote is exact-chat owner-only and maps to the poll dec
   const { config, directory } = fixture();
   config.councilApprovals.nativePolls = true;
   const calls = [];
+  let statusCalls = 0;
   const vote = { pollMessageId: "WA.poll-1", selectedOptions: ["Approve"], chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "vote-1" };
-  const fetcher = async (url, token, init = {}) => { calls.push({ url, token, init }); return String(url).includes("/status?") ? pollStatus() : { acknowledgement: "Council approved." }; };
+  const fetcher = async (url, token, init = {}) => {
+    calls.push({ url, token, init });
+    if (String(url).includes("/status?")) { statusCalls += 1; return pollStatus("WA.poll-1", statusCalls % 2 === 0 ? "consumed" : "active"); }
+    if (String(url).includes("/poll/decision?") && !init.method) return { ...pollStatus("WA.poll-1", "consumed"), verdict: "approved" };
+    return { acknowledgement: "Council approved." };
+  };
   const result = await processCouncilPollVote(vote, config, { fetcher });
   await processCouncilPollVote(vote, config, { fetcher });
   assert.deepEqual(result, { ok: true, status: "accepted", message: "Council approved." });
@@ -49,12 +55,65 @@ test("native Council poll vote is exact-chat owner-only and maps to the poll dec
   const unknown = await processCouncilPollVote({ ...vote, pollMessageId: "foreign-poll" }, config, { registrationWaitMs: 0, fetcher: async () => { const error = new Error("not found"); error.status = 404; throw error; } });
   assert.deepEqual(unknown, { ok: false, status: "unclaimed", message: "This poll is not a registered Council approval." });
   let statusAttempts = 0;
+  let delayedPosted = false;
   const delayed = await processCouncilPollVote({ ...vote, pollMessageId: "delayed-poll" }, config, { registrationWaitMs: 1_200, fetcher: async (url, token, init = {}) => {
-    if (String(url).includes("/status?")) { statusAttempts += 1; if (statusAttempts < 12) { const error = new Error("not found yet"); error.status = 404; throw error; } return pollStatus("delayed-poll"); }
+    if (String(url).includes("/status?")) { statusAttempts += 1; if (statusAttempts < 12) { const error = new Error("not found yet"); error.status = 404; throw error; } return pollStatus("delayed-poll", delayedPosted ? "consumed" : "active"); }
+    if (String(url).includes("/poll/decision?") && !init.method) return { ...pollStatus("delayed-poll", "consumed"), verdict: "approved" };
+    if (init.method === "POST") delayedPosted = true;
     return { acknowledgement: "Council approved." };
   } });
   assert.equal(delayed.ok, true);
   assert.ok(statusAttempts >= 12);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("successful native Council poll votes require exact decision readback before acknowledgement", async () => {
+  const { config, directory } = fixture();
+  config.councilApprovals.nativePolls = true;
+  let posts = 0;
+  const vote = { pollMessageId: "WA.poll-1", selectedOptions: ["Approve"], chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "vote-readback" };
+  await assert.rejects(processCouncilPollVote(vote, config, { fetcher: async (url, token, init = {}) => {
+    if (String(url).includes("/status?")) return pollStatus();
+    if (init.method === "POST") { posts += 1; return { acknowledgement: "Council approved." }; }
+    return { pollId: "WA.poll-1", caseId: "wrong-case", rev: 1, digest, scope: "design", verdict: "approved" };
+  } }), /outcome is uncertain; exact readback failed/);
+  assert.equal(posts, 1);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("matching case decisions do not prove an unconsumed native Council poll vote", async () => {
+  for (const postFails of [false, true]) {
+    const { config, directory } = fixture();
+    config.councilApprovals.nativePolls = true;
+    let statusReads = 0;
+    let posts = 0;
+    const vote = { pollMessageId: "WA.poll-1", selectedOptions: ["Approve"], chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: `vote-unconsumed-${postFails}` };
+    await assert.rejects(processCouncilPollVote(vote, config, { fetcher: async (url, token, init = {}) => {
+      if (String(url).includes("/status?")) { statusReads += 1; return pollStatus("WA.poll-1", statusReads === 1 ? "active" : "stale"); }
+      if (init.method === "POST") { posts += 1; if (postFails) throw new Error("transport failed"); return { acknowledgement: "Council approved." }; }
+      return { ...pollStatus("WA.poll-1", "consumed"), verdict: "approved" };
+    } }), /outcome is uncertain; exact readback failed/);
+    assert.equal(posts, 1);
+    assert.equal(statusReads, 2);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("successful native Council poll votes surface a conflicting exact decision without retrying", async () => {
+  const { config, directory } = fixture();
+  config.councilApprovals.nativePolls = true;
+  let posts = 0;
+  let statusReads = 0;
+  const vote = { pollMessageId: "WA.poll-1", selectedOptions: ["Approve"], chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "vote-conflict" };
+  const result = await processCouncilPollVote(vote, config, { fetcher: async (url, token, init = {}) => {
+    if (String(url).includes("/status?")) { statusReads += 1; return pollStatus("WA.poll-1", statusReads === 1 ? "active" : "consumed"); }
+    if (init.method === "POST") { posts += 1; return { acknowledgement: "Council approved." }; }
+    return { ...pollStatus("WA.poll-1", "consumed"), verdict: "rejected" };
+  } });
+  assert.equal(result.ok, false);
+  assert.equal(result.status, "bound-failed");
+  assert.match(result.message, /already recorded rejected/);
+  assert.equal(posts, 1);
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
@@ -83,7 +142,7 @@ test("consumed Council poll votes read back once and cannot reverse the recorded
   config.councilApprovals.nativePolls = true;
   let posts = 0;
   const fetcher = async (url, token, init = {}) => {
-    if (String(url).includes("/status?")) return { registered: true, status: "consumed", pollId: "WA.poll-1", caseId: "case_mu4vrfky_2", rev: 1, digest, scope: "design" };
+    if (String(url).includes("/status?")) return pollStatus("WA.poll-1", "consumed");
     if (String(url).includes("/api/whatsapp/poll/decision?")) return { pollId: "WA.poll-1", caseId: "case_mu4vrfky_2", rev: 1, digest, scope: "design", verdict: "approved" };
     if (init.method === "POST") posts += 1;
     return {};

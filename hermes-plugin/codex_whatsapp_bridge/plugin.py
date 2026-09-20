@@ -83,7 +83,10 @@ def _native_poll_vote(event: Any) -> tuple[str, list[str]] | None:
     selected = source.get("selectedOptions") or source.get("selected_options")
     if not poll_message_id or not isinstance(selected, list):
         return None
-    return poll_message_id, [str(value).strip() for value in selected]
+    selected_options = [str(value).strip() for value in selected]
+    if len(selected_options) != 1 or selected_options[0] not in {"Approve", "Reject"}:
+        return None
+    return poll_message_id, selected_options
 
 
 def _authorized(event: Any, config: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -351,7 +354,7 @@ async def _admit(event: Any) -> bool | str:
         try:
             result = await _broker("council-poll-vote", {"pollMessageId": poll_message_id, "selectedOptions": selected_options, "chatId": chat_id, "senderId": sender_id, "messageId": message_id}, config)
         except Exception:
-            return "Council poll vote could not be identified or verified. No decision was recorded."
+            return "Council poll outcome could not be verified. Check Council status before retrying."
         if result.get("status") == "unclaimed":
             return False
         acknowledgement = result.get("acknowledgement")

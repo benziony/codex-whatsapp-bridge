@@ -71,6 +71,12 @@ web-only in Council. Existing Codex Blockers routing remains independent.
 permit events. The relay uses a deterministic UUID delivery key, registers the
 poll against the exact case, revision, digest, scope, and owner permit, and
 accepts votes only from the exact configured Council chat and owner sender.
+After a vote POST, the bridge reads back the exact immutable poll decision and
+refetches poll status. It shows success only when the poll is consumed and its
+poll, case, revision, digest, scope, and verdict all match; retries report the
+existing decision without attempting a reversal. If exact consumption cannot
+be confirmed, WhatsApp reports an uncertain outcome instead of claiming that
+the vote failed or succeeded.
 The permit reference never appears in WhatsApp text, poll context, prompts, or
 replay state. Set it to `false` to retain the bounded text-command fallback.
 

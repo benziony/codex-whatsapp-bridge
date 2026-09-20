@@ -112,7 +112,16 @@ function exactPollStatus(status, { pollId, scope }) {
     && status.digest === status.digest.toLowerCase()
     && status.scope === scope
     && /^[A-Za-z0-9._*:/-]{1,128}$/.test(status.scope)
-    && new Set(["active", "consumed", "expired", "stale"]).has(status.status);
+    && new Set(["active", "consumed", "expired", "stale"]).has(status.status)
+    && (status.status !== "consumed" || Number.isFinite(Date.parse(String(status.consumedAt))));
+}
+
+function samePollBinding(left, right) {
+  return left.pollId === right.pollId
+    && left.caseId === right.caseId
+    && left.rev === right.rev
+    && left.digest === right.digest
+    && left.scope === right.scope;
 }
 
 function exactPollDecision(decision, pollStatus, pollId, scope) {
@@ -126,6 +135,21 @@ function exactPollDecision(decision, pollStatus, pollId, scope) {
     && decision.scope === scope
     && decision.scope === pollStatus.scope
     && (decision.verdict === "approved" || decision.verdict === "rejected");
+}
+
+async function readExactPollDecision(pollMessageId, pollStatus, configured, token, fetcher, requestId = "") {
+  const readback = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}`, token, workspaceRequest(configured, requestId ? { headers: { "x-request-id": requestId } } : {}));
+  const decision = councilDecision(readback);
+  if (!exactPollDecision(decision, pollStatus, pollMessageId, configured.scope)) throw new Error("Council returned invalid poll decision readback");
+  return decision;
+}
+
+async function readExactConsumedPollStatus(statusUrl, pollMessageId, pollStatus, configured, token, fetcher, requestId = "") {
+  const refreshed = await fetcher(statusUrl, token, workspaceRequest(configured, requestId ? { headers: { "x-request-id": requestId } } : {}));
+  if (!exactPollStatus(refreshed, { pollId: pollMessageId, scope: configured.scope }) || !samePollBinding(refreshed, pollStatus) || refreshed.status !== "consumed") {
+    throw new Error("Council poll consumption was not confirmed");
+  }
+  return refreshed;
 }
 
 async function readExistingCouncilDecision(approval, configured, token, fetcher) {
@@ -258,9 +282,7 @@ export async function processCouncilPollVote(payload, config, { fetcher = counci
   const verdict = selectedOptions[0] === "Approve" ? "approved" : "rejected";
   if (pollStatus.status === "consumed") {
     try {
-      const readback = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}`, token, workspaceRequest(configured));
-      const decision = councilDecision(readback);
-      if (!exactPollDecision(decision, pollStatus, pollMessageId, configured.scope)) throw new Error("Council returned invalid poll decision readback");
+      const decision = await readExactPollDecision(pollMessageId, pollStatus, configured, token, fetcher);
       if (decision.verdict === verdict) return { ok: true, status: "accepted", duplicate: true, message: "Council poll decision was already recorded." };
       return { ok: false, status: "bound-failed", message: `This Council poll already recorded ${decision.verdict}; no change was made.` };
     } catch (error) {
@@ -274,12 +296,21 @@ export async function processCouncilPollVote(payload, config, { fetcher = counci
     result = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision`, token, workspaceRequest(configured, { method: "POST", headers: { "content-type": "application/json", "x-request-id": requestId }, body: JSON.stringify({ pollId: pollMessageId, verdict }) }));
   } catch (error) {
     try {
-      const readback = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}&verdict=${verdict}`, token, workspaceRequest(configured, { headers: { "x-request-id": requestId } }));
-      const decision = councilDecision(readback);
-      if (exactPollDecision(decision, pollStatus, pollMessageId, configured.scope) && decision.verdict === verdict) return { ok: true, status: "accepted", recovered: true, message: "Council poll decision was recorded." };
+      const decision = await readExactPollDecision(pollMessageId, pollStatus, configured, token, fetcher, requestId);
+      await readExactConsumedPollStatus(statusUrl, pollMessageId, pollStatus, configured, token, fetcher, requestId);
+      if (decision.verdict === verdict) return { ok: true, status: "accepted", recovered: true, message: "Council poll decision was recorded." };
+      return { ok: false, status: "bound-failed", message: `This Council poll already recorded ${decision.verdict}; no change was made.` };
     } catch { /* preserve uncertainty below */ }
     throw new Error(`Council poll decision outcome is uncertain; exact readback failed (${error?.message ?? "request failure"})`);
   }
+  let decision;
+  try {
+    decision = await readExactPollDecision(pollMessageId, pollStatus, configured, token, fetcher, requestId);
+    await readExactConsumedPollStatus(statusUrl, pollMessageId, pollStatus, configured, token, fetcher, requestId);
+  } catch (error) {
+    throw new Error(`Council poll decision outcome is uncertain; exact readback failed (${error?.message ?? "request failure"})`);
+  }
+  if (decision.verdict !== verdict) return { ok: false, status: "bound-failed", message: `This Council poll already recorded ${decision.verdict}; no change was made.` };
   const acknowledgement = result?.acknowledgement;
   return { ok: true, status: "accepted", message: typeof acknowledgement === "string" && acknowledgement.trim() ? acknowledgement.slice(0, 500) : `Council ${selectedOptions[0].toLowerCase()} vote recorded.` };
 }
