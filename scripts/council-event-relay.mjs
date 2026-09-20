@@ -110,7 +110,10 @@ function approvalNotification(event, config) {
       issuedAt: event.issuedAt ?? event.at,
       expiresAt: event.expiresAt,
     };
-  if (!isCurrentWhatsappPermit(permit, { caseId: event.caseId, rev: event.rev, digest: event.digest, scope: approvals.scope })) return null;
+  const permitScope = typeof permit.scope === "string" && SAFE_IDENTIFIER.test(permit.scope) ? permit.scope : null;
+  if (!permitScope) return null;
+  if (typeof event.scope === "string" && event.scope !== permitScope) return null;
+  if (!isCurrentWhatsappPermit(permit, { caseId: event.caseId, rev: event.rev, digest: event.digest, scope: permitScope })) return null;
   const safeSummary = typeof event.safeSummary === "string" && event.safeSummary.trim()
     ? event.safeSummary.trim().slice(0, 500)
     : "A Council proposal is ready for owner review.";
@@ -122,6 +125,7 @@ function approvalNotification(event, config) {
   const safeExecutor = typeof event.safeExecutor === "string" && SAFE_IDENTIFIER.test(event.safeExecutor) ? event.safeExecutor : "the assigned agent";
   const fixedContext = [
     "Council decision needed",
+    `Reference: ${event.caseId} · revision ${event.rev}`,
     `Request: ${safeSummary}`,
     safeReason ? `Why: ${safeReason}` : "",
     safeEffect ? `What happens: ${safeEffect}` : "",

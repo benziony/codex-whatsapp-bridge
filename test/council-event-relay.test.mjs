@@ -128,14 +128,40 @@ test("native approval poll is contextual and never includes permit or digest com
   assert.deepEqual(notice.poll.options, ["Approve", "Reject"]);
   assert.match(notice.poll.deliveryKey, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.match(notice.poll.context, /Request: Review the bounded SolarManager repair/);
+  assert.match(notice.poll.context, /Reference: case_a · revision 2/);
   assert.match(notice.poll.context, /Why: The legacy path keeps timing out/);
   assert.match(notice.poll.context, /What happens: Codex will replace only the retry path/);
   assert.match(notice.poll.context, /Who: codex/);
   assert.match(notice.poll.context, /Risk: financial/);
   assert.match(notice.poll.context, /Scope: design/);
-  assert.doesNotMatch(notice.poll.context, /Case case_a|revision 2|Channels:|Digest|Expires:|APPROVE|REJECT|wp_opaque/);
+  assert.doesNotMatch(notice.poll.context, /Channels:|Digest|Expires:|APPROVE|REJECT|wp_opaque/);
   assert.equal(notice.text, undefined);
   assert.equal(notice.poll.permitId, undefined);
+});
+
+test("native approval permits use their exact Council scope instead of one fixed bridge scope", () => {
+  const scopedPermit = permit("case_scope", 4, event.digest, "ui:completed-records");
+  const scopedEvent = {
+    ...event,
+    eventId: "evt-scope",
+    caseId: scopedPermit.caseId,
+    rev: scopedPermit.rev,
+    scope: scopedPermit.scope,
+    whatsappPermit: scopedPermit,
+  };
+  const notice = approvalNotification(scopedEvent, { councilApprovals: { chatId: "120@g.us", scope: "design", nativePolls: true } });
+  assert.ok(notice);
+  assert.match(notice.poll.context, /Scope: ui:completed-records/);
+});
+
+test("native approval polls expose a nonsecret reference that distinguishes identical requests", () => {
+  const first = approvalNotification(event, { councilApprovals: { chatId: "120@g.us", nativePolls: true } });
+  const secondPermit = permit("case_b", event.rev, event.digest, event.scope);
+  const second = approvalNotification({ ...event, eventId: "evt-5", caseId: "case_b", whatsappPermit: secondPermit }, { councilApprovals: { chatId: "120@g.us", nativePolls: true } });
+  assert.equal(first.poll.question, second.poll.question);
+  assert.notEqual(first.poll.context, second.poll.context);
+  assert.match(first.poll.context, /Reference: case_a/);
+  assert.match(second.poll.context, /Reference: case_b/);
 });
 
 test("native poll registration binds the exact owner permit without exposing it to WhatsApp", async (t) => {
