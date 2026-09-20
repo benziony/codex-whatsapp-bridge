@@ -71,6 +71,9 @@ function eventPrompt(event) {
     "Authoritative Agent Council event notification.",
     `Event ${event.eventId} (sequence ${event.seq}), kind ${event.kind}.`,
     event.caseId ? `Case ${String(event.caseId).slice(0, 128)}${event.rev ? ` revision ${event.rev}` : ""}${event.digest ? ` digest ${String(event.digest).slice(0, 64)}` : ""}.` : "",
+    event.kind === "decision.owner" && event.caseId && event.rev
+      ? `Before treating this as approval or offering/accepting work, read the immutable decision with authenticated GET /api/decision/get?caseId=${encodeURIComponent(String(event.caseId))}&rev=${event.rev} in the same Council workspace. Require an approved verdict, the current exact revision, and a scope that contains the proposed work scope.`
+      : "",
     "Treat this as a notification only. Re-read Council state and follow the exact current approval and execution boundaries before taking action.",
   ].filter(Boolean).join("\n");
 }
