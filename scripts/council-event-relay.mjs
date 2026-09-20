@@ -15,7 +15,7 @@ const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_CASE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const SAFE_DIGEST = /^[a-f0-9]{64}$/i;
 const SAFE_EVENT_KINDS = new Set([
-  "case.create", "message.send", "proposal.publish", "position.record", "decision.owner",
+  "case.create", "msg.send", "proposal.publish", "position.record", "decision.owner",
   "job.offer", "job.claim", "attempt.event", "result.verify", "job.cancel", "xfer.offer",
   "xfer.accept", "inbox.read", "inbox.ack", "rule.put", "rule.revoke", "artifact.put",
   "proposal.pending", "proposal.permit.created", "decision.recorded", "job.updated", "message.created", "council.event",
@@ -183,8 +183,15 @@ async function* sseEvents(response) {
     const result = flush();
     if (result) yield result;
   } finally {
+    try { await reader.cancel(); } catch { /* the peer may already have closed */ }
     reader.releaseLock();
   }
+}
+
+function relayErrorSummary(error, cursor, retryMs) {
+  const name = typeof error?.name === "string" ? error.name.slice(0, 80) : "Error";
+  const code = typeof error?.code === "string" && SAFE_IDENTIFIER.test(error.code) ? error.code : undefined;
+  return JSON.stringify({ level: "error", component: "council-event-relay", name, ...(code ? { code } : {}), message: "Council relay operation failed", cursor, retryMs });
 }
 
 async function openStream(options, cursor) {
@@ -276,7 +283,7 @@ async function reconcileCursor(options, cursor, config, turnRunner) {
   return { currentCursor, requestId };
 }
 
-export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
   const options = relayConfig(config);
   if (!options) throw new Error("Council push is not configured");
   let state = readState(options.statePath);
@@ -284,7 +291,6 @@ export async function runRelay(config, { signal = new AbortController().signal, 
   while (!signal.aborted) {
     try {
       const response = await streamOpener(options, state.cursor);
-      backoff = 1_000;
       for await (const record of sseEvents(response)) {
         if (signal.aborted) break;
         if (record.type !== "council.event" && record.type !== "council" && record.type !== "message") continue;
@@ -321,6 +327,7 @@ export async function runRelay(config, { signal = new AbortController().signal, 
         await turnRunner({ codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt: eventPrompt(event), requestId, sessionId: options.sessionId || null, title: "Agent Council event", turnTimeoutMs: 15 * 60 * 1000 });
         state = { ...state, cursor: event.seq };
         writeState(options.statePath, state);
+        backoff = 1_000;
       }
       throw new Error("Council event stream closed");
     } catch (error) {
@@ -332,6 +339,7 @@ export async function runRelay(config, { signal = new AbortController().signal, 
         backoff = 1_000;
         continue;
       }
+      errorLogger(relayErrorSummary(error, state.cursor, backoff));
       await sleep(backoff);
       backoff = Math.min(MAX_BACKOFF_MS, backoff * 2);
     }
