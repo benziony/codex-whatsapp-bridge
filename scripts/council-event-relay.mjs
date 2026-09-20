@@ -225,6 +225,12 @@ function relayErrorSummary(error, cursor, retryMs) {
   return JSON.stringify({ level: "error", component: "council-event-relay", name, ...(code ? { code } : {}), message: "Council relay operation failed", cursor, retryMs });
 }
 
+function relayAdmissionSummary(error, cursor) {
+  const name = typeof error?.name === "string" ? error.name.slice(0, 80) : "Error";
+  const code = typeof error?.code === "string" && SAFE_IDENTIFIER.test(error.code) ? error.code : undefined;
+  return JSON.stringify({ level: "warn", component: "council-event-relay", name, ...(code ? { code } : {}), message: "Council event was admitted to Codex but its background turn did not complete", cursor });
+}
+
 async function openStream(options, cursor, signal) {
   const token = readBearerCredential({ credentialFile: options.credentialFile, tokenEnv: options.tokenEnv });
   const url = new URL(`${options.councilUrl}/api/events/stream`);
@@ -356,9 +362,26 @@ export async function runRelay(config, { signal = new AbortController().signal, 
           state = { ...state, notified: [...(state.notified ?? []), event.eventId].slice(-256) };
           writeState(options.statePath, state);
         }
-        await turnRunner({ codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt: eventPrompt(event, options.workspace), requestId, sessionId: options.sessionId || null, title: "Agent Council event", turnTimeoutMs: 15 * 60 * 1000 });
-        state = { ...state, cursor: event.seq };
-        writeState(options.statePath, state);
+        let admitted = false;
+        const commitAdmission = () => {
+          admitted = true;
+          if (state.cursor >= event.seq) return;
+          state = { ...state, cursor: event.seq };
+          writeState(options.statePath, state);
+        };
+        try {
+          await turnRunner({ codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt: eventPrompt(event, options.workspace), requestId, sessionId: options.sessionId || null, title: "Agent Council event", turnTimeoutMs: 15 * 60 * 1000, onTurnStarted: commitAdmission });
+          // Test runners and compatible adapters may complete without invoking
+          // the native admission callback. A completed turn is also durable
+          // delivery, so retain the prior behavior as a fallback.
+          commitAdmission();
+        } catch (error) {
+          if (!admitted) throw error;
+          // The Council message is already visible in Codex. Tool approval,
+          // interruption, or later execution failure must not head-of-line
+          // block unrelated decisions and WhatsApp permits behind it.
+          errorLogger(relayAdmissionSummary(error, state.cursor));
+        }
         backoff = 1_000;
       }
       throw new Error("Council event stream closed");

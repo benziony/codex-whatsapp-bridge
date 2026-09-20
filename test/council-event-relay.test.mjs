@@ -296,7 +296,7 @@ test("relay preserves exponential backoff until an event is processed and logs b
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
-test("relay wakes one configured task, writes a private cursor only after completion, and uses stable event request id", async () => {
+test("relay wakes one configured task, writes a private cursor after durable admission, and uses stable event request id", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-relay-"));
   const credentialFile = path.join(directory, "codex-token");
   const statePath = path.join(directory, "state.json");
@@ -343,6 +343,43 @@ test("relay wakes one configured task, writes a private cursor only after comple
   assert.equal(JSON.parse(stored).cursor, 4);
   assert.doesNotMatch(stored, /wp_opaque_permit_123456/);
   fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("an admitted Codex turn cannot block later Council events when background execution pauses", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-admission-cursor-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 3, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  const logs = [];
+  const requestIds = [];
+  let turns = 0;
+  const events = [
+    { seq: 4, eventId: "evt-admitted-paused", kind: "proposal.publish", caseId: "case_a" },
+    { seq: 5, eventId: "evt-after-paused", kind: "msg.send", caseId: "case_b" },
+  ];
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(events.map((item) => `id: ${item.seq}\nevent: council.event\ndata: ${JSON.stringify(item)}\n\n`).join("")),
+    turnRunner: async (input) => {
+      turns += 1;
+      requestIds.push(input.requestId);
+      if (turns === 1) {
+        input.onTurnStarted({ sessionId: "thread-1", turnId: "turn-1" });
+        throw new Error("tool approval required");
+      }
+      controller.abort();
+    },
+    sleep: async () => {},
+    errorLogger: (line) => logs.push(JSON.parse(line)),
+  });
+  assert.equal(result.cursor, 5);
+  assert.deepEqual(requestIds, ["council-event:evt-admitted-paused", "council-event:evt-after-paused"]);
+  assert.deepEqual(logs, [{ level: "warn", component: "council-event-relay", name: "Error", message: "Council event was admitted to Codex but its background turn did not complete", cursor: 4 }]);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 5);
 });
 
 test("native poll delivery failure leaves the cursor untouched and replays with the same delivery key", async () => {
