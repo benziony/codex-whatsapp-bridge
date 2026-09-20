@@ -12,6 +12,7 @@ const MAX_BACKOFF_MS = 5 * 60 * 1000;
 const MAX_RECONCILE_BYTES = 64 * 1024;
 const MAX_RECONCILE_PROMPT = 12 * 1024;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SAFE_SCOPE = /^[A-Za-z0-9_.*:/-]{1,128}$/;
 const SAFE_CASE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const SAFE_DIGEST = /^[a-f0-9]{64}$/i;
 const SAFE_EVENT_KINDS = new Set([
@@ -110,7 +111,7 @@ function approvalNotification(event, config) {
       issuedAt: event.issuedAt ?? event.at,
       expiresAt: event.expiresAt,
     };
-  const permitScope = typeof permit.scope === "string" && SAFE_IDENTIFIER.test(permit.scope) ? permit.scope : null;
+  const permitScope = typeof permit.scope === "string" && SAFE_SCOPE.test(permit.scope) ? permit.scope : null;
   if (!permitScope) return null;
   if (typeof event.scope === "string" && event.scope !== permitScope) return null;
   if (!isCurrentWhatsappPermit(permit, { caseId: event.caseId, rev: event.rev, digest: event.digest, scope: permitScope })) return null;

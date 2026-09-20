@@ -140,18 +140,20 @@ test("native approval poll is contextual and never includes permit or digest com
 });
 
 test("native approval permits use their exact Council scope instead of one fixed bridge scope", () => {
-  const scopedPermit = permit("case_scope", 4, event.digest, "ui:completed-records");
-  const scopedEvent = {
-    ...event,
-    eventId: "evt-scope",
-    caseId: scopedPermit.caseId,
-    rev: scopedPermit.rev,
-    scope: scopedPermit.scope,
-    whatsappPermit: scopedPermit,
-  };
-  const notice = approvalNotification(scopedEvent, { councilApprovals: { chatId: "120@g.us", scope: "design", nativePolls: true } });
-  assert.ok(notice);
-  assert.match(notice.poll.context, /Scope: ui:completed-records/);
+  for (const [index, scope] of ["ui:completed-records", "repo/read", "*"] .entries()) {
+    const scopedPermit = permit(`case_scope_${index}`, 4, event.digest, scope);
+    const scopedEvent = {
+      ...event,
+      eventId: `evt-scope-${index}`,
+      caseId: scopedPermit.caseId,
+      rev: scopedPermit.rev,
+      scope: scopedPermit.scope,
+      whatsappPermit: scopedPermit,
+    };
+    const notice = approvalNotification(scopedEvent, { councilApprovals: { chatId: "120@g.us", scope: "design", nativePolls: true } });
+    assert.ok(notice);
+    assert.match(notice.poll.context, new RegExp(`Scope: ${scope === "*" ? "\\*" : scope}`));
+  }
 });
 
 test("native approval polls expose a nonsecret reference that distinguishes identical requests", () => {
