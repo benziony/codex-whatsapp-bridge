@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { CouncilCursorTooOldError, approvalNotification, eventPrompt, openStream, reconciliationPrompt, registerCouncilPoll, relayConfig, runRelay, safeReconcileSnapshot, sseEvents } from "../scripts/council-event-relay.mjs";
 import { sendWhatsAppNotification } from "../scripts/lib/bridge-state.mjs";
+import { CodexTaskBusyError } from "../scripts/lib/codex-app-server.mjs";
 const permit = (caseId = "case_a", rev = 2, digest = "a".repeat(64), scope = "design") => ({ caseId, rev, digest, scope, issuedBy: "owner", issuedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
 
 const event = { seq: 4, eventId: "evt-4", kind: "whatsapp.permit", caseId: "case_a", rev: 2, digest: "a".repeat(64), permitId: "wp_opaque_permit_123456", safeSummary: "Review the bounded plan.", proposalBody: "A concise proposal body.", approvalChannels: ["web"], riskClass: "financial", scope: "design", whatsappPermit: permit() };
@@ -379,6 +380,47 @@ test("an admitted Codex turn cannot block later Council events when background e
   assert.equal(result.cursor, 5);
   assert.deepEqual(requestIds, ["council-event:evt-admitted-paused", "council-event:evt-after-paused"]);
   assert.deepEqual(logs, [{ level: "warn", component: "council-event-relay", name: "Error", message: "Council event was admitted to Codex but its background turn did not complete", cursor: 4 }]);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 5);
+});
+
+test("a busy configured Council task falls back to one fresh exact-request task", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-bound-task-fallback-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 3, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, sessionId: "thread-fixed", cwd: directory, statePath } };
+  const controller = new AbortController();
+  const attempts = [];
+  let eventFourAdmitted = false;
+  const events = [
+    { seq: 4, eventId: "evt-bound-paused", kind: "proposal.publish", caseId: "case_a" },
+    { seq: 5, eventId: "evt-bound-next", kind: "msg.send", caseId: "case_b" },
+  ];
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(events.map((item) => `id: ${item.seq}\nevent: council.event\ndata: ${JSON.stringify(item)}\n\n`).join("")),
+    turnRunner: async (input) => {
+      attempts.push({ requestId: input.requestId, sessionId: input.sessionId });
+      if (input.requestId.endsWith("evt-bound-paused")) {
+        eventFourAdmitted = true;
+        input.onTurnStarted({ sessionId: "thread-fixed", turnId: "turn-1" });
+        throw new Error("tool approval required");
+      }
+      if (eventFourAdmitted && input.sessionId === "thread-fixed") throw new CodexTaskBusyError("configured task still has the admitted turn", { turnStartRejected: true });
+      input.onTurnStarted({ sessionId: "thread-fallback", turnId: "turn-2" });
+      controller.abort();
+    },
+    sleep: async () => {},
+    errorLogger: () => {},
+  });
+  assert.equal(result.cursor, 5);
+  assert.deepEqual(attempts, [
+    { requestId: "council-event:evt-bound-paused", sessionId: "thread-fixed" },
+    { requestId: "council-event:evt-bound-next", sessionId: "thread-fixed" },
+    { requestId: "council-event:evt-bound-next", sessionId: null },
+  ]);
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 5);
 });
 
