@@ -92,6 +92,55 @@ function workspaceRequest(configured, extra = {}) {
   return { ...extra, headers: { "x-council-workspace": configured.workspace, ...(extra.headers ?? {}) } };
 }
 
+function councilDecision(value) {
+  return value?.decision && typeof value.decision === "object" ? value.decision : value;
+}
+
+function exactDecision(decision, { caseId, rev, scope }) {
+  return decision && decision.caseId === caseId && decision.rev === rev && decision.scope === scope && (decision.verdict === "approved" || decision.verdict === "rejected");
+}
+
+function exactPollStatus(status, { pollId, scope }) {
+  return status?.registered === true
+    && status.pollId === pollId
+    && typeof status.caseId === "string"
+    && CASE_ID.test(status.caseId)
+    && Number.isSafeInteger(status.rev)
+    && status.rev > 0
+    && typeof status.digest === "string"
+    && DIGEST.test(status.digest)
+    && status.digest === status.digest.toLowerCase()
+    && status.scope === scope
+    && /^[A-Za-z0-9._*:/-]{1,128}$/.test(status.scope)
+    && new Set(["active", "consumed", "expired", "stale"]).has(status.status);
+}
+
+function exactPollDecision(decision, pollStatus, pollId, scope) {
+  return decision
+    && decision.pollId === pollId
+    && decision.caseId === pollStatus.caseId
+    && decision.rev === pollStatus.rev
+    && typeof decision.digest === "string"
+    && DIGEST.test(decision.digest)
+    && decision.digest.toLowerCase() === pollStatus.digest
+    && decision.scope === scope
+    && decision.scope === pollStatus.scope
+    && (decision.verdict === "approved" || decision.verdict === "rejected");
+}
+
+async function readExistingCouncilDecision(approval, configured, token, fetcher) {
+  const url = `${configured.councilUrl}/api/whatsapp/decision?workspace=${encodeURIComponent(configured.workspace)}&caseId=${encodeURIComponent(approval.caseId)}&rev=${approval.rev}&digest=${approval.digest}&scope=${encodeURIComponent(configured.scope)}`;
+  try {
+    const response = await fetcher(url, token, workspaceRequest(configured));
+    const decision = councilDecision(response);
+    if (!exactDecision(decision, { caseId: approval.caseId, rev: approval.rev, scope: configured.scope })) throw new Error("Council returned invalid decision readback");
+    return decision;
+  } catch (error) {
+    if (error?.status === 404) return null;
+    throw error;
+  }
+}
+
 export function isCurrentWhatsappPermit(permit, { caseId, rev, digest, scope, nowMs = Date.now() } = {}) {
   if (!permit || typeof permit !== "object" || Array.isArray(permit)) return false;
   if (Object.keys(permit).length !== PERMIT_KEYS.length || PERMIT_KEYS.some((key) => !Object.prototype.hasOwnProperty.call(permit, key))) return false;
@@ -117,11 +166,11 @@ export async function processCouncilApproval(text, config, { fetcher = councilJs
     return { ok: false, message: "Council approval sender or message identity is not allowed." };
   }
   const token = readBearerCredential(configured);
-  const dashboard = await fetcher(`${configured.councilUrl}/api/dashboard?workspace=${encodeURIComponent(configured.workspace)}`, token, workspaceRequest(configured));
-  const pending = Array.isArray(dashboard.pendingDecisions) ? dashboard.pendingDecisions : [];
-  const proposal = pending.find((item) => item?.caseId === approval.caseId && item?.rev === approval.rev);
-  if (!proposal || proposal.superseded === true) return { ok: false, message: `No pending Council proposal matches ${approval.caseId} rev ${approval.rev}.` };
-  if (typeof proposal.digest !== "string" || !DIGEST.test(proposal.digest) || proposal.digest.toLowerCase() !== approval.digest) return { ok: false, message: "Digest mismatch; no decision was recorded." };
+  const existing = await readExistingCouncilDecision(approval, configured, token, fetcher);
+  if (existing) {
+    if (existing.verdict === approval.verdict) return { ok: true, duplicate: true, message: `Council ${approval.verdict} was already recorded for ${approval.caseId} rev ${approval.rev}.`, result: existing };
+    return { ok: false, message: `Council ${existing.verdict} is already recorded for ${approval.caseId} rev ${approval.rev}; no change was made.` };
+  }
   const permitResponse = await fetcher(`${configured.councilUrl}/api/whatsapp/permit?workspace=${encodeURIComponent(configured.workspace)}&caseId=${encodeURIComponent(approval.caseId)}&rev=${approval.rev}&digest=${approval.digest}`, token, workspaceRequest(configured));
   const permitSource = permitResponse?.whatsappPermit && typeof permitResponse.whatsappPermit === "object" ? permitResponse.whatsappPermit : permitResponse?.permit && typeof permitResponse.permit === "object" ? permitResponse.permit : permitResponse;
   const { permitId: _permitId, ...permit } = permitSource && typeof permitSource === "object" ? permitSource : {};
@@ -205,8 +254,20 @@ export async function processCouncilPollVote(payload, config, { fetcher = counci
     }
   }
   if (!pollStatus || pollStatus.registered !== true) return { ok: false, status: "unclaimed", message: "This poll is not a registered Council approval." };
-  if (pollStatus.status !== "active") return { ok: false, status: "bound-failed", message: `This Council poll is ${pollStatus.status}; no decision was recorded.` };
+  if (!exactPollStatus(pollStatus, { pollId: pollMessageId, scope: configured.scope })) return { ok: false, status: "bound-failed", message: "This Council poll registration is not exactly bound; no decision was recorded." };
   const verdict = selectedOptions[0] === "Approve" ? "approved" : "rejected";
+  if (pollStatus.status === "consumed") {
+    try {
+      const readback = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}`, token, workspaceRequest(configured));
+      const decision = councilDecision(readback);
+      if (!exactPollDecision(decision, pollStatus, pollMessageId, configured.scope)) throw new Error("Council returned invalid poll decision readback");
+      if (decision.verdict === verdict) return { ok: true, status: "accepted", duplicate: true, message: "Council poll decision was already recorded." };
+      return { ok: false, status: "bound-failed", message: `This Council poll already recorded ${decision.verdict}; no change was made.` };
+    } catch (error) {
+      throw new Error(`Council poll decision status is uncertain; exact readback failed (${error?.message ?? "request failure"})`);
+    }
+  }
+  if (pollStatus.status !== "active") return { ok: false, status: "bound-failed", message: `This Council poll is ${pollStatus.status}; no decision was recorded.` };
   const requestId = stablePollRequestId(pollMessageId, messageId, verdict);
   let result;
   try {
@@ -214,8 +275,8 @@ export async function processCouncilPollVote(payload, config, { fetcher = counci
   } catch (error) {
     try {
       const readback = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}&verdict=${verdict}`, token, workspaceRequest(configured, { headers: { "x-request-id": requestId } }));
-      const decision = readback?.decision && typeof readback.decision === "object" ? readback.decision : readback;
-      if (decision?.verdict === verdict && decision?.pollId === pollMessageId) return { ok: true, status: "accepted", recovered: true, message: "Council poll decision was recorded." };
+      const decision = councilDecision(readback);
+      if (exactPollDecision(decision, pollStatus, pollMessageId, configured.scope) && decision.verdict === verdict) return { ok: true, status: "accepted", recovered: true, message: "Council poll decision was recorded." };
     } catch { /* preserve uncertainty below */ }
     throw new Error(`Council poll decision outcome is uncertain; exact readback failed (${error?.message ?? "request failure"})`);
   }
