@@ -99,6 +99,32 @@ test("SSE parser cancels the response body when a consumer stops early", async (
   assert.equal(canceled, 1);
 });
 
+test("relay abort cancels an idle SSE read and exits", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-idle-abort-"));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 61, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  let canceled = 0;
+  const idle = new Response(new ReadableStream({ cancel() { canceled += 1; } }));
+  const controller = new AbortController();
+  const pending = runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => idle,
+    sleep: async () => {},
+    errorLogger: () => {},
+  });
+  setTimeout(() => controller.abort(), 20);
+  const result = await Promise.race([
+    pending,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("relay did not stop after abort")), 250)),
+  ]);
+  assert.deepEqual(result, { ok: true, cursor: 61 });
+  assert.equal(canceled, 1);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test("relay replays canonical msg.send after cursor 61 and advances only after the task turn", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-msg-replay-"));
   const credentialFile = path.join(directory, "codex-token");

@@ -141,9 +141,12 @@ async function registerCouncilPoll(options, event, delivery, config) {
   return { ok: true, status: "registered" };
 }
 
-async function* sseEvents(response) {
+async function* sseEvents(response, signal) {
   if (!response.body) throw new Error("Council event stream has no body");
   const reader = response.body.getReader();
+  const cancel = () => { reader.cancel().catch(() => {}); };
+  if (signal?.aborted) cancel();
+  else signal?.addEventListener("abort", cancel, { once: true });
   const decoder = new TextDecoder();
   let buffer = "";
   let event = { id: "", data: [], type: "message" };
@@ -183,6 +186,7 @@ async function* sseEvents(response) {
     const result = flush();
     if (result) yield result;
   } finally {
+    signal?.removeEventListener("abort", cancel);
     try { await reader.cancel(); } catch { /* the peer may already have closed */ }
     reader.releaseLock();
   }
@@ -194,7 +198,7 @@ function relayErrorSummary(error, cursor, retryMs) {
   return JSON.stringify({ level: "error", component: "council-event-relay", name, ...(code ? { code } : {}), message: "Council relay operation failed", cursor, retryMs });
 }
 
-async function openStream(options, cursor) {
+async function openStream(options, cursor, signal) {
   const token = readBearerCredential({ credentialFile: options.credentialFile, tokenEnv: options.tokenEnv });
   const url = new URL(`${options.councilUrl}/api/events/stream`);
   url.searchParams.set("since", String(cursor));
@@ -202,6 +206,7 @@ async function openStream(options, cursor) {
   const response = await fetch(url, {
     redirect: "error",
     headers: { authorization: `Bearer ${token}`, accept: "text/event-stream" },
+    signal,
   });
   if (response.status === 410) throw new CouncilCursorTooOldError();
   if (!response.ok) throw new Error(`Council event stream failed (${response.status})`);
@@ -290,8 +295,8 @@ export async function runRelay(config, { signal = new AbortController().signal, 
   let backoff = 1_000;
   while (!signal.aborted) {
     try {
-      const response = await streamOpener(options, state.cursor);
-      for await (const record of sseEvents(response)) {
+      const response = await streamOpener(options, state.cursor, signal);
+      for await (const record of sseEvents(response, signal)) {
         if (signal.aborted) break;
         if (record.type !== "council.event" && record.type !== "council" && record.type !== "message") continue;
         let rawEvent;
