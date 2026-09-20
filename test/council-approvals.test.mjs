@@ -67,6 +67,24 @@ test("native Council poll vote is exact-chat owner-only and maps to the poll dec
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
+test("native Council poll votes preserve a registered variable scope", async () => {
+  const { config, directory } = fixture();
+  config.councilApprovals.nativePolls = true;
+  const scope = "ui:completed-records";
+  let posted = false;
+  let statusReads = 0;
+  const fetcher = async (url, _token, init = {}) => {
+    if (String(url).includes("/status?")) { statusReads += 1; return pollStatus("WA.variable", posted && statusReads > 1 ? "consumed" : "active", scope); }
+    if (String(url).includes("/poll/decision?") && !init.method) return { ...pollStatus("WA.variable", "consumed", scope), verdict: "approved" };
+    if (init.method === "POST") posted = true;
+    return { acknowledgement: "Council approved." };
+  };
+  const result = await processCouncilPollVote({ pollMessageId: "WA.variable", selectedOptions: ["Approve"], chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "vote-variable" }, config, { fetcher });
+  assert.equal(result.ok, true);
+  assert.equal(posted, true);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test("successful native Council poll votes require exact decision readback before acknowledgement", async () => {
   const { config, directory } = fixture();
   config.councilApprovals.nativePolls = true;
@@ -158,14 +176,14 @@ test("consumed Council poll votes read back once and cannot reverse the recorded
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
-test("malformed or out-of-scope consumed Council poll registrations fail closed", async () => {
+test("malformed consumed Council poll registrations fail closed", async () => {
   const { config, directory } = fixture();
   config.councilApprovals.nativePolls = true;
   let decisionReads = 0;
   const vote = { pollMessageId: "WA.poll-1", selectedOptions: ["Approve"], chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "vote-malformed" };
   for (const status of [
     { registered: true, status: "consumed", pollId: "WA.poll-1" },
-    pollStatus("WA.poll-1", "consumed", "production"),
+    pollStatus("WA.poll-1", "consumed", "production bad"),
     { ...pollStatus("WA.poll-1", "consumed"), pollId: "different-poll" },
   ]) {
     const result = await processCouncilPollVote(vote, config, { fetcher: async (url) => {
@@ -282,21 +300,34 @@ test("direct broker context cannot bypass the exact Council chat, sender, or mes
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
-test("scope mismatch and expired proposal are rejected before decision post", async () => {
-  for (const metadata of [{ whatsappPermit: { ...permit(), scope: "production" } }, { whatsappPermit: { ...permit(), expiresAt: "2020-01-01T00:00:00.000Z" } }]) {
-    const { config, directory } = fixture();
-    let post = false;
-    const fetcher = async (url) => {
-      if (url.includes("/api/whatsapp/decision?")) { const error = new Error("not found"); error.status = 404; throw error; }
-      if (url.includes("/api/whatsapp/permit?")) return { ...metadata.whatsappPermit, permitId };
-      post = true;
-      return {};
-    };
-    const result = await processCouncilApproval(`APPROVE case_mu4vrfky_2 REV 1 DIGEST ${digest}`, config, { fetcher, context: { chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "msg-1" } });
-    assert.equal(result.ok, false);
-    assert.equal(post, false);
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
+test("text approvals use the owner permit's exact scope instead of one fixed bridge scope", async () => {
+  const { config, directory } = fixture();
+  let postedBody;
+  const fetcher = async (url, _token, init = {}) => {
+    if (url.includes("/api/whatsapp/decision?")) { const error = new Error("not found"); error.status = 404; throw error; }
+    if (url.includes("/api/whatsapp/permit?")) return { ...permit("case_mu4vrfky_2", 1, "ui:completed-records"), permitId };
+    postedBody = JSON.parse(init.body);
+    return { verdict: "approved" };
+  };
+  const result = await processCouncilApproval(`APPROVE case_mu4vrfky_2 REV 1 DIGEST ${digest}`, config, { fetcher, context: { chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "msg-variable-scope" } });
+  assert.equal(result.ok, true);
+  assert.equal(postedBody.scope, "ui:completed-records");
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("expired owner permits are rejected before decision post", async () => {
+  const { config, directory } = fixture();
+  let post = false;
+  const fetcher = async (url) => {
+    if (url.includes("/api/whatsapp/decision?")) { const error = new Error("not found"); error.status = 404; throw error; }
+    if (url.includes("/api/whatsapp/permit?")) return { ...permit(), expiresAt: "2020-01-01T00:00:00.000Z", permitId };
+    post = true;
+    return {};
+  };
+  const result = await processCouncilApproval(`APPROVE case_mu4vrfky_2 REV 1 DIGEST ${digest}`, config, { fetcher, context: { chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "msg-expired" } });
+  assert.equal(result.ok, false);
+  assert.equal(post, false);
+  fs.rmSync(directory, { recursive: true, force: true });
 });
 
 test("agent self-misclassification without an owner permit is denied", async () => {

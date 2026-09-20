@@ -100,6 +100,12 @@ function exactDecision(decision, { caseId, rev, scope }) {
   return decision && decision.caseId === caseId && decision.rev === rev && decision.scope === scope && (decision.verdict === "approved" || decision.verdict === "rejected");
 }
 
+function exactDecisionAnyScope(decision, { caseId, rev }) {
+  return decision && decision.caseId === caseId && decision.rev === rev
+    && typeof decision.scope === "string" && /^[A-Za-z0-9._*:/-]{1,128}$/.test(decision.scope)
+    && (decision.verdict === "approved" || decision.verdict === "rejected");
+}
+
 function exactPollStatus(status, { pollId, scope }) {
   return status?.registered === true
     && status.pollId === pollId
@@ -140,24 +146,24 @@ function exactPollDecision(decision, pollStatus, pollId, scope) {
 async function readExactPollDecision(pollMessageId, pollStatus, configured, token, fetcher, requestId = "") {
   const readback = await fetcher(`${configured.councilUrl}/api/whatsapp/poll/decision?workspace=${encodeURIComponent(configured.workspace)}&pollId=${encodeURIComponent(pollMessageId)}`, token, workspaceRequest(configured, requestId ? { headers: { "x-request-id": requestId } } : {}));
   const decision = councilDecision(readback);
-  if (!exactPollDecision(decision, pollStatus, pollMessageId, configured.scope)) throw new Error("Council returned invalid poll decision readback");
+  if (!exactPollDecision(decision, pollStatus, pollMessageId, pollStatus.scope)) throw new Error("Council returned invalid poll decision readback");
   return decision;
 }
 
 async function readExactConsumedPollStatus(statusUrl, pollMessageId, pollStatus, configured, token, fetcher, requestId = "") {
   const refreshed = await fetcher(statusUrl, token, workspaceRequest(configured, requestId ? { headers: { "x-request-id": requestId } } : {}));
-  if (!exactPollStatus(refreshed, { pollId: pollMessageId, scope: configured.scope }) || !samePollBinding(refreshed, pollStatus) || refreshed.status !== "consumed") {
+  if (!exactPollStatus(refreshed, { pollId: pollMessageId, scope: pollStatus.scope }) || !samePollBinding(refreshed, pollStatus) || refreshed.status !== "consumed") {
     throw new Error("Council poll consumption was not confirmed");
   }
   return refreshed;
 }
 
 async function readExistingCouncilDecision(approval, configured, token, fetcher) {
-  const url = `${configured.councilUrl}/api/whatsapp/decision?workspace=${encodeURIComponent(configured.workspace)}&caseId=${encodeURIComponent(approval.caseId)}&rev=${approval.rev}&digest=${approval.digest}&scope=${encodeURIComponent(configured.scope)}`;
+  const url = `${configured.councilUrl}/api/whatsapp/decision?workspace=${encodeURIComponent(configured.workspace)}&caseId=${encodeURIComponent(approval.caseId)}&rev=${approval.rev}&digest=${approval.digest}`;
   try {
     const response = await fetcher(url, token, workspaceRequest(configured));
     const decision = councilDecision(response);
-    if (!exactDecision(decision, { caseId: approval.caseId, rev: approval.rev, scope: configured.scope })) throw new Error("Council returned invalid decision readback");
+    if (!exactDecisionAnyScope(decision, { caseId: approval.caseId, rev: approval.rev })) throw new Error("Council returned invalid decision readback");
     return decision;
   } catch (error) {
     if (error?.status === 404) return null;
@@ -198,7 +204,8 @@ export async function processCouncilApproval(text, config, { fetcher = councilJs
   const permitResponse = await fetcher(`${configured.councilUrl}/api/whatsapp/permit?workspace=${encodeURIComponent(configured.workspace)}&caseId=${encodeURIComponent(approval.caseId)}&rev=${approval.rev}&digest=${approval.digest}`, token, workspaceRequest(configured));
   const permitSource = permitResponse?.whatsappPermit && typeof permitResponse.whatsappPermit === "object" ? permitResponse.whatsappPermit : permitResponse?.permit && typeof permitResponse.permit === "object" ? permitResponse.permit : permitResponse;
   const { permitId: _permitId, ...permit } = permitSource && typeof permitSource === "object" ? permitSource : {};
-  if (!isCurrentWhatsappPermit(permit, { caseId: approval.caseId, rev: approval.rev, digest: approval.digest, scope: configured.scope })) return { ok: false, message: "No current owner-issued WhatsApp permit matches this proposal." };
+  const permitScope = typeof permit?.scope === "string" && /^[A-Za-z0-9._*:/-]{1,128}$/.test(permit.scope) ? permit.scope : null;
+  if (!permitScope || !isCurrentWhatsappPermit(permit, { caseId: approval.caseId, rev: approval.rev, digest: approval.digest, scope: permitScope })) return { ok: false, message: "No current owner-issued WhatsApp permit matches this proposal." };
   const permitId = typeof permitResponse?.permitId === "string" ? permitResponse.permitId.trim() : typeof permit?.permitId === "string" ? permit.permitId.trim() : "";
   if (!PERMIT_ID.test(permitId)) return { ok: false, message: "No current Council permit reference is available." };
   const requestId = `whatsapp-approval:${chatId}:${messageId}:${approval.caseId}:${approval.rev}:${approval.digest}`;
@@ -206,7 +213,7 @@ export async function processCouncilApproval(text, config, { fetcher = councilJs
     const result = await fetcher(`${configured.councilUrl}/api/whatsapp/decision`, token, workspaceRequest(configured, {
       method: "POST",
       headers: { "content-type": "application/json", "x-request-id": requestId },
-      body: JSON.stringify({ requestId, caseId: approval.caseId, rev: approval.rev, verdict: approval.verdict, scope: configured.scope, permitId }),
+      body: JSON.stringify({ requestId, caseId: approval.caseId, rev: approval.rev, verdict: approval.verdict, scope: permitScope, permitId }),
     }));
     return { ok: true, message: `Council ${approval.verdict} recorded for ${approval.caseId} rev ${approval.rev}.`, result };
   } catch (error) {
@@ -218,7 +225,7 @@ export async function processCouncilApproval(text, config, { fetcher = councilJs
         headers: { "x-request-id": requestId, "x-council-request-id": requestId },
       }));
       const decision = readback?.decision && typeof readback.decision === "object" ? readback.decision : readback;
-      if (decision && decision.caseId === approval.caseId && decision.rev === approval.rev && decision.verdict === approval.verdict && decision.scope === configured.scope) {
+      if (decision && decision.caseId === approval.caseId && decision.rev === approval.rev && decision.verdict === approval.verdict && decision.scope === permitScope) {
         return { ok: true, recovered: true, message: `Council ${approval.verdict} recorded for ${approval.caseId} rev ${approval.rev}.`, result: readback };
       }
     } catch {
@@ -245,7 +252,7 @@ export async function recoverCouncilApproval(text, config, { fetcher = councilJs
       headers: { "x-request-id": requestId, "x-council-request-id": requestId },
     }));
     const decision = readback?.decision && typeof readback.decision === "object" ? readback.decision : readback;
-    if (decision && decision.caseId === approval.caseId && decision.rev === approval.rev && decision.verdict === approval.verdict && decision.scope === configured.scope) {
+    if (decision && decision.caseId === approval.caseId && decision.rev === approval.rev && decision.verdict === approval.verdict && typeof decision.scope === "string" && /^[A-Za-z0-9._*:/-]{1,128}$/.test(decision.scope)) {
       return { ok: true, recovered: true, message: `Council ${approval.verdict} recorded for ${approval.caseId} rev ${approval.rev}.`, result: readback };
     }
   } catch {
@@ -278,7 +285,8 @@ export async function processCouncilPollVote(payload, config, { fetcher = counci
     }
   }
   if (!pollStatus || pollStatus.registered !== true) return { ok: false, status: "unclaimed", message: "This poll is not a registered Council approval." };
-  if (!exactPollStatus(pollStatus, { pollId: pollMessageId, scope: configured.scope })) return { ok: false, status: "bound-failed", message: "This Council poll registration is not exactly bound; no decision was recorded." };
+  const pollScope = typeof pollStatus.scope === "string" && /^[A-Za-z0-9._*:/-]{1,128}$/.test(pollStatus.scope) ? pollStatus.scope : null;
+  if (!pollScope || !exactPollStatus(pollStatus, { pollId: pollMessageId, scope: pollScope })) return { ok: false, status: "bound-failed", message: "This Council poll registration is not exactly bound; no decision was recorded." };
   const verdict = selectedOptions[0] === "Approve" ? "approved" : "rejected";
   if (pollStatus.status === "consumed") {
     try {
