@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { runCodexAppServerTurn } from "./lib/codex-app-server.mjs";
+import { CodexActiveWriterError, CodexTaskBusyError, runCodexAppServerTurn } from "./lib/codex-app-server.mjs";
 import { sendWhatsAppNotification, sendWhatsAppPoll } from "./lib/bridge-state.mjs";
 import { bridgePaths, codexBinaryPath, readConfig } from "./lib/runtime-config.mjs";
 import { isCurrentWhatsappPermit, readBearerCredential } from "./lib/council-approvals.mjs";
@@ -225,6 +225,12 @@ function relayErrorSummary(error, cursor, retryMs) {
   return JSON.stringify({ level: "error", component: "council-event-relay", name, ...(code ? { code } : {}), message: "Council relay operation failed", cursor, retryMs });
 }
 
+function relayAdmissionSummary(error, cursor) {
+  const name = typeof error?.name === "string" ? error.name.slice(0, 80) : "Error";
+  const code = typeof error?.code === "string" && SAFE_IDENTIFIER.test(error.code) ? error.code : undefined;
+  return JSON.stringify({ level: "warn", component: "council-event-relay", name, ...(code ? { code } : {}), message: "Council event was admitted to Codex but its background turn did not complete", cursor });
+}
+
 async function openStream(options, cursor, signal) {
   const token = readBearerCredential({ credentialFile: options.credentialFile, tokenEnv: options.tokenEnv });
   const url = new URL(`${options.councilUrl}/api/events/stream`);
@@ -356,9 +362,38 @@ export async function runRelay(config, { signal = new AbortController().signal, 
           state = { ...state, notified: [...(state.notified ?? []), event.eventId].slice(-256) };
           writeState(options.statePath, state);
         }
-        await turnRunner({ codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt: eventPrompt(event, options.workspace), requestId, sessionId: options.sessionId || null, title: "Agent Council event", turnTimeoutMs: 15 * 60 * 1000 });
-        state = { ...state, cursor: event.seq };
-        writeState(options.statePath, state);
+        let admitted = false;
+        const commitAdmission = () => {
+          admitted = true;
+          if (state.cursor >= event.seq) return;
+          state = { ...state, cursor: event.seq };
+          writeState(options.statePath, state);
+        };
+        const runTurn = (sessionId) => turnRunner({ codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt: eventPrompt(event, options.workspace), requestId, sessionId, title: "Agent Council event", turnTimeoutMs: 15 * 60 * 1000, onTurnStarted: commitAdmission });
+        try {
+          try {
+            await runTurn(options.sessionId || null);
+          } catch (error) {
+            const boundTaskRejectedAdmission = !admitted && options.sessionId && (error instanceof CodexTaskBusyError || error instanceof CodexActiveWriterError);
+            if (!boundTaskRejectedAdmission) throw error;
+            // A configured conversation is preferred, not a global queue lock.
+            // Exact pre-admission busy/active-writer errors prove that the
+            // request was not accepted there, so one fresh correlated task is
+            // safe and prevents an active owner conversation from blocking the
+            // rest of the Council stream.
+            await runTurn(null);
+          }
+          // Test runners and compatible adapters may complete without invoking
+          // the native admission callback. A completed turn is also durable
+          // delivery, so retain the prior behavior as a fallback.
+          commitAdmission();
+        } catch (error) {
+          if (!admitted) throw error;
+          // The Council message is already visible in Codex. Tool approval,
+          // interruption, or later execution failure must not head-of-line
+          // block unrelated decisions and WhatsApp permits behind it.
+          errorLogger(relayAdmissionSummary(error, state.cursor));
+        }
         backoff = 1_000;
       }
       throw new Error("Council event stream closed");
