@@ -53,12 +53,12 @@ Runtime configuration is stored at
 claim. It uses the Codex principal credential reference (`codexCredentialFile`
 or `codexTokenEnv`), not an owner credential. When push is also enabled, both
 sections must name the same file or environment variable and workspace.
-Every dashboard, permit, decision, and readback request carries that explicit
-workspace. Incoming commands
+Every permit, decision, and readback request carries that explicit workspace;
+the Codex credential never calls the owner-only dashboard. Incoming commands
 must be exactly `APPROVE|REJECT case_id REV n DIGEST sha256`. The bridge
-fetches current Council state before every decision, requires the exact
-owner-issued unexpired `whatsappPermit` metadata and opaque permit reference,
-then refetches that reference from the exact Codex-authenticated
+reads the exact immutable decision status before every attempt, requires the
+exact owner-issued unexpired `whatsappPermit` metadata and opaque permit
+reference, then fetches that reference from the exact Codex-authenticated
 `GET /api/whatsapp/permit?caseId=...&rev=...&digest=...` route immediately
 before the decision. It sends the reference only in the authenticated HTTPS
 `POST /api/whatsapp/decision` call.
