@@ -19,7 +19,7 @@ const SAFE_EVENT_KINDS = new Set([
   "job.offer", "job.claim", "attempt.event", "result.verify", "job.cancel", "xfer.offer",
   "xfer.accept", "inbox.read", "inbox.ack", "rule.put", "rule.revoke", "artifact.put",
   "proposal.pending", "proposal.permit.created", "decision.recorded", "job.updated", "message.created", "council.event",
-  "whatsapp.permit",
+  "whatsapp.permit", "proposal",
 ]);
 
 class CouncilCursorTooOldError extends Error {
@@ -117,18 +117,21 @@ function approvalNotification(event, config) {
   const proposalBody = typeof event.proposalBody === "string" && event.proposalBody.trim()
     ? event.proposalBody.trim().slice(0, 900)
     : "";
+  const safeReason = typeof event.safeReason === "string" && event.safeReason.trim() ? event.safeReason.trim().slice(0, 600) : "";
+  const safeEffect = typeof event.safeEffect === "string" && event.safeEffect.trim() ? event.safeEffect.trim().slice(0, 600) : "";
+  const safeExecutor = typeof event.safeExecutor === "string" && SAFE_IDENTIFIER.test(event.safeExecutor) ? event.safeExecutor : "the assigned agent";
   const fixedContext = [
-    "Council approval requested.",
-    `Case ${event.caseId}, revision ${event.rev}.`,
-    `Risk: ${typeof event.riskClass === "string" ? event.riskClass.slice(0, 64) : "unspecified"}.`,
-    `Channels: ${Array.isArray(event.approvalChannels) ? event.approvalChannels.slice(0, 4).map((value) => String(value).slice(0, 32)).join(", ") : "web"}.`,
-    `Digest fingerprint: ${event.digest.slice(0, 12)}.`,
+    "Council decision needed",
+    `Request: ${safeSummary}`,
+    safeReason ? `Why: ${safeReason}` : "",
+    safeEffect ? `What happens: ${safeEffect}` : "",
+    `Who: ${safeExecutor}`,
+    `Risk: ${typeof event.riskClass === "string" ? event.riskClass.slice(0, 64) : "unspecified"}`,
     `Scope: ${permit.scope}`,
-    `Expires: ${String(permit.expiresAt).slice(0, 32)}`,
-  ].join("\n");
-  const details = [safeSummary, proposalBody ? `Proposal: ${proposalBody}` : ""].filter(Boolean).join("\n");
+  ].filter(Boolean).join("\n");
+  const details = !safeReason && !safeEffect && proposalBody ? `Details: ${proposalBody}` : "";
   const context = `${fixedContext}\n${details.slice(0, Math.max(0, 1_200 - fixedContext.length - 1))}`.slice(0, 1_200);
-  const text = `Council approval available\nCase: ${event.caseId} rev ${event.rev}\nDigest: ${event.digest.toLowerCase()}\nScope: ${permit.scope}\n\nApprove: APPROVE ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}\nReject: REJECT ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}`;
+  const text = `${context}\n\nReply with one exact command:\nApprove: APPROVE ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}\nReject: REJECT ${event.caseId} REV ${event.rev} DIGEST ${event.digest.toLowerCase()}`;
   // Keep the event-derived key stable across retries while conforming to the
   // bridge's UUID-v4 delivery-key contract.
   const keyBytes = Buffer.from(createHash("sha256").update(event.eventId).digest("hex").slice(0, 32), "hex");
@@ -137,7 +140,7 @@ function approvalNotification(event, config) {
   const keyHash = keyBytes.toString("hex");
   const deliveryKey = `${keyHash.slice(0, 8)}-${keyHash.slice(8, 12)}-${keyHash.slice(12, 16)}-${keyHash.slice(16, 20)}-${keyHash.slice(20)}`;
   if (approvals.nativePolls === true) {
-    const question = `Approve ${safeSummary.slice(0, 72)} (case ${event.caseId} r${event.rev})?`.slice(0, 500);
+    const question = `Approve “${safeSummary.slice(0, 180)}”?`.slice(0, 500);
     return { target: approvals.chatId, deliveryKey, poll: { target: approvals.chatId, context, question, options: ["Approve", "Reject"], selectableCount: 1, deliveryKey } };
   }
   return { target: approvals.chatId, text, deliveryKey };

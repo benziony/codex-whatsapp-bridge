@@ -25,7 +25,7 @@ test("decision prompts require exact-revision authoritative readback", () => {
 });
 
 test("ordinary Council events remain advisory notification-only prompts", () => {
-  for (const kind of ["proposal.pending", "job.claim", "attempt.event", "result.verify"]) {
+  for (const kind of ["proposal", "proposal.pending", "job.claim", "attempt.event", "result.verify"]) {
     const prompt = eventPrompt({ seq: 10, eventId: `evt-${kind.replaceAll(".", "-")}`, kind, caseId: "case_scope", rev: 3 });
     assert.match(prompt, /Treat this as a notification only/);
     assert.doesNotMatch(prompt, /execution trigger|claim only that current job|executor is exactly codex/);
@@ -116,21 +116,24 @@ test("approval notices require an owner permit-created event", async () => {
   const result = await runRelay(config, { signal: controller.signal, streamOpener: async () => new Response(`id: 4\nevent: council.event\ndata: ${JSON.stringify(ordinary)}\n\nid: 5\nevent: council.event\ndata: ${JSON.stringify(permitted)}\n\n`), turnRunner: async (input) => { if (input.prompt.includes("evt-permit")) controller.abort(); }, notificationSender: async (notice) => notices.push(notice), sleep: async () => {} });
   assert.equal(result.cursor, 5);
   assert.equal(notices.length, 1);
-  assert.doesNotMatch(notices[0].text, /Review the bounded plan|financial/);
+  assert.match(notices[0].text, /Request: Review the bounded plan/);
+  assert.match(notices[0].text, /Risk: financial/);
+  assert.doesNotMatch(notices[0].text, /wp_opaque_permit_123456/);
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
 test("native approval poll is contextual and never includes permit or digest commands", () => {
-  const notice = approvalNotification({ ...event, safeSummary: "Review the bounded SolarManager repair.", proposalBody: "Replace the legacy retry path." }, { councilApprovals: { chatId: "120@g.us", scope: "design", nativePolls: true } });
-  assert.match(notice.poll.question, /Approve .*case case_a r2/);
+  const notice = approvalNotification({ ...event, safeSummary: "Review the bounded SolarManager repair.", safeReason: "The legacy path keeps timing out.", safeEffect: "Codex will replace only the retry path.", safeExecutor: "codex", proposalBody: "Replace the legacy retry path." }, { councilApprovals: { chatId: "120@g.us", scope: "design", nativePolls: true } });
+  assert.equal(notice.poll.question, "Approve “Review the bounded SolarManager repair.”?");
   assert.deepEqual(notice.poll.options, ["Approve", "Reject"]);
   assert.match(notice.poll.deliveryKey, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-  assert.match(notice.poll.context, /Review the bounded SolarManager repair/);
-  assert.match(notice.poll.context, /Replace the legacy retry path/);
-  assert.match(notice.poll.context, /Case case_a, revision 2|Risk: financial|Channels: web|Digest fingerprint: a{12}/);
+  assert.match(notice.poll.context, /Request: Review the bounded SolarManager repair/);
+  assert.match(notice.poll.context, /Why: The legacy path keeps timing out/);
+  assert.match(notice.poll.context, /What happens: Codex will replace only the retry path/);
+  assert.match(notice.poll.context, /Who: codex/);
+  assert.match(notice.poll.context, /Risk: financial/);
   assert.match(notice.poll.context, /Scope: design/);
-  assert.match(notice.poll.context, /Expires:/);
-  assert.doesNotMatch(notice.poll.context, /APPROVE|REJECT|Digest:|wp_opaque/);
+  assert.doesNotMatch(notice.poll.context, /Case case_a|revision 2|Channels:|Digest|Expires:|APPROVE|REJECT|wp_opaque/);
   assert.equal(notice.text, undefined);
   assert.equal(notice.poll.permitId, undefined);
 });
