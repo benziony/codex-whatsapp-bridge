@@ -87,6 +87,99 @@ test("SSE parser preserves event id/type and multiline data", async () => {
   assert.deepEqual(records, [{ id: "4", type: "council.event", data: '{"seq":4,\n"ok"}' }]);
 });
 
+test("SSE parser cancels the response body when a consumer stops early", async () => {
+  let canceled = 0;
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('id: 4\nevent: council.event\ndata: {"seq":4}\n\n'));
+    },
+    cancel() { canceled += 1; },
+  }));
+  for await (const _record of sseEvents(response)) break;
+  assert.equal(canceled, 1);
+});
+
+test("relay abort cancels an idle SSE read and exits", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-idle-abort-"));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 61, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  let canceled = 0;
+  const idle = new Response(new ReadableStream({ cancel() { canceled += 1; } }));
+  const controller = new AbortController();
+  const pending = runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => idle,
+    sleep: async () => {},
+    errorLogger: () => {},
+  });
+  setTimeout(() => controller.abort(), 20);
+  const result = await Promise.race([
+    pending,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("relay did not stop after abort")), 250)),
+  ]);
+  assert.deepEqual(result, { ok: true, cursor: 61 });
+  assert.equal(canceled, 1);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("relay replays canonical msg.send after cursor 61 and advances only after the task turn", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-msg-replay-"));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 61, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, sessionId: "thread-1", cwd: directory, statePath } };
+  const controller = new AbortController();
+  let turn;
+  const canonicalMessage = { seq: 63, op: "msg.send", sender: "instinct", caseId: "case_replay", to: "codex" };
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(`id: 63\nevent: council\ndata: ${JSON.stringify(canonicalMessage)}\n\n`),
+    turnRunner: async (input) => { turn = input; controller.abort(); },
+    sleep: async () => {},
+    errorLogger: () => {},
+  });
+  assert.equal(result.cursor, 63);
+  assert.equal(turn.requestId, "council-event:event:default:63");
+  assert.match(turn.prompt, /kind msg\.send/);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 63);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("relay preserves exponential backoff until an event is processed and logs bounded metadata", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-backoff-"));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 61, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  const sleeps = [];
+  const logs = [];
+  let opened = 0;
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => {
+      opened += 1;
+      if (opened < 3) throw new Error("temporary stream failure");
+      return new Response(`id: 63\nevent: council\ndata: ${JSON.stringify({ seq: 63, op: "msg.send", sender: "instinct", caseId: "case_replay", to: "codex" })}\n\n`);
+    },
+    turnRunner: async () => { controller.abort(); },
+    sleep: async (ms) => { sleeps.push(ms); },
+    errorLogger: (line) => { logs.push(JSON.parse(line)); },
+  });
+  assert.deepEqual(sleeps, [1000, 2000]);
+  assert.deepEqual(logs.map((item) => ({ component: item.component, cursor: item.cursor, retryMs: item.retryMs })), [
+    { component: "council-event-relay", cursor: 61, retryMs: 1000 },
+    { component: "council-event-relay", cursor: 61, retryMs: 2000 },
+  ]);
+  assert.equal(JSON.stringify(logs).includes("codex-token"), false);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test("relay wakes one configured task, writes a private cursor only after completion, and uses stable event request id", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-relay-"));
   const credentialFile = path.join(directory, "codex-token");
