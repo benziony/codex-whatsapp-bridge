@@ -97,6 +97,25 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             plugin._broker = original_broker
         self.assertIn("could not be identified", result)
 
+    async def test_uncertain_council_poll_outcome_is_not_reported_as_unrecorded(self):
+        original_config = plugin._read_config
+        original_broker = plugin._broker
+        try:
+            plugin._read_config = council_config
+
+            async def broker(*_args):
+                raise RuntimeError("Council poll decision outcome is uncertain")
+
+            plugin._broker = broker
+            poll = event(chat="789-012@g.us", metadata={"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.poll-1", "selectedOptions": ["Approve"]}}})
+            result = await plugin._admit(poll)
+        finally:
+            plugin._read_config = original_config
+            plugin._broker = original_broker
+        self.assertIn("could not be verified", result)
+        self.assertIn("Check Council status", result)
+        self.assertNotIn("No decision was recorded", result)
+
     async def test_council_timeout_uses_exact_readback_not_admission_status(self):
         calls = []
         original_spawn = plugin.asyncio.create_subprocess_exec
