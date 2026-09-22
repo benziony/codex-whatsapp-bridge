@@ -51,11 +51,40 @@ export function codexBinaryPath(config = readConfig({ required: false })) {
   return "/opt/homebrew/bin/codex";
 }
 
-export function bridgePaths(config = readConfig()) {
+function canonicalDirectory(target) {
+  const resolved = path.resolve(target);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+export function codexHomePath(
+  config = readConfig({ required: false }),
+  { env = process.env, home = os.homedir() } = {},
+) {
+  const configured = config?.codex?.home;
+  const selected = configured ?? env.CODEX_HOME ?? path.join(home, ".codex");
+  if (typeof selected !== "string" || !path.isAbsolute(selected)) {
+    throw new Error("Codex home must be an absolute path");
+  }
+  return canonicalDirectory(selected);
+}
+
+export function bridgePaths(
+  config = readConfig(),
+  { env = process.env, home = os.homedir() } = {},
+) {
   const root = path.dirname(config._path ?? configPath());
   const gatewayRepo = config.gateway?.repositoryPath;
+  const codexHome = codexHomePath(config, { env, home });
   return {
     root,
+    codexHome,
+    codexHooks: path.join(codexHome, "hooks.json"),
+    codexSessions: path.join(codexHome, "sessions"),
+    codexDatabase: path.join(codexHome, "state_5.sqlite"),
     clientState: config.codex?.statePath ?? path.join(root, "client", "state.json"),
     clientAttachments:
       config.codex?.attachmentPath ?? path.join(root, "client", "attachments"),
@@ -69,4 +98,3 @@ export function bridgePaths(config = readConfig()) {
         : null),
   };
 }
-

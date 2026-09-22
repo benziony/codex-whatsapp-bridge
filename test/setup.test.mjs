@@ -15,10 +15,61 @@ test("launch agents expose the configured Node directory to env-based tools", ()
     stderr: "/tmp/error.log",
     workingDirectory: "/tmp/bridge",
     home: "/Users/test",
+    codexHome: "/Users/test/Codex & State",
     configPath: "/Users/test/.config/bridge.json",
     nodeBinary: "/opt/node/bin/node",
   });
   assert.match(content, /<key>PATH<\/key><string>\/opt\/node\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin<\/string>/);
+  assert.match(content, /<key>CODEX_HOME<\/key><string>\/Users\/test\/Codex &amp; State<\/string>/);
+});
+
+test("split setup canonicalizes Codex home and rolls the broker with the repository", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-rollover-plan-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "home");
+  const activeCodexHome = path.join(root, "active-codex-home");
+  const linkedCodexHome = path.join(home, ".codex");
+  const configPath = path.join(root, "config.json");
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(activeCodexHome);
+  fs.symlinkSync(activeCodexHome, linkedCodexHome);
+  fs.writeFileSync(configPath, `${JSON.stringify({
+    schemaVersion: 1,
+    role: "codex",
+    hostId: "regular-mac",
+    gateway: {
+      sshHost: "server-mac",
+      repositoryPath: "/srv/releases/old",
+      brokerPath: "/srv/releases/stale/scripts/codex-whatsapp-broker.mjs",
+      node: "/opt/node/bin/node",
+      attachmentPath: "/srv/attachments",
+    },
+    whatsapp: {},
+    codex: { home: linkedCodexHome, defaultCwd: root, mirrorProgress: false },
+  })}\n`);
+  const baseArgs = [
+    path.resolve("scripts/setup.mjs"),
+    "--non-interactive",
+    "--role=codex",
+    "--gateway-repository=/srv/releases/new",
+  ];
+  const options = {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    env: { ...process.env, HOME: home, CODEX_WHATSAPP_CONFIG: configPath },
+  };
+
+  const rolled = spawnSync(process.execPath, baseArgs, options);
+  assert.equal(rolled.status, 0, rolled.stderr);
+  const rolledPlan = JSON.parse(rolled.stdout);
+  const canonicalCodexHome = fs.realpathSync(activeCodexHome);
+  assert.equal(rolledPlan.codexHome, canonicalCodexHome);
+  assert.equal(rolledPlan.codexHooks, path.join(canonicalCodexHome, "hooks.json"));
+  assert.equal(rolledPlan.gateway.brokerPath, "/srv/releases/new/scripts/codex-whatsapp-broker.mjs");
+
+  const pinned = spawnSync(process.execPath, [...baseArgs, "--gateway-broker=/srv/releases/pinned/broker.mjs"], options);
+  assert.equal(pinned.status, 0, pinned.stderr);
+  assert.equal(JSON.parse(pinned.stdout).gateway.brokerPath, "/srv/releases/pinned/broker.mjs");
 });
 
 test("failed setup restores the prior runtime configuration", (t) => {

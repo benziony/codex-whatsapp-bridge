@@ -6,8 +6,9 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { configPath, readConfig } from "./lib/runtime-config.mjs";
+import { codexHomePath, configPath, readConfig } from "./lib/runtime-config.mjs";
 import { launchAgentPlist } from "./lib/launch-agent.mjs";
+import { isBridgeHookCommand, makeTreeOwnerWritable, removeBridgeHooks } from "./lib/setup-files.mjs";
 
 const apply = process.argv.includes("--apply");
 const nonInteractive = process.argv.includes("--non-interactive");
@@ -118,7 +119,7 @@ function mergeHooks(current, hookCommand) {
     result.hooks[event] ??= [];
     for (const group of result.hooks[event]) {
       group.hooks = (group.hooks ?? []).filter(
-        (hook) => !String(hook.command ?? "").includes("codex-whatsapp-client.mjs"),
+        (hook) => !isBridgeHookCommand(hook.command),
       );
     }
     result.hooks[event] = result.hooks[event].filter((group) => group.hooks.length);
@@ -129,8 +130,8 @@ function mergeHooks(current, hookCommand) {
   return result;
 }
 
-function plist(options) {
-  return launchAgentPlist({ ...options, workingDirectory: root, home, configPath: targetConfig, nodeBinary: process.execPath });
+function plist(options, codexHome = "") {
+  return launchAgentPlist({ ...options, workingDirectory: root, home, codexHome, configPath: targetConfig, nodeBinary: process.execPath });
 }
 
 function installPlist(label, content, snapshot) {
@@ -203,6 +204,12 @@ async function main() {
     const defaultCwd = isCodex
       ? path.resolve(await answer(rl, "default-cwd", "Working directory for new Codex tasks", existing?.codex?.defaultCwd ?? process.cwd()))
       : existing?.codex?.defaultCwd ?? "";
+    const codexHomeInput = isCodex
+      ? await answer(rl, "codex-home", "Active Codex home", existing?.codex?.home ?? process.env.CODEX_HOME ?? path.join(home, ".codex"))
+      : existing?.codex?.home ?? "";
+    const codexHome = isCodex
+      ? codexHomePath({ codex: { home: codexHomeInput } }, { env: process.env, home })
+      : "";
     const councilPushUrl = isCodex
       ? await answer(rl, "council-push-url", "Optional Council event stream HTTPS URL", existing?.councilPush?.councilUrl ?? "")
       : existing?.councilPush?.councilUrl ?? "";
@@ -256,6 +263,11 @@ async function main() {
       ? await answer(rl, "gateway-repository", "Bridge repository path on gateway", existing?.gateway?.repositoryPath ?? root)
       : root;
     shellTransportSafePath(gatewayRepo, "gateway-repository");
+    const gatewayBrokerOverride = valueFor("gateway-broker");
+    const gatewayBroker = shellTransportSafePath(
+      gatewayBrokerOverride ?? path.join(gatewayRepo, "scripts", "codex-whatsapp-broker.mjs"),
+      "gateway-broker",
+    );
     const gatewayNode = role === "codex"
       ? await answer(rl, "gateway-node", "Node binary path on gateway", existing?.gateway?.node ?? "/opt/homebrew/bin/node")
       : process.execPath;
@@ -287,7 +299,7 @@ async function main() {
         ...(hermesPython ? { hermesPython } : {}),
         node: gatewayNode,
         ...(existing?.gateway?.statePath ? { statePath: existing.gateway.statePath } : {}),
-        ...(existing?.gateway?.brokerPath ? { brokerPath: existing.gateway.brokerPath } : {}),
+        brokerPath: gatewayBroker,
         ...(gatewaySsh ? { sshHost: gatewaySsh } : {}),
         ...(existing?.gateway?.lanHost ? { lanHost: existing.gateway.lanHost } : {}),
         ...(existing?.gateway?.hostKeyAlias ? { hostKeyAlias: existing.gateway.hostKeyAlias } : {}),
@@ -325,6 +337,7 @@ async function main() {
       } : {}),
       codex: {
         binary: existing?.codex?.binary ?? "/opt/homebrew/bin/codex",
+        ...(codexHome ? { home: codexHome } : {}),
         defaultCwd,
         mirrorProgress: /^y(es)?$/i.test(progressAnswer),
         ...(existing?.codex?.statePath ? { statePath: existing.codex.statePath } : {}),
@@ -346,6 +359,7 @@ async function main() {
       mirrorProgress: config.codex.mirrorProgress,
       gateway: {
         repositoryPath: gatewayRepo,
+        brokerPath: gatewayBroker,
         node: gatewayNode,
         ...(hermesPython ? { hermesPython } : {}),
         ...(gatewaySsh ? { sshHost: gatewaySsh } : {}),
@@ -356,7 +370,8 @@ async function main() {
       hermesCompatibility: isGateway
         ? (hermesCompatibilityReady(hermesCheckout) ? "native" : `patch for ${supportedHermesCommit}`)
         : null,
-      codexHooks: isCodex ? path.join(home, ".codex", "hooks.json") : null,
+      codexHome: codexHome || null,
+      codexHooks: isCodex ? path.join(codexHome, "hooks.json") : null,
       launchAgents: [isCodex ? "com.codex-whatsapp-bridge.client" : null, isCodex && councilPushEnabled ? "com.codex-whatsapp-bridge.council-events" : null, isGateway ? "com.codex-whatsapp-bridge.updates" : null].filter(Boolean),
     };
     console.log(JSON.stringify(plan, null, 2));
@@ -378,6 +393,7 @@ async function main() {
       const domain = `gui/${process.getuid()}`;
       for (const label of touchedServices) command("/bin/launchctl", ["bootout", `${domain}/${label}`]);
       for (const entry of [...snapshots].reverse()) {
+        makeTreeOwnerWritable(entry.target);
         fs.rmSync(entry.target, { recursive: true, force: true });
         if (entry.existed) {
           fs.mkdirSync(path.dirname(entry.target), { recursive: true });
@@ -410,6 +426,7 @@ async function main() {
         const pluginTarget = path.join(home, ".hermes", "plugins", "codex-whatsapp-bridge");
         snapshot(hermesConfig);
         snapshot(pluginTarget);
+        makeTreeOwnerWritable(pluginTarget);
         fs.rmSync(pluginTarget, { recursive: true, force: true });
         fs.cpSync(path.join(root, "hermes-plugin"), pluginTarget, { recursive: true });
         const configured = command(hermesPython, [
@@ -422,10 +439,17 @@ async function main() {
         if (configured.status !== 0) throw new Error(configured.stderr || "Could not configure Hermes");
       }
       if (isCodex) {
-        const hooks = path.join(home, ".codex", "hooks.json");
+        const hooks = path.join(codexHome, "hooks.json");
         snapshot(hooks);
         const current = fs.existsSync(hooks) ? JSON.parse(fs.readFileSync(hooks, "utf8")) : {};
         secureJson(hooks, mergeHooks(current, `${process.execPath} ${path.join(root, "scripts", "codex-whatsapp-client.mjs")} hook`));
+        const legacyCodexHome = codexHomePath({}, { env: {}, home });
+        const legacyHooks = path.join(legacyCodexHome, "hooks.json");
+        if (legacyCodexHome !== codexHome && fs.existsSync(legacyHooks)) {
+          snapshot(legacyHooks);
+          const legacyCurrent = JSON.parse(fs.readFileSync(legacyHooks, "utf8"));
+          secureJson(legacyHooks, removeBridgeHooks(legacyCurrent));
+        }
         touchedServices.push("com.codex-whatsapp-bridge.client");
         installPlist("com.codex-whatsapp-bridge.client", plist({
           label: "com.codex-whatsapp-bridge.client",
@@ -433,7 +457,7 @@ async function main() {
           interval: 5,
           stdout: path.join(logs, "client.log"),
           stderr: path.join(logs, "client.error.log"),
-        }), snapshot);
+        }, codexHome), snapshot);
         if (councilPushEnabled) {
           touchedServices.push("com.codex-whatsapp-bridge.council-events");
           installPlist("com.codex-whatsapp-bridge.council-events", plist({
@@ -442,7 +466,7 @@ async function main() {
             keepAlive: true,
             stdout: path.join(logs, "council-events.log"),
             stderr: path.join(logs, "council-events.error.log"),
-          }), snapshot);
+          }, codexHome), snapshot);
         }
       }
       if (isGateway) {
@@ -453,7 +477,7 @@ async function main() {
           interval: 7 * 24 * 60 * 60,
           stdout: path.join(logs, "updates.log"),
           stderr: path.join(logs, "updates.error.log"),
-        }), snapshot);
+        }, codexHome), snapshot);
       }
     } catch (error) {
       rollback();
