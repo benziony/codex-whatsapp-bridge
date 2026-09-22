@@ -11,6 +11,7 @@ Runtime configuration is stored at
   "hostId": "my-mac",
   "gateway": {
     "repositoryPath": "/absolute/path/to/codex-whatsapp-bridge",
+    "brokerPath": "/absolute/path/to/codex-whatsapp-bridge/scripts/codex-whatsapp-broker.mjs",
     "hermesCheckout": "/absolute/path/to/hermes-agent",
     "hermesPython": "/absolute/path/to/hermes-venv/bin/python",
     "node": "/opt/homebrew/opt/node@24/bin/node"
@@ -39,6 +40,7 @@ Runtime configuration is stored at
   },
   "codex": {
     "binary": "/opt/homebrew/bin/codex",
+    "home": "/absolute/path/to/active/codex/home",
     "defaultCwd": "/absolute/project/or/inbox/directory",
     "mirrorProgress": false
   },
@@ -48,6 +50,14 @@ Runtime configuration is stored at
   }
 }
 ```
+
+`codex.home` is the canonical active Codex state directory. Setup resolves it
+from `--codex-home`, an existing `codex.home`, `CODEX_HOME`, or finally
+`~/.codex`, in that order, and resolves an existing symlink before saving it.
+Hooks, sessions, and `state_5.sqlite` are always read from this directory, and
+Codex-side LaunchAgents receive the same `CODEX_HOME`. When the legacy
+`~/.codex` is a different directory, setup removes only this bridge's stale
+hook commands there and preserves unrelated hooks.
 
 `councilApprovals` is optional and is deliberately a separate exact-chat
 claim. It uses the Codex principal credential reference (`codexCredentialFile`
@@ -100,7 +110,9 @@ resets or discards a cursor.
 For split topology the gateway configures `codexInbox.originHost` and the
 absolute new-task directory on the Codex Mac. The Codex host configures
 `gateway.sshHost`, the gateway's `repositoryPath`, gateway-side Node binary,
-`brokerPath`, and exact `attachmentPath`. Optional
+and exact `attachmentPath`. `gateway.brokerPath` defaults to the broker inside
+that repository, so selecting a new release rolls both paths together. Use the
+explicit `--gateway-broker` setup option only for a reviewed pin. Optional
 `lanHost` plus `hostKeyAlias` provides a pinned LAN fallback. SSH must already
 work non-interactively; setup does not install keys or weaken host checking.
 Bridge repository, Node, and split-host attachment paths must be absolute and

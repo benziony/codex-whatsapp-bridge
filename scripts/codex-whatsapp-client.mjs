@@ -2,7 +2,6 @@
 
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -52,9 +51,9 @@ const remoteHostKeyAlias = process.env.CODEX_WHATSAPP_GATEWAY_HOST_KEY_ALIAS ?? 
 const remoteNode = process.env.CODEX_WHATSAPP_GATEWAY_NODE ?? runtimeConfig.gateway?.node ?? "/opt/homebrew/opt/node@24/bin/node";
 const remoteBroker = process.env.CODEX_WHATSAPP_GATEWAY_BROKER ?? configuredPaths.brokerScript;
 const localBroker = path.join(repositoryRoot, "scripts", "codex-whatsapp-broker.mjs");
-const hooksPath = path.join(os.homedir(), ".codex", "hooks.json");
-const sessionsRoot = path.join(path.dirname(hooksPath), "sessions");
-const codexDatabase = process.env.CODEX_WHATSAPP_CODEX_DB ?? path.join(path.dirname(hooksPath), "state_5.sqlite");
+const hooksPath = configuredPaths.codexHooks;
+const sessionsRoot = configuredPaths.codexSessions;
+const codexDatabase = process.env.CODEX_WHATSAPP_CODEX_DB ?? configuredPaths.codexDatabase;
 const hookCommand = `${process.execPath} ${path.join(repositoryRoot, "scripts", "codex-whatsapp-client.mjs")} hook`;
 const maximumTranscriptTail = 2 * 1024 * 1024;
 const maximumActivityMessageLength = 3_900;
