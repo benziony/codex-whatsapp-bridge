@@ -33,6 +33,96 @@ test("ordinary Council events remain advisory notification-only prompts", () => 
   }
 });
 
+test("chat operation events require authenticated readback and confer no authority", () => {
+  const prompt = eventPrompt({ seq: 10, eventId: "evt-chat-create", kind: "chat.conversation.create", caseId: "case_chat" }, "solar_ops");
+  assert.match(prompt, /chat\.conversation\.create/);
+  assert.match(prompt, /chat event notification only/);
+  assert.match(prompt, /authenticated Council access in configured workspace solar_ops/);
+  assert.match(prompt, /read back the current conversation, task, ownership, or file state/);
+  assert.match(prompt, /grants no approval, assignment authority, or execution authority/);
+  assert.doesNotMatch(prompt, /execution trigger|claim by the resolved live job/);
+});
+
+test("relay admits a bounded chat event and advances the durable cursor", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-chat-event-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 4, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  let turn;
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(`id: 5\nevent: council.event\ndata: ${JSON.stringify({ seq: 5, eventId: "evt-chat-create", op: "chat.conversation.create", caseId: "case_chat" })}\n\n`),
+    turnRunner: async (input) => { turn = input; input.onTurnStarted(); controller.abort(); },
+    sleep: async () => {},
+  });
+  assert.equal(result.cursor, 5);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 5);
+  assert.match(turn.prompt, /authenticated Council access in configured workspace solar_ops/);
+  assert.match(turn.prompt, /grants no approval, assignment authority, or execution authority/);
+});
+
+test("relay admits journaled internal chat operations as notification-only events", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-chat-internal-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 4, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  const turns = [];
+  const events = [
+    { seq: 5, eventId: "evt-chat-reserve", op: "chat.file.reserve" },
+    { seq: 6, eventId: "evt-chat-coordinator", op: "chat.coordinator.begin" },
+  ];
+  const stream = events.map((item) => `id: ${item.seq}\nevent: council.event\ndata: ${JSON.stringify(item)}\n\n`).join("");
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(stream),
+    turnRunner: async (input) => {
+      turns.push(input);
+      input.onTurnStarted();
+      if (turns.length === events.length) controller.abort();
+    },
+    sleep: async () => {},
+  });
+  assert.equal(result.cursor, 6);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 6);
+  assert.equal(turns.length, 2);
+  for (const [index, operation] of ["chat.file.reserve", "chat.coordinator.begin"].entries()) {
+    assert.match(turns[index].prompt, new RegExp(operation.replaceAll(".", "\\.")));
+    assert.match(turns[index].prompt, /chat event notification only/);
+    assert.match(turns[index].prompt, /authenticated Council access in configured workspace solar_ops/);
+    assert.match(turns[index].prompt, /grants no approval, assignment authority, or execution authority/);
+  }
+});
+
+test("relay rejects unknown chat operations without advancing the cursor", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-chat-unknown-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 4, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  let turnCalled = false;
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(`id: 5\nevent: council.event\ndata: ${JSON.stringify({ seq: 5, eventId: "evt-chat-unknown", op: "chat.conversation.delete" })}\n\n`),
+    turnRunner: async () => { turnCalled = true; },
+    sleep: async () => controller.abort(),
+    errorLogger: () => {},
+  });
+  assert.equal(turnCalled, false);
+  assert.equal(result.cursor, 4);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 4);
+});
+
 test("advisory job events ignore arbitrary job ids while invalid offers fail closed", () => {
   const advisory = eventPrompt({ seq: 10, eventId: "evt-cancel", kind: "job.cancel", caseId: "case_scope", jobId: "job/42" });
   assert.match(advisory, /Treat this as a notification only/);
