@@ -176,6 +176,30 @@ test("consumed Council poll votes read back once and cannot reverse the recorded
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
+test("portal-first decisions close a registered poll without writing a second vote", async () => {
+  const { config, directory } = fixture();
+  config.councilApprovals.nativePolls = true;
+  let posts = 0;
+  for (const winningVerdict of ["approved", "rejected"]) {
+    const fetcher = async (url, _token, init = {}) => {
+      if (String(url).includes("/status?")) return { ...pollStatus("WA.poll-1", "consumed"), decisionChannel: "portal" };
+      if (String(url).includes("/api/whatsapp/poll/decision?")) return { ...pollStatus("WA.poll-1", "consumed"), verdict: winningVerdict, decisionChannel: "portal" };
+      if (init.method === "POST") posts += 1;
+      throw new Error("unexpected Council route");
+    };
+    const base = { pollMessageId: "WA.poll-1", chatId: "120@g.us", senderId: "15551234567@s.whatsapp.net", messageId: "portal-first" };
+    const same = await processCouncilPollVote({ ...base, selectedOptions: [winningVerdict === "approved" ? "Approve" : "Reject"] }, config, { fetcher });
+    assert.equal(same.ok, true);
+    assert.equal(same.duplicate, true);
+    assert.match(same.message, /already recorded in the portal/);
+    const opposite = await processCouncilPollVote({ ...base, selectedOptions: [winningVerdict === "approved" ? "Reject" : "Approve"] }, config, { fetcher });
+    assert.equal(opposite.ok, false);
+    assert.match(opposite.message, /already recorded/);
+  }
+  assert.equal(posts, 0);
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test("malformed consumed Council poll registrations fail closed", async () => {
   const { config, directory } = fixture();
   config.councilApprovals.nativePolls = true;

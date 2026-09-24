@@ -119,7 +119,8 @@ function exactPollStatus(status, { pollId, scope }) {
     && status.scope === scope
     && /^[A-Za-z0-9._*:/-]{1,128}$/.test(status.scope)
     && new Set(["active", "consumed", "expired", "stale"]).has(status.status)
-    && (status.status !== "consumed" || Number.isFinite(Date.parse(String(status.consumedAt))));
+    && (status.status !== "consumed" || Number.isFinite(Date.parse(String(status.consumedAt))))
+    && (status.decisionChannel === undefined || new Set(["portal", "whatsapp"]).has(status.decisionChannel));
 }
 
 function samePollBinding(left, right) {
@@ -291,7 +292,7 @@ export async function processCouncilPollVote(payload, config, { fetcher = counci
   if (pollStatus.status === "consumed") {
     try {
       const decision = await readExactPollDecision(pollMessageId, pollStatus, configured, token, fetcher);
-      if (decision.verdict === verdict) return { ok: true, status: "accepted", duplicate: true, message: "Council poll decision was already recorded." };
+      if (decision.verdict === verdict) return { ok: true, status: "accepted", duplicate: true, message: pollStatus.decisionChannel === "portal" ? `Council ${decision.verdict} was already recorded in the portal; this poll vote made no change.` : "Council poll decision was already recorded." };
       return { ok: false, status: "bound-failed", message: `This Council poll already recorded ${decision.verdict}; no change was made.` };
     } catch (error) {
       throw new Error(`Council poll decision status is uncertain; exact readback failed (${error?.message ?? "request failure"})`);
