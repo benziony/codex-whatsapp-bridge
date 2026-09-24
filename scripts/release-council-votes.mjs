@@ -120,6 +120,7 @@ export function prepareImmutableRelease({ source, commit, releaseRoot, fileSyste
   }
   fileSystem.mkdirSync(releaseRoot, { recursive: true, mode: 0o700 });
   const temporary = fileSystem.mkdtempSync(path.join(releaseRoot, `.staging-${commit.slice(0, 12)}-`));
+  let published = false;
   try {
     const archive = checked("git", ["archive", "--format=tar", commit], { cwd: source, encoding: "buffer" }).stdout;
     checked("/usr/bin/tar", ["-xf", "-", "-C", temporary], { input: archive, encoding: "utf8" });
@@ -144,11 +145,16 @@ export function prepareImmutableRelease({ source, commit, releaseRoot, fileSyste
         parent = path.dirname(parent);
       }
     }
-    for (const directory of [...directories].sort((a, b) => b.length - a.length)) fileSystem.chmodSync(directory, 0o555);
-    fileSystem.chmodSync(temporary, 0o555);
+    for (const directory of [...directories].sort((a, b) => b.length - a.length)) {
+      if (directory !== temporary) fileSystem.chmodSync(directory, 0o555);
+    }
+    // macOS requires the staging directory to remain writable for rename.
     fileSystem.renameSync(temporary, release);
+    published = true;
+    fileSystem.chmodSync(release, 0o555);
     return { release, manifest, created: true };
   } catch (error) {
+    const cleanup = published ? release : temporary;
     try {
       const restoreWritable = (directory) => {
         for (const entry of fileSystem.readdirSync(directory, { withFileTypes: true })) {
@@ -157,9 +163,9 @@ export function prepareImmutableRelease({ source, commit, releaseRoot, fileSyste
         }
         fileSystem.chmodSync(directory, 0o700);
       };
-      restoreWritable(temporary);
-    } catch { /* staging may already be moved */ }
-    try { fileSystem.rmSync(temporary, { recursive: true, force: true }); } catch { /* preserve original failure */ }
+      restoreWritable(cleanup);
+    } catch { /* preserve original failure */ }
+    try { fileSystem.rmSync(cleanup, { recursive: true, force: true }); } catch { /* preserve original failure */ }
     throw error;
   }
 }
