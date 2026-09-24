@@ -84,6 +84,7 @@ test("relay advances passive chat events without waking Codex", async (t) => {
     { seq: 7, eventId: "evt-chat-coordinator", op: "chat.coordinator.begin" },
     { seq: 8, eventId: "evt-chat-read", op: "chat.conversation.read" },
     { seq: 9, eventId: "evt-self-send", op: "chat.conversation.send", sender: "codex" },
+    { seq: 10, eventId: "evt-chat-address", op: "chat.conversation.address", sender: "owner" },
   ];
   const stream = events.map((item) => `id: ${item.seq}\nevent: council.event\ndata: ${JSON.stringify(item)}\n\n`).join("");
   const result = await runRelay(config, {
@@ -92,8 +93,8 @@ test("relay advances passive chat events without waking Codex", async (t) => {
     turnRunner: async (input) => { turns.push(input); },
     sleep: async () => controller.abort(),
   });
-  assert.equal(result.cursor, 9);
-  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 9);
+  assert.equal(result.cursor, 10);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 10);
   assert.equal(turns.length, 0);
 });
 

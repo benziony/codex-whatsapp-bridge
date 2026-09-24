@@ -24,14 +24,14 @@ const SAFE_EVENT_KINDS = new Set([
 ]);
 const SAFE_CHAT_EVENT_KINDS = new Set([
   "chat.conversation.create", "chat.conversation.get", "chat.conversation.send", "chat.conversation.read",
-  "chat.conversation.invite", "chat.conversation.archive",
+  "chat.conversation.invite", "chat.conversation.address", "chat.conversation.archive",
   "chat.ownership.offer", "chat.ownership.accept", "chat.ownership.decline",
   "chat.task.create", "chat.task.update", "chat.task.report", "chat.task.contribute", "chat.task.dispatch",
   "chat.file.get", "chat.file.list", "chat.file.reserve", "chat.file.finalize",
   "chat.coordinator.begin", "chat.coordinator.finish", "chat.coordinator.fail",
 ]);
 const PASSIVE_CHAT_EVENT_KINDS = new Set([
-  "chat.conversation.create", "chat.conversation.get", "chat.conversation.read",
+  "chat.conversation.create", "chat.conversation.get", "chat.conversation.read", "chat.conversation.address",
   "chat.file.get", "chat.file.list", "chat.file.reserve", "chat.coordinator.begin",
 ]);
 
