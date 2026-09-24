@@ -45,6 +45,24 @@ test("chat operation events require authenticated readback and confer no authori
   assert.doesNotMatch(prompt, /execution trigger|claim by the resolved live job/);
 });
 
+test("task notifications instruct Codex to accept only a current offered assignment", () => {
+  for (const kind of ["chat.task.create", "chat.task.update"]) {
+    const prompt = eventPrompt({ seq: 11, eventId: `evt-${kind.replaceAll(".", "-")}`, kind, conversationId: "conv_task", taskId: "task_exact" }, "default", "/opt/council/runtime.mjs");
+    assert.match(prompt, /read back the current task and its originating conversation/);
+    assert.match(prompt, /currently offered, its executor is exactly codex/);
+    assert.match(prompt, /typed task-update operation/);
+    assert.match(prompt, /\/opt\/council\/runtime\.mjs/);
+    assert.match(prompt, /Use only task task_exact/);
+    assert.match(prompt, /transition accepted to working/);
+    assert.match(prompt, /task-report/);
+    assert.match(prompt, /stable x-request-id/);
+    assert.match(prompt, /Acceptance is not a job claim or permission to execute/);
+    assert.match(prompt, /Do not claim or execute a job during this task-notification turn/);
+  }
+  const legacy = eventPrompt({ seq: 12, eventId: "evt-old-task", kind: "chat.task.update", conversationId: "conv_task" });
+  assert.match(legacy, /no bound taskId; do not accept a task/);
+});
+
 test("relay admits a bounded chat event and advances the durable cursor", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-chat-event-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -589,6 +607,8 @@ test("native poll registration failure leaves notification and cursor uncommitte
 
 test("relay config rejects owner credential-shaped or incomplete push settings", () => {
   assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: "/tmp/a", sessionId: "t", cwd: "/tmp" } }).sessionId, "t");
+  assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: "/tmp/a", cwd: "/tmp", runtimePath: "/opt/council/runtime.mjs" } }).runtimePath, "/opt/council/runtime.mjs");
+  assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: "/tmp/a", cwd: "/tmp", runtimePath: "relative/runtime.mjs" } }), null);
   assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: "/tmp/a", codexTokenEnv: "OWNER", sessionId: "t", cwd: "/tmp" } }), null);
   assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "http://council.example", codexCredentialFile: "/tmp/a", sessionId: "t", cwd: "/tmp" } }), null);
 });
