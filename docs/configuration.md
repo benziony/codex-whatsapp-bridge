@@ -92,12 +92,16 @@ replay state. Set it to `false` to retain the bounded text-command fallback.
 
 `councilPush` is an optional outbound-only Council event consumer for the
 Codex-role Mac. It uses a separate Codex-principal credential reference (never
-the owner credential), keeps a `0600` replay cursor, reconnects with bounded
-backoff, and wakes a fresh Codex task per event by default. An explicit
-`sessionId` is supported only for a reviewed task-owned setup. It opens no
-inbound Mac port. If an event is explicitly WhatsApp-eligible, the consumer
-also sends the bounded native poll or text fallback described above to the
-configured Council Approvals chat using a stable delivery key.
+the owner credential), keeps a private `0600` replay and dispatch state,
+and reconnects with bounded backoff. Routine addressed events share one
+Codex inbox task; an exact Codex-assigned job or conversation task gets its
+own owner-visible work task. The relay persists the binding and retry state
+so replay does not create another task for the same assignment. An explicit
+`sessionId` can bind the shared inbox to a reviewed existing task. The relay
+opens no inbound Mac port. If an event is explicitly WhatsApp-eligible, it
+sends the bounded native poll or text fallback described above to the
+configured Council Approvals chat using a stable delivery key before advancing
+past that event.
 
 If the Council stream returns `410 Gone` because the cursor is older than the
 replay floor, the relay calls the authenticated
