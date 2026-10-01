@@ -274,6 +274,11 @@ export function createNativeObserver(config, options = {}, deps = {}) {
         await saveObserverState(config.statePath, state);
         return { stale: true };
       }
+      const existing = state.control[event.challengeId];
+      if (existing) {
+        if (existing.nonce !== event.nonce || existing.eventId !== event.eventId || existing.seq !== event.seq || existing.expiresAt !== event.expiresAt) fail("Native control event replay changed its binding");
+        return existing;
+      }
       if (state.challenge?.id === event.challengeId) {
         if (Date.parse(event.expiresAt) > Date.parse(state.challenge.expiresAt)) fail("Native control event expiry exceeds issued challenge");
       } else if (state.pendingIssue) {
@@ -289,11 +294,6 @@ export function createNativeObserver(config, options = {}, deps = {}) {
         return { buffered: true };
       } else {
         fail("Native control event has no matching issued challenge");
-      }
-      const existing = state.control[event.challengeId];
-      if (existing) {
-        if (existing.nonce !== event.nonce || existing.eventId !== event.eventId || existing.seq !== event.seq || existing.expiresAt !== event.expiresAt) fail("Native control event replay changed its binding");
-        return existing;
       }
       const control = { challengeId: event.challengeId, nonce: event.nonce, eventId: event.eventId, seq: event.seq, expiresAt: event.expiresAt,
         requestId: controlRequestId(event.challengeId), delivered: true, uncertain: false };

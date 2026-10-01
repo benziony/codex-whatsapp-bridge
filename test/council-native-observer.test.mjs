@@ -106,6 +106,41 @@ test("authentic expired and superseded native controls are durably skipped while
   assert.equal(JSON.parse(fs.readFileSync(haltedFixture.statePath, "utf8")).skippedEvents[0].reason, "observer-halted");
 });
 
+test("a verified native control replay returns its stored admission after the challenge is cleared", async (t) => {
+  const f = fixture();
+  t.after(f.cleanup);
+  let now = Date.parse("2026-10-01T12:00:00Z");
+  const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
+    request: async (operation) => operation === "challenge"
+      ? { id: "replay-challenge", expiresAt: new Date(now + 90_000).toISOString(), runtimeId: "runtime-a", profileRevision: 4, generation: 3, grantRevision: 2 }
+      : { mode: "native-wake", kind: "native-admission", expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(), generation: 3, profileRevision: 4, grantRevision: 2 },
+    observerReader: async ({ expectedText }) => {
+      const challenge = JSON.parse(expectedText.split("\n")[1].slice("Challenge: ".length));
+      return { turnId: "turn-replay", status: "completed", nonce: challenge.nonce, observedAt: new Date(now).toISOString() };
+    },
+    turnRunner: async (args) => {
+      await args.onTurnStarting({ sessionId: args.sessionId });
+      await args.onTurnStarted({ sessionId: args.sessionId, turnId: "turn-replay" });
+    },
+    clock: () => now, random: () => 0, randomId: () => "replay-cycle", canRunControl: () => true,
+  });
+  await observer.tick({ force: true });
+  const event = { op: "connect.native.challenge", kind: "native-admission-control", seq: 1, eventId: "replay-event", challengeId: "replay-challenge",
+    nonce: "9".repeat(64), workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a", profileRevision: 4,
+    generation: 3, grantRevision: 2, expiresAt: new Date(now + 90_000).toISOString(), recipients: ["codex"] };
+  await observer.acceptEvent(event);
+  await observer.tick();
+  const state = JSON.parse(fs.readFileSync(f.statePath, "utf8"));
+  assert.equal(state.challenge, null);
+  assert.equal(state.control["replay-challenge"].admission.status, "verified");
+
+  const replay = await observer.acceptEvent(event);
+  assert.deepEqual(replay, state.control["replay-challenge"]);
+  await assert.rejects(observer.acceptEvent({ ...event, nonce: "8".repeat(64) }), /replay changed its binding/);
+  await assert.rejects(observer.acceptEvent({ ...event, seq: 2 }), /replay changed its binding/);
+  await assert.rejects(observer.acceptEvent({ ...event, challengeId: "unknown-challenge" }), /no matching issued challenge/);
+});
+
 test("SSE arriving before the issue response is durably buffered and promoted without overlapping ticks", async (t) => {
   const f = fixture();
   t.after(f.cleanup);
