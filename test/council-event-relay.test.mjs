@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CouncilCursorTooOldError, approvalNotification, eventPrompt, openStream, readState, reconciliationPrompt, registerCouncilPoll, relayConfig, runRelay, safeReconcileSnapshot, sseEvents } from "../scripts/council-event-relay.mjs";
+import { CouncilCursorTooOldError, approvalNotification, eventPrompt, openStream, readState, reconciliationPrompt, registerCouncilPoll, relayConfig, runRelay, runtimeRenewalCommand, safeReconcileSnapshot, sseEvents } from "../scripts/council-event-relay.mjs";
 import { sendWhatsAppNotification } from "../scripts/lib/bridge-state.mjs";
 import { CodexTaskBusyError, CodexThreadStartUncertainError, CodexTurnStartUncertainError } from "../scripts/lib/codex-app-server.mjs";
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
@@ -122,6 +122,179 @@ test("relay advances passive chat events without waking Codex", async (t) => {
   assert.equal(result.cursor, 10);
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 10);
   assert.equal(turns.length, 0);
+});
+
+test("listener schedules bounded runtime renewal and keeps business dispatch alive after a secret-bearing child failure", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-runtime-renewal-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "push-state.json");
+  const renewalStatePath = path.join(directory, "renewal-state.json");
+  fs.writeFileSync(credentialFile, "private-codex-token", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, renewalEnabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile,
+    cwd: directory, statePath, renewalStatePath, runtimePath: "/opt/council/scripts/council-runtime.mjs", workspace: "solar_ops" } };
+  const parsed = relayConfig(config);
+  const expected = runtimeRenewalCommand(parsed);
+  assert.equal(expected.executable, process.execPath);
+  assert.deepEqual(expected.args, [
+    "/opt/council/scripts/council-runtime.mjs", "renew", "--agent", "codex", "--state", renewalStatePath, "--once",
+    "--council-url", "https://council.example", "--workspace", "solar_ops", "--credential", credentialFile,
+  ]);
+  assert.equal(expected.timeoutMs, 90_000);
+
+  const controller = new AbortController();
+  const renewals = [];
+  const errors = [];
+  const event = { seq: 1, eventId: "evt-renew-business", op: "msg.send", kind: "msg.send", sender: "hermes", target: "codex" };
+  const relay = runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(`id: 1\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`),
+    runtimeRenewalRunner: async (command) => { renewals.push(command); throw new Error("child stderr may contain private-codex-token"); },
+    turnRunner: async (input) => { input.onTurnStarted?.(); controller.abort(); },
+    errorLogger: (line) => errors.push(line),
+    sleep: nextTurn,
+  });
+  const result = await relay;
+  await nextTurn();
+  assert.equal(result.cursor, 1);
+  assert.equal(renewals.length, 1);
+  assert.deepEqual(renewals[0], expected);
+  assert.equal(errors.some((line) => line.includes("private-codex-token")), false);
+  assert.ok(errors.some((line) => line.includes("business queue continue")));
+});
+
+test("relay sends native challenge SSE only to its configured observer and durably advances after acceptance", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-native-relay-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const statePath = path.join(directory, "push-state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: path.join(directory, "codex-token"),
+    cwd: directory, statePath, workspace: "solar_ops", nativeObserver: { credentialFile: path.join(directory, "observer.token"), grantId: "grant-a",
+      grantRevision: 7, agentId: "codex", runtimeId: "runtime-a", nativeThreadId: "thread-a", profileRevision: 4, generation: 3 } } };
+  const controller = new AbortController();
+  const accepted = [];
+  const turns = [];
+  let factoryConfig;
+  const event = { seq: 1, eventId: "native-event-1", op: "connect.native.challenge", kind: "native-admission-control", challengeId: "challenge-1",
+    nonce: "a".repeat(64), workspace: "solar_ops", runtimeId: "runtime-a", nativeThreadId: "thread-a", profileRevision: 4, generation: 3,
+    grantRevision: 7, expiresAt: new Date(Date.now() + 60_000).toISOString(), recipients: ["codex"] };
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(`id: 1\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`),
+    observerCredentialLoader: async () => "observer_" + "b".repeat(64),
+    nativeObserverFactory: (receivedConfig, options, dependencies) => {
+      factoryConfig = { receivedConfig, options, dependencies };
+      return { acceptEvent: async (item) => { accepted.push(item); controller.abort(); return { delivered: true }; }, tick: async () => ({ ok: true }), status: () => ({ busy: false }) };
+    },
+    turnRunner: async (input) => { turns.push(input); },
+    errorLogger: () => {},
+    sleep: nextTurn,
+  });
+  assert.equal(result.cursor, 1);
+  assert.equal(factoryConfig.options.workspace, "solar_ops");
+  assert.equal(typeof factoryConfig.dependencies.spawnImpl, "function", "default native reads receive the real Node child-process spawner");
+  assert.equal(factoryConfig.receivedConfig.statePath, `${statePath}.native-observer.json`);
+  assert.deepEqual(accepted, [{ ...event }]);
+  assert.equal(turns.length, 0, "native control is not dispatched as a business conversation");
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 1);
+});
+
+test("expired recipient response challenges advance as transport controls before later business work", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-response-control-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "push-state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile,
+    cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  const challenge = { seq: 1, eventId: "response-event-1", op: "connect.response.challenge", kind: "response-challenge", mode: "stream",
+    workspace: "solar_ops", recipients: ["codex"], challengeId: "challenge-response-1", nonce: "a".repeat(64), runtimeId: "Runtime identity v1",
+    profileRevision: 4, generation: 3, expiresAt: new Date(Date.now() - 60_000).toISOString() };
+  const business = { seq: 2, eventId: "business-after-response", op: "msg.send", kind: "msg.send", sender: "hermes", target: "codex" };
+  const turns = [];
+  const result = await runRelay(config, { signal: controller.signal,
+    streamOpener: async () => new Response([challenge, business].map((event) => `id: ${event.seq}\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`).join("")),
+    turnRunner: async (input) => { turns.push(input); controller.abort(); }, sleep: nextTurn, errorLogger: () => {} });
+  assert.equal(result.cursor, 2);
+  assert.equal(turns.length, 1, "only the following business event starts a Codex turn");
+  assert.ok(turns[0].prompt.includes("business-after-response"));
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 2);
+});
+
+test("malformed recipient response challenges fail closed without moving the durable cursor", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-response-invalid-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "push-state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  const event = { seq: 1, eventId: "response-event-invalid", op: "connect.response.challenge", kind: "response-challenge", mode: "stream",
+    workspace: "solar_ops", recipients: ["instinct"], challengeId: "challenge-invalid", nonce: "a".repeat(64), runtimeId: "runtime-a",
+    profileRevision: 4, generation: 3, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+  const result = await runRelay(config, { signal: controller.signal,
+    streamOpener: async () => new Response(`id: 1\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`), sleep: async () => controller.abort(), errorLogger: () => {} });
+  assert.equal(result.cursor, 0);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 0);
+});
+
+test("a stale but well-formed native control advances safely so following business work is admitted", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-stale-native-control-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "push-state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile,
+    cwd: directory, statePath, workspace: "solar_ops", nativeObserver: { credentialFile: path.join(directory, "observer.token"), grantId: "grant-new",
+      grantRevision: 8, agentId: "codex", runtimeId: "runtime-new", nativeThreadId: "thread-new", profileRevision: 5, generation: 4 } } };
+  const controller = new AbortController();
+  const stale = { seq: 1, eventId: "stale-old-grant", op: "connect.native.challenge", kind: "native-admission-control", challengeId: "old-control",
+    nonce: "b".repeat(64), workspace: "solar_ops", runtimeId: "runtime-old", nativeThreadId: "thread-old", profileRevision: 4,
+    generation: 3, grantRevision: 7, expiresAt: new Date(Date.now() + 60_000).toISOString(), recipients: ["codex"] };
+  const business = { seq: 2, eventId: "business-after-stale-control", op: "msg.send", kind: "msg.send", sender: "hermes", target: "codex" };
+  const accepted = [];
+  const turns = [];
+  const result = await runRelay(config, { signal: controller.signal,
+    streamOpener: async () => new Response([stale, business].map((event) => `id: ${event.seq}\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`).join("")),
+    observerCredentialLoader: async () => "observer_" + "c".repeat(64),
+    nativeObserverFactory: () => ({ acceptEvent: async (event) => { accepted.push(event); return { stale: true }; }, tick: async () => ({ ok: true }), status: () => ({ busy: false }) }),
+    turnRunner: async (input) => { turns.push(input); controller.abort(); }, sleep: nextTurn, errorLogger: () => {} });
+  assert.equal(result.cursor, 2);
+  assert.equal(accepted.length, 1);
+  assert.equal(turns.length, 1);
+  assert.ok(turns[0].prompt.includes("business-after-stale-control"));
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 2);
+});
+
+test("a known native control is durably skipped when its optional observer is disabled", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-disabled-native-control-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "push-state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile,
+    cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  const control = { seq: 1, eventId: "native-control-disabled", op: "connect.native.challenge", kind: "native-admission-control", challengeId: "known-control",
+    nonce: "d".repeat(64), workspace: "solar_ops", runtimeId: "runtime old v1", nativeThreadId: "thread-old", profileRevision: 4,
+    generation: 3, grantRevision: 7, expiresAt: new Date(Date.now() - 60_000).toISOString(), recipients: ["codex"] };
+  const business = { seq: 2, eventId: "business-after-disabled-control", op: "msg.send", kind: "msg.send", sender: "hermes", target: "codex" };
+  const turns = [];
+  const stream = [control, business].map((event) => ["id: " + event.seq, "event: council.event", "data: " + JSON.stringify(event), "", ""].join("\n")).join("");
+  const result = await runRelay(config, { signal: controller.signal, streamOpener: async () => new Response(stream),
+    turnRunner: async (input) => { turns.push(input); controller.abort(); }, sleep: nextTurn, errorLogger: () => {} });
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(result.cursor, 2);
+  assert.equal(turns.length, 1, "only the following business message starts a turn");
+  assert.ok(turns[0].prompt.includes("business-after-disabled-control"));
+  assert.equal(state.skippedNativeControls.length, 1);
+  assert.deepEqual({ ...state.skippedNativeControls[0], at: "timestamp" }, { eventId: "native-control-disabled", challengeId: "known-control", seq: 1, at: "timestamp", reason: "observer-disabled" });
 });
 
 test("relay rejects unknown chat operations without advancing the cursor", async (t) => {

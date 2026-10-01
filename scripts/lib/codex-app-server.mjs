@@ -402,6 +402,17 @@ export async function runCodexAppServerTurn({
         if (!uncertaintyExpired(execution.uncertainUntil)) throw new CodexTurnStartUncertainError();
         throw new CodexAttentionRequiredError("Codex may have accepted this turn, but its result cannot be recovered safely. Open the task in Codex.");
       }
+      // Readback identifies the rollout; resume loads that exact saved thread
+      // into this app-server before a safely unadmitted request can start.
+      let resumed;
+      try { resumed = await connection.request("thread/resume", { threadId: recoverySessionId }); }
+      catch (error) {
+        if (isActiveWriterRpcError(error, recoverySessionId)) throw new CodexActiveWriterError();
+        throw error;
+      }
+      thread = resumed?.thread;
+      if (!thread || thread.id !== recoverySessionId) throw new Error("The recovered Codex task identity changed");
+      if (threadStatus(thread) === "active") throw new CodexTaskBusyError();
     }
 
     if (!thread && !recoverySessionId && execution?.stage === "thread-creating") {

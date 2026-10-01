@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { CodexTaskBusyError, runCodexAppServerTurn } from "./lib/codex-app-server.mjs";
 import { sendWhatsAppNotification, sendWhatsAppPoll } from "./lib/bridge-state.mjs";
 import { bridgePaths, codexBinaryPath, readConfig } from "./lib/runtime-config.mjs";
 import { isCurrentWhatsappPermit, readBearerCredential } from "./lib/council-approvals.mjs";
+import { createNativeObserver, loadObserverCredential } from "./lib/council-native-observer.mjs";
 
 const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_REPLAY_EVENTS = 1000;
@@ -32,7 +34,7 @@ const SAFE_REGISTRY_NOTICE_KINDS = new Set([
 ]);
 const SAFE_PASSIVE_ONBOARDING_OPS = new Set([
   "connect.profile.put", "connect.challenge.issue", "connect.challenge.answer",
-  "connect.verify", "connect.modes", "connect.restart",
+  "connect.verify", "connect.modes", "connect.restart", "connect.response.challenge",
 ]);
 const SAFE_CHAT_EVENT_KINDS = new Set([
   "chat.conversation.create", "chat.conversation.get", "chat.conversation.send", "chat.conversation.read",
@@ -70,13 +72,58 @@ function relayConfig(config) {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(workspace)) return null;
   const runtimePath = value.runtimePath == null ? "" : String(value.runtimePath).trim();
   if (runtimePath && !path.isAbsolute(runtimePath)) return null;
-  return { councilUrl, credentialFile, tokenEnv, sessionId, cwd, workspace, runtimePath, statePath: value.statePath ? path.resolve(String(value.statePath)) : bridgePaths(config).root + "/council-push/state.json" };
+  const statePath = value.statePath ? path.resolve(String(value.statePath)) : bridgePaths(config).root + "/council-push/state.json";
+  const renewalEnabled = value.renewalEnabled === true;
+  if (renewalEnabled && (!runtimePath || (!credentialFile && !tokenEnv))) return null;
+  const renewalStatePath = value.renewalStatePath == null ? `${statePath}.renewal.json` : String(value.renewalStatePath).trim();
+  if (!path.isAbsolute(renewalStatePath)) return null;
+  return { councilUrl, credentialFile, tokenEnv, sessionId, cwd, workspace, runtimePath, statePath, renewalEnabled, renewalStatePath };
+}
+
+export function runtimeRenewalCommand(options) {
+  if (!options?.runtimePath || !options.renewalStatePath || !options.councilUrl || !options.workspace) throw new Error("Council runtime renewal is not configured");
+  const args = [options.runtimePath, "renew", "--agent", "codex", "--state", options.renewalStatePath, "--once", "--council-url", options.councilUrl, "--workspace", options.workspace];
+  if (options.credentialFile) args.push("--credential", options.credentialFile);
+  else if (options.tokenEnv) args.push("--token-env", options.tokenEnv);
+  else throw new Error("Council runtime renewal credential is not configured");
+  return { executable: process.execPath, args, cwd: options.cwd, timeoutMs: 90_000 };
+}
+
+async function runRuntimeRenewal(command, { signal, spawnImpl = spawn } = {}) {
+  const child = spawnImpl(command.executable, command.args, { cwd: command.cwd, shell: false, stdio: ["ignore", "ignore", "pipe"] });
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    let finished = false;
+    const finish = (error, value) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error); else resolve(value);
+    };
+    const abort = () => { child.kill("SIGTERM"); finish(new Error("cancelled")); };
+    const timer = setTimeout(() => { child.kill("SIGTERM"); finish(new Error("timed out")); }, command.timeoutMs);
+    timer.unref?.();
+    if (signal?.aborted) return abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    child.stderr?.on("data", (chunk) => { if (stderr.length < 8192) stderr += String(chunk).slice(0, 8192 - stderr.length); });
+    child.once("error", () => finish(new Error("could not start")));
+    child.once("exit", (code) => {
+      if (code === 0) return finish(null, { ok: true });
+      const error = new Error("child failed");
+      error.authRevoked = /Council request failed \((?:401|403)\)/.test(stderr);
+      finish(error);
+    });
+  });
 }
 
 function readState(filePath) {
   if (!fs.existsSync(filePath)) return { schemaVersion: 1, cursor: 0, notified: [] };
   const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  if (!value || value.schemaVersion !== 1 || !Number.isSafeInteger(value.cursor) || value.cursor < 0 || (value.notified !== undefined && (!Array.isArray(value.notified) || value.notified.some((id) => typeof id !== "string")))) throw new Error("Council relay state is invalid");
+  if (!value || value.schemaVersion !== 1 || !Number.isSafeInteger(value.cursor) || value.cursor < 0 || (value.notified !== undefined && (!Array.isArray(value.notified) || value.notified.some((id) => typeof id !== "string"))) ||
+      (value.skippedNativeControls !== undefined && (!Array.isArray(value.skippedNativeControls) || value.skippedNativeControls.length > 64 || value.skippedNativeControls.some((item) =>
+        !item || typeof item !== "object" || typeof item.eventId !== "string" || !SAFE_IDENTIFIER.test(item.eventId) || typeof item.challengeId !== "string" || !SAFE_IDENTIFIER.test(item.challengeId) || !Number.isSafeInteger(item.seq) || item.seq < 1 ||
+        item.reason !== "observer-disabled" || !Number.isFinite(Date.parse(item.at)))))) throw new Error("Council relay state is invalid");
   if (value.pending !== undefined && (!Array.isArray(value.pending) || value.pending.length > MAX_PENDING_EVENTS || value.pending.some((item) => !validPendingPointer(item)))) throw new Error("Council relay pending queue is invalid");
   if (!validFrozenRegistryBatch(value.inbox, value.pending ?? [])) throw new Error("Council relay state is invalid");
   return value;
@@ -151,7 +198,8 @@ function writeState(filePath, state) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   fs.chmodSync(path.dirname(filePath), 0o700);
   const temporary = `${filePath}.${process.pid}.tmp`;
-  const persisted = { schemaVersion: 1, cursor: state.cursor, notified: (state.notified ?? []).slice(-256), ...(state.reconcile ? { reconcile: state.reconcile } : {}) };
+  const persisted = { schemaVersion: 1, cursor: state.cursor, notified: (state.notified ?? []).slice(-256), ...(state.reconcile ? { reconcile: state.reconcile } : {}),
+    ...(state.skippedNativeControls ? { skippedNativeControls: state.skippedNativeControls.slice(-64) } : {}) };
   if (state.inbox) persisted.inbox = state.inbox;
   if (state.jobs && Object.keys(state.jobs).length) persisted.jobs = state.jobs;
   if (state.tasks && Object.keys(state.tasks).length) persisted.tasks = state.tasks;
@@ -479,7 +527,7 @@ async function reconcileCursor(options, cursor, config, turnRunner) {
   return { currentCursor, requestId };
 }
 
-export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
+export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, runtimeRenewalRunner = runRuntimeRenewal, nativeObserverFactory = createNativeObserver, observerCredentialLoader = loadObserverCredential, nativeObserverRequest, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
   const options = relayConfig(config);
   if (!options) throw new Error("Council push is not configured");
   let state = readState(options.statePath);
@@ -488,6 +536,70 @@ export async function runRelay(config, { signal = new AbortController().signal, 
   let pendingRetryTimer = null;
   let pendingDrainScheduled = false;
   const activeSlots = new Map();
+  let nativeObserver = null;
+  const observerConfig = config?.councilPush?.nativeObserver;
+  if (observerConfig) {
+    const observerToken = await observerCredentialLoader(String(observerConfig.credentialFile ?? ""));
+    const observerStatePath = String(observerConfig.statePath ?? `${options.statePath}.native-observer.json`);
+    nativeObserver = nativeObserverFactory({ ...observerConfig, credentialFile: String(observerConfig.credentialFile), statePath: observerStatePath },
+      { workspace: options.workspace, councilUrl: options.councilUrl }, {
+        codexBinary: codexBinaryPath(config), cwd: options.cwd, turnRunner, spawnImpl: spawn,
+        canRunControl: () => !activeSlots.has("inbox") && !state.inbox?.execution && !(state.pending ?? []).some((item) => !item.jobId && !item.taskId),
+        request: nativeObserverRequest ?? (async (operation, payload, requestId) => {
+          const route = operation === "challenge" ? "/api/connect/observer/challenge" : "/api/connect/observer/admit";
+          const response = await fetch(new URL(route, options.councilUrl), { method: "POST", redirect: "error", headers: {
+            authorization: `Bearer ${observerToken}`, "content-type": "application/json", "x-council-workspace": options.workspace,
+            "x-request-id": requestId,
+          }, body: JSON.stringify(payload), signal: AbortSignal.timeout(15_000) });
+          const declared = Number(response.headers.get("content-length") ?? 0);
+          if (declared > 65_536) throw new Error("Council observer response is too large");
+          const chunks = [];
+          let size = 0;
+          const reader = response.body?.getReader();
+          if (reader) {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              size += value.byteLength;
+              if (size > 65_536) { await reader.cancel(); throw new Error("Council observer response is too large"); }
+              chunks.push(value);
+            }
+          }
+          const responseBody = Buffer.concat(chunks).toString("utf8");
+          if (!response.ok) throw new Error(`Council request failed (${response.status})`);
+          if (responseBody.includes(observerToken)) throw new Error("Council reflected the observer credential");
+          try { return JSON.parse(responseBody); } catch { throw new Error("Council returned invalid JSON"); }
+        }),
+      });
+  }
+  let renewalInFlight = false;
+  let renewalStopped = false;
+  const runRenewal = () => {
+    if (!options.renewalEnabled || signal.aborted || renewalStopped || renewalInFlight) return;
+    renewalInFlight = true;
+    Promise.resolve().then(() => runtimeRenewalRunner(runtimeRenewalCommand(options), { signal })).catch((error) => {
+      if (error?.authRevoked) {
+        renewalStopped = true;
+        try { errorLogger("Council runtime renewal stopped because its credential was rejected."); } catch { /* logging must not interrupt the relay */ }
+      } else {
+        try { errorLogger("Council runtime renewal failed; the existing relay and business queue continue."); } catch { /* logging must not interrupt the relay */ }
+      }
+    }).finally(() => { renewalInFlight = false; });
+  };
+  const renewalTimer = options.renewalEnabled ? setInterval(runRenewal, 60_000) : null;
+  renewalTimer?.unref?.();
+  if (renewalTimer) signal.addEventListener("abort", () => clearInterval(renewalTimer), { once: true });
+  runRenewal();
+  const observerTick = () => {
+    if (!nativeObserver || signal.aborted) return;
+    Promise.resolve(nativeObserver.tick()).catch(() => {
+      try { errorLogger("Council native observer needs attention; relay business dispatch continues."); } catch { /* logging must not interrupt the relay */ }
+    });
+  };
+  const observerTimer = nativeObserver ? setInterval(observerTick, 15_000) : null;
+  observerTimer?.unref?.();
+  if (observerTimer) signal.addEventListener("abort", () => clearInterval(observerTimer), { once: true });
+  observerTick();
   let drainPending;
   const schedulePendingDrain = (delayMs = 0) => {
     if (signal.aborted) return;
@@ -531,7 +643,7 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       const inbox = state.inbox ?? { sessionId: options.sessionId || null };
       const slot = exactJobId ? (state.jobs?.[exactJobId] ?? {}) : exactTaskId ? (state.tasks?.[exactTaskId] ?? {}) : inbox;
       const slotKey = exactJobId ? `job:${exactJobId}` : exactTaskId ? `task:${exactTaskId}` : "inbox";
-      if (blockedSlots.has(slotKey) || activeSlots.has(slotKey)) continue;
+      if (blockedSlots.has(slotKey) || activeSlots.has(slotKey) || (slotKey === "inbox" && nativeObserver?.status().busy)) continue;
       const activeExecution = slot.execution?.eventId === event.eventId ? slot.execution : null;
       let registryBatch = null;
       if (event.kind === "registry.announce") {
@@ -671,6 +783,47 @@ export async function runRelay(config, { signal = new AbortController().signal, 
           ...(rawEvent?.op === "registry.announce" ? { noticeKind: rawEvent.kind, principal: rawEvent.principal } : {}),
         };
         if (event.seq <= state.cursor) continue;
+        if (rawEvent?.op === "connect.native.challenge") {
+          const validControl = SAFE_IDENTIFIER.test(event.eventId) && rawEvent.kind === "native-admission-control" && rawEvent.workspace === options.workspace &&
+            Array.isArray(rawEvent.recipients) && rawEvent.recipients.includes("codex") && typeof rawEvent.challengeId === "string" && SAFE_IDENTIFIER.test(rawEvent.challengeId) &&
+            typeof rawEvent.nonce === "string" && /^[a-f0-9]{64}$/.test(rawEvent.nonce) && typeof rawEvent.runtimeId === "string" && rawEvent.runtimeId.trim() === rawEvent.runtimeId && rawEvent.runtimeId.length <= 120 &&
+            typeof rawEvent.nativeThreadId === "string" && !!rawEvent.nativeThreadId && rawEvent.nativeThreadId.length <= 256 &&
+            Number.isSafeInteger(rawEvent.profileRevision) && rawEvent.profileRevision > 0 && Number.isSafeInteger(rawEvent.generation) && rawEvent.generation >= 0 &&
+            Number.isSafeInteger(rawEvent.grantRevision) && rawEvent.grantRevision > 0 && Number.isFinite(Date.parse(rawEvent.expiresAt));
+          if (!validControl) throw new Error("Native admission event identity is invalid");
+          if (!nativeObserver) {
+            const skippedNativeControls = (state.skippedNativeControls ?? []).filter((item) => item.eventId !== event.eventId);
+            skippedNativeControls.push({ eventId: event.eventId, challengeId: rawEvent.challengeId, seq, at: new Date().toISOString(), reason: "observer-disabled" });
+            state = { ...state, skippedNativeControls: skippedNativeControls.slice(-64), cursor: Math.max(state.cursor, seq) };
+            writeState(options.statePath, state);
+            continue;
+          }
+          await nativeObserver.acceptEvent({ ...rawEvent, seq, eventId: event.eventId });
+          state = { ...state, cursor: Math.max(state.cursor, seq) };
+          writeState(options.statePath, state);
+          observerTick();
+          continue;
+        }
+        if (rawEvent?.op === "connect.response.challenge") {
+          const runtimeId = rawEvent.runtimeId;
+          const expiresAt = Date.parse(rawEvent.expiresAt);
+          if (!SAFE_IDENTIFIER.test(event.eventId) || rawEvent.kind !== "response-challenge" || rawEvent.mode !== "stream" || rawEvent.workspace !== options.workspace ||
+              !Array.isArray(rawEvent.recipients) || !rawEvent.recipients.includes("codex") ||
+              typeof rawEvent.challengeId !== "string" || !SAFE_IDENTIFIER.test(rawEvent.challengeId) ||
+              typeof rawEvent.nonce !== "string" || !/^[a-f0-9]{64}$/.test(rawEvent.nonce) ||
+              typeof runtimeId !== "string" || runtimeId.trim() !== runtimeId || runtimeId.length > 120 ||
+              /council_[A-Za-z0-9_-]{40,128}|Bearer\s+[A-Za-z0-9_.-]{32,}/i.test(runtimeId) ||
+              !Number.isSafeInteger(rawEvent.profileRevision) || rawEvent.profileRevision < 1 ||
+              !Number.isSafeInteger(rawEvent.generation) || rawEvent.generation < 0 ||
+              !Number.isFinite(expiresAt)) {
+            throw new Error("Council response challenge event is invalid");
+          }
+          // Expired, otherwise well-formed recipient proofs are transport
+          // controls. Acknowledge them so later actionable events can proceed.
+          state = { ...state, cursor: Math.max(state.cursor, seq) };
+          writeState(options.statePath, state);
+          continue;
+        }
         if (!SAFE_IDENTIFIER.test(event.eventId)
           || (typeof rawEvent?.op === "string" && rawEvent.op.startsWith("connect.") && !SAFE_PASSIVE_ONBOARDING_OPS.has(rawEvent.op))
           || (!SAFE_EVENT_KINDS.has(event.kind) && !SAFE_CHAT_EVENT_KINDS.has(event.kind) && !SAFE_PASSIVE_ONBOARDING_OPS.has(event.kind))) throw new Error("Council event is invalid");
@@ -745,6 +898,8 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       backoff = Math.min(MAX_BACKOFF_MS, backoff * 2);
     }
   }
+  if (renewalTimer) clearInterval(renewalTimer);
+  if (observerTimer) clearInterval(observerTimer);
   return { ok: true, cursor: state.cursor };
 }
 
