@@ -535,9 +535,9 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       const activeExecution = slot.execution?.eventId === event.eventId ? slot.execution : null;
       let registryBatch = null;
       if (event.kind === "registry.announce") {
-        if (activeExecution?.registryBatch) {
+        if (activeExecution && Object.hasOwn(activeExecution, "registryBatch")) {
           registryBatch = activeExecution.registryBatch;
-        } else {
+        } else if (!activeExecution) {
           const queueIndex = (state.pending ?? []).findIndex((item) => item.eventId === event.eventId);
           registryBatch = [];
           for (const candidate of (state.pending ?? []).slice(queueIndex)) {
@@ -607,7 +607,7 @@ export async function runRelay(config, { signal = new AbortController().signal, 
         turnTimeoutMs: 15 * 60 * 1000,
         onThreadCreating: ({ threadSource, uncertainUntil }) => saveSlot(registryBatch
           ? { ...(activeExecution ?? {}), stage: "thread-creating", threadSource, uncertainUntil, registryBatch }
-          : { stage: "thread-creating", threadSource, uncertainUntil }),
+          : { ...(activeExecution ?? {}), stage: "thread-creating", threadSource, uncertainUntil }),
         onThreadReady: ({ sessionId, threadSource }) => {
           const current = exactJobId ? (state.jobs?.[exactJobId] ?? {}) : exactTaskId ? (state.tasks?.[exactTaskId] ?? {}) : (state.inbox ?? { sessionId: options.sessionId || null });
           saveSlot({ ...(current.execution ?? {}), stage: "thread-ready", ...(threadSource ? { threadSource } : {}), sessionId });

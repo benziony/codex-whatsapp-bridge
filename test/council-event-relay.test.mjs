@@ -377,6 +377,71 @@ test("registry batch admits after an unresolved independent job and retains that
   ]);
 });
 
+test("legacy uncertain registry execution recovers singly before batching later notices", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-legacy-recovery-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  const legacyPointer = { seq: 4, eventId: "evt-registry-legacy", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" };
+  const laterPointers = [
+    { seq: 5, eventId: "evt-registry-after-legacy-a", kind: "registry.announce", noticeKind: "capabilities-changed", principal: "agent_a" },
+    { seq: 6, eventId: "evt-registry-after-legacy-b", kind: "registry.announce", noticeKind: "runtime-restarted", principal: "agent_b" },
+  ];
+  const legacyExecution = {
+    eventId: legacyPointer.eventId,
+    stage: "turn-starting",
+    sessionId: "legacy-registry-thread",
+    turnId: "legacy-registry-turn",
+    threadSource: "legacy-registry-source",
+    uncertainUntil: "2026-10-01T06:00:00.000Z",
+  };
+  fs.writeFileSync(statePath, JSON.stringify({
+    schemaVersion: 1,
+    cursor: 6,
+    notified: [],
+    pending: [legacyPointer, ...laterPointers],
+    inbox: { sessionId: legacyExecution.sessionId, execution: legacyExecution },
+  }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  const started = [];
+  let stateAtLegacyStart;
+  let afterLegacyAdmission;
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(new ReadableStream()),
+    turnRunner: async (input) => {
+      started.push(input);
+      if (started.length === 1) {
+        if (input.requestId !== "council-event:" + legacyPointer.eventId) {
+          controller.abort();
+          return;
+        }
+        stateAtLegacyStart = readState(statePath);
+        input.onTurnStarted({ sessionId: legacyExecution.sessionId, turnId: legacyExecution.turnId });
+        afterLegacyAdmission = readState(statePath);
+        return;
+      }
+      input.onTurnStarted({ sessionId: "legacy-registry-thread", turnId: "new-registry-batch" });
+      controller.abort();
+    },
+    sleep: async () => { await waitFor(() => started.length === 2); controller.abort(); },
+    errorLogger: () => {},
+  });
+  assert.equal(started.length, 2);
+  assert.equal(started[0].requestId, "council-event:" + legacyPointer.eventId);
+  assert.deepEqual(started[0].execution, legacyExecution);
+  assert.deepEqual(stateAtLegacyStart.inbox.execution, legacyExecution);
+  assert.match(started[0].prompt, /Event evt-registry-legacy \(sequence 4\), kind registry\.announce/);
+  assert.doesNotMatch(started[0].prompt, /evt-registry-after-legacy/);
+  assert.deepEqual(afterLegacyAdmission.pending.map((item) => item.eventId), laterPointers.map((item) => item.eventId));
+  assert.match(started[1].requestId, /^council-registry-refresh:[a-f0-9]{48}$/);
+  assert.doesNotMatch(started[1].prompt, /evt-registry-legacy/);
+  assert.match(started[1].prompt, /evt-registry-after-legacy-a/);
+  assert.match(started[1].prompt, /evt-registry-after-legacy-b/);
+});
+
 test("uncertain registry batch retry keeps frozen membership as later notices arrive", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-batch-retry-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
