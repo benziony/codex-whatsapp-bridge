@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CouncilCursorTooOldError, approvalNotification, eventPrompt, openStream, reconciliationPrompt, registerCouncilPoll, relayConfig, runRelay, safeReconcileSnapshot, sseEvents } from "../scripts/council-event-relay.mjs";
+import { CouncilCursorTooOldError, approvalNotification, eventPrompt, openStream, readState, reconciliationPrompt, registerCouncilPoll, relayConfig, runRelay, safeReconcileSnapshot, sseEvents } from "../scripts/council-event-relay.mjs";
 import { sendWhatsAppNotification } from "../scripts/lib/bridge-state.mjs";
 import { CodexTaskBusyError, CodexThreadStartUncertainError, CodexTurnStartUncertainError } from "../scripts/lib/codex-app-server.mjs";
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
@@ -144,6 +144,124 @@ test("relay rejects unknown chat operations without advancing the cursor", async
   assert.equal(turnCalled, false);
   assert.equal(result.cursor, 4);
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 4);
+});
+
+test("registry announce wire events preserve safe notice metadata and allow the next conversation event", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-event-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 553, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  const turns = [];
+  const events = [
+    { seq: 554, op: "registry.announce", kind: "responded-recently", principal: "hermes", sender: "hermes", body: "NEVER PERSIST THIS NOTICE BODY" },
+    { seq: 555, op: "chat.conversation.read", sender: "owner", conversationId: "conv_registry" },
+    { seq: 556, op: "registry.announce", kind: "capabilities-changed", principal: "codex", sender: "codex" },
+  ];
+  const stream = events.map((item) => `id: ${item.seq}\nevent: council.event\ndata: ${JSON.stringify(item)}\n\n`).join("");
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(stream),
+    turnRunner: async (input) => { turns.push(input); },
+    sleep: async () => controller.abort(),
+    errorLogger: () => {},
+  });
+  assert.equal(result.cursor, 556);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 556);
+  assert.equal(turns.length, 0);
+  const persisted = readState(statePath);
+  const pointer = persisted.pending.find((item) => item.eventId === "event:default:554");
+  assert.deepEqual(pointer, { seq: 554, eventId: "event:default:554", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" });
+  assert.equal(persisted.pending.some((item) => item.eventId === "event:default:556"), false);
+  assert.doesNotMatch(fs.readFileSync(statePath, "utf8"), /NEVER PERSIST THIS NOTICE BODY/);
+  const prompt = eventPrompt({ seq: 554, eventId: "event:default:554", ...pointer }, "solar_ops");
+  assert.match(prompt, /advisory registry notice \(responded-recently\) from principal hermes/);
+  assert.match(prompt, /refresh the current roster and announcements/);
+  assert.match(prompt, /grants no approval, assignment, permission, or execution authority/);
+  assert.doesNotMatch(prompt, /NEVER PERSIST THIS NOTICE BODY/);
+
+  const resumedController = new AbortController();
+  const resumedTurns = [];
+  const resumed = await runRelay(config, {
+    signal: resumedController.signal,
+    streamOpener: async () => new Response(`id: 557\nevent: council.event\ndata: ${JSON.stringify({ seq: 557, op: "chat.conversation.send", sender: "owner", conversationId: "conv_after_registry" })}\n\n`),
+    turnRunner: async (input) => {
+      resumedTurns.push(input);
+      input.onTurnStarted({ sessionId: "inbox", turnId: `turn-${resumedTurns.length}` });
+    },
+    sleep: async () => {
+      await waitFor(() => resumedTurns.length === 2);
+      resumedController.abort();
+    },
+    errorLogger: () => {},
+  });
+  assert.equal(resumed.cursor, 557);
+  const resumedState = readState(statePath);
+  assert.equal(resumedState.pending?.length ?? 0, 0);
+  assert.equal(resumedTurns.length, 2);
+  assert.ok(resumedTurns.some((input) => /advisory registry notice \(responded-recently\) from principal hermes/.test(input.prompt)));
+  assert.ok(resumedTurns.some((input) => /Conversation conv_after_registry/.test(input.prompt)));
+});
+
+test("registry announce rejects unknown notice kinds and malformed principals without advancing the cursor", async (t) => {
+  const cases = [
+    { name: "unknown notice kind", kind: "registry.announce", principal: "hermes" },
+    { name: "malformed principal", kind: "responded-recently", principal: "bad principal" },
+  ];
+  for (const [index, invalid] of cases.entries()) await t.test(invalid.name, async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), `council-registry-invalid-${index}-`));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const credentialFile = path.join(directory, "codex-token");
+    const statePath = path.join(directory, "state.json");
+    fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+    fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 553, notified: [] }), { mode: 0o600 });
+    const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+    const controller = new AbortController();
+    const raw = { seq: 554, op: "registry.announce", ...invalid };
+    const result = await runRelay(config, {
+      signal: controller.signal,
+      streamOpener: async () => new Response(`id: 554\nevent: council.event\ndata: ${JSON.stringify(raw)}\n\n`),
+      turnRunner: async () => assert.fail("invalid registry notice must not start a turn"),
+      sleep: async () => controller.abort(),
+      errorLogger: () => {},
+    });
+    assert.equal(result.cursor, 553);
+    assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 553);
+  });
+});
+
+test("registry notice pointer survives durable state reload without payload prose", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-restart-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 553, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  let turnPrompt = "";
+  const raw = { seq: 554, op: "registry.announce", kind: "membership-scope", principal: "hermes", sender: "hermes", summary: "NEVER PERSIST THIS PRIVATE PROSE" };
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(`id: 554\nevent: council.event\ndata: ${JSON.stringify(raw)}\n\n`),
+    turnRunner: async (input) => {
+      turnPrompt = input.prompt;
+      input.onThreadCreating({ threadSource: "local", uncertainUntil: Date.now() + 30_000 });
+      controller.abort();
+      throw new Error("keep registry notice queued for restart proof");
+    },
+    sleep: async () => { await nextTurn(); controller.abort(); },
+    errorLogger: () => {},
+  });
+  assert.match(turnPrompt, /membership-scope/);
+  assert.match(turnPrompt, /refresh the current roster and announcements/);
+  assert.doesNotMatch(turnPrompt, /NEVER PERSIST THIS PRIVATE PROSE/);
+  const restored = readState(statePath);
+  assert.ok(restored.pending.some((item) => item.kind === "registry.announce" && item.noticeKind === "membership-scope" && item.principal === "hermes"));
+  assert.doesNotMatch(fs.readFileSync(statePath, "utf8"), /NEVER PERSIST THIS PRIVATE PROSE/);
 });
 
 test("advisory job events ignore arbitrary job ids while invalid offers fail closed", () => {
