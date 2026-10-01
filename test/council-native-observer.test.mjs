@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createNativeObserver, loadObserverCredential, observeNativeTurn } from "../scripts/lib/council-native-observer.mjs";
+import { controlRequestId, createNativeObserver, loadObserverCredential, observeNativeTurn } from "../scripts/lib/council-native-observer.mjs";
 
 const pause = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -139,6 +139,117 @@ test("a verified native control replay returns its stored admission after the ch
   await assert.rejects(observer.acceptEvent({ ...event, nonce: "8".repeat(64) }), /replay changed its binding/);
   await assert.rejects(observer.acceptEvent({ ...event, seq: 2 }), /replay changed its binding/);
   await assert.rejects(observer.acceptEvent({ ...event, challengeId: "unknown-challenge" }), /no matching issued challenge/);
+});
+
+test("native turn start waits for delayed user-message visibility in the read-only app-server", async (t) => {
+  const f = fixture();
+  t.after(f.cleanup);
+  let now = Date.parse("2026-10-01T12:00:00Z");
+  const requestId = controlRequestId("visibility-challenge");
+  const nonce = "a".repeat(64);
+  const expectedText = `Native admission control challenge.\nChallenge: ${JSON.stringify({ challengeId: "visibility-challenge", nonce })}\nAcknowledge only.`;
+  const binary = path.join(f.directory, "synthetic-delayed-native-reader.mjs");
+  const readCountFile = path.join(f.directory, "thread-read-count");
+  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');let result={};if(m.method==='thread/read'){const reads=(fs.existsSync(${JSON.stringify(readCountFile)})?Number(fs.readFileSync(${JSON.stringify(readCountFile)},'utf8')):0)+1;fs.writeFileSync(${JSON.stringify(readCountFile)},String(reads));const items=reads>=4?[{type:'userMessage',clientId:${JSON.stringify(requestId)},content:[{type:'text',text:${JSON.stringify(expectedText)}}]}]:[];result={thread:{id:'thread-a',turns:[{id:'visibility-turn',status:'interrupted',items}]}}}process.stdout.write(JSON.stringify({id:m.id,result})+'\\n')});\n`, { mode: 0o700 });
+  let startCount = 0;
+  let runnerCompleted = false;
+  const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
+    request: async (operation) => operation === "challenge"
+      ? { id: "visibility-challenge", expiresAt: new Date(now + 90_000).toISOString(), runtimeId: "runtime-a", profileRevision: 4, generation: 3, grantRevision: 2 }
+      : { mode: "native-wake", kind: "native-admission", expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(), generation: 3, profileRevision: 4, grantRevision: 2 },
+    turnRunner: async (args) => {
+      startCount++;
+      await args.onTurnStarting({ sessionId: args.sessionId });
+      await args.onTurnStarted({ sessionId: args.sessionId, turnId: "visibility-turn" });
+      runnerCompleted = true;
+    },
+    codexBinary: binary, cwd: f.directory, observerTimeoutMs: 1_000, observerVisibilityTimeoutMs: 1_000, observerPollIntervalMs: 10,
+    clock: () => now, random: () => 0, randomId: () => "delayed-visibility", canRunControl: () => true,
+  });
+  await observer.tick({ force: true });
+  await observer.acceptEvent({ op: "connect.native.challenge", kind: "native-admission-control", seq: 1, eventId: "visibility-event",
+    challengeId: "visibility-challenge", nonce, workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a", profileRevision: 4,
+    generation: 3, grantRevision: 2, expiresAt: new Date(now + 90_000).toISOString(), recipients: ["codex"] });
+
+  await observer.tick();
+  const state = JSON.parse(fs.readFileSync(f.statePath, "utf8"));
+  assert.equal(Number(fs.readFileSync(readCountFile, "utf8")), 4);
+  assert.equal(startCount, 1, "visibility polling observes the already-started turn instead of retrying it");
+  assert.equal(runnerCompleted, true, "a temporary missing user message does not interrupt the started turn");
+  assert.equal(state.control["visibility-challenge"].admission.status, "verified");
+});
+
+test("native user-message visibility timeout stays uncertain without interrupting or restarting the turn", async (t) => {
+  const f = fixture();
+  t.after(f.cleanup);
+  let now = Date.parse("2026-10-01T12:00:00Z");
+  const requestId = controlRequestId("visibility-timeout-challenge");
+  const binary = path.join(f.directory, "synthetic-empty-native-reader.mjs");
+  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');const result=m.method==='initialize'?{}:{thread:{id:'thread-a',turns:[{id:'timeout-turn',status:'interrupted',items:[]}]}};process.stdout.write(JSON.stringify({id:m.id,result})+'\\n')});\n`, { mode: 0o700 });
+  let startCount = 0;
+  let runnerCompleted = false;
+  const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
+    request: async (operation) => operation === "challenge"
+      ? { id: "visibility-timeout-challenge", expiresAt: new Date(now + 90_000).toISOString(), runtimeId: "runtime-a", profileRevision: 4, generation: 3, grantRevision: 2 }
+      : { mode: "native-wake", kind: "native-admission", expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(), generation: 3, profileRevision: 4, grantRevision: 2 },
+    turnRunner: async (args) => {
+      startCount++;
+      await args.onTurnStarting({ sessionId: args.sessionId });
+      await args.onTurnStarted({ sessionId: args.sessionId, turnId: "timeout-turn" });
+      runnerCompleted = true;
+    },
+    codexBinary: binary, cwd: f.directory, observerTimeoutMs: 500, observerVisibilityTimeoutMs: 20, observerPollIntervalMs: 5,
+    clock: () => now, random: () => 0, randomId: () => "visibility-timeout", canRunControl: () => true,
+  });
+  await observer.tick({ force: true });
+  await observer.acceptEvent({ op: "connect.native.challenge", kind: "native-admission-control", seq: 1, eventId: "visibility-timeout-event",
+    challengeId: "visibility-timeout-challenge", nonce: "b".repeat(64), workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a",
+    profileRevision: 4, generation: 3, grantRevision: 2, expiresAt: new Date(now + 90_000).toISOString(), recipients: ["codex"] });
+
+  await observer.tick();
+  await observer.tick();
+  const control = JSON.parse(fs.readFileSync(f.statePath, "utf8")).control["visibility-timeout-challenge"];
+  assert.equal(startCount, 1, "an unobserved request is not blindly started again");
+  assert.equal(runnerCompleted, true, "a visibility timeout does not abort the already-started turn");
+  assert.equal(control.uncertain, true);
+  assert.equal(control.stage, "native-start-pending");
+  assert.equal(control.admission, undefined);
+});
+
+test("a thread/read that crosses the visibility deadline is an uncertain absence, not a fatal runner error", async (t) => {
+  const f = fixture();
+  t.after(f.cleanup);
+  let now = Date.parse("2026-10-01T12:00:00Z");
+  const binary = path.join(f.directory, "synthetic-slow-empty-native-reader.mjs");
+  const readCountFile = path.join(f.directory, "slow-thread-read-count");
+  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');if(m.method==='initialize'){process.stdout.write(JSON.stringify({id:m.id,result:{}})+'\\n');return}const reads=(fs.existsSync(${JSON.stringify(readCountFile)})?Number(fs.readFileSync(${JSON.stringify(readCountFile)},'utf8')):0)+1;fs.writeFileSync(${JSON.stringify(readCountFile)},String(reads));setTimeout(()=>process.stdout.write(JSON.stringify({id:m.id,result:{thread:{id:'thread-a',turns:[{id:'slow-timeout-turn',status:'interrupted',items:[]}]}}})+'\\n'),12)});\n`, { mode: 0o700 });
+  let startCount = 0;
+  let runnerCompleted = false;
+  const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
+    request: async (operation) => operation === "challenge"
+      ? { id: "slow-timeout-challenge", expiresAt: new Date(now + 90_000).toISOString(), runtimeId: "runtime-a", profileRevision: 4, generation: 3, grantRevision: 2 }
+      : { mode: "native-wake", kind: "native-admission", expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(), generation: 3, profileRevision: 4, grantRevision: 2 },
+    turnRunner: async (args) => {
+      startCount++;
+      await args.onTurnStarting({ sessionId: args.sessionId });
+      await args.onTurnStarted({ sessionId: args.sessionId, turnId: "slow-timeout-turn" });
+      runnerCompleted = true;
+    },
+    codexBinary: binary, cwd: f.directory, observerTimeoutMs: 1_000, observerVisibilityTimeoutMs: 20, observerPollIntervalMs: 5,
+    clock: () => now, random: () => 0, randomId: () => "slow-visibility-timeout", canRunControl: () => true,
+  });
+  await observer.tick({ force: true });
+  await observer.acceptEvent({ op: "connect.native.challenge", kind: "native-admission-control", seq: 1, eventId: "slow-timeout-event",
+    challengeId: "slow-timeout-challenge", nonce: "c".repeat(64), workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a",
+    profileRevision: 4, generation: 3, grantRevision: 2, expiresAt: new Date(now + 90_000).toISOString(), recipients: ["codex"] });
+
+  await observer.tick();
+  const control = JSON.parse(fs.readFileSync(f.statePath, "utf8")).control["slow-timeout-challenge"];
+  assert.ok(Number(fs.readFileSync(readCountFile, "utf8")) >= 2);
+  assert.equal(startCount, 1);
+  assert.equal(runnerCompleted, true, "visibility-budget expiry during an RPC does not abort the started turn");
+  assert.equal(control.uncertain, true);
+  assert.equal(control.admission, undefined);
 });
 
 test("SSE arriving before the issue response is durably buffered and promoted without overlapping ticks", async (t) => {

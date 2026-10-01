@@ -86,9 +86,12 @@ function responseText(turn, requestId) {
   return content.filter((entry) => entry?.type === "text" && typeof entry.text === "string").map((entry) => entry.text).join("");
 }
 
-export async function observeNativeTurn({ spawnImpl = spawn, codexBinary, cwd, threadId, requestId, expectedText, timeoutMs = 15_000 }) {
+export async function observeNativeTurn({ spawnImpl = spawn, codexBinary, cwd, threadId, requestId, expectedText, timeoutMs = 15_000,
+  visibilityTimeoutMs = timeoutMs, visibilityPollIntervalMs = 100 }) {
   if (typeof spawnImpl !== "function" || typeof codexBinary !== "string" || !isAbsolute(cwd) || typeof threadId !== "string" || !threadId ||
-      typeof requestId !== "string" || !requestId || typeof expectedText !== "string" || !expectedText || expectedText.length > 4096) fail("Native observer read request is invalid");
+      typeof requestId !== "string" || !requestId || typeof expectedText !== "string" || !expectedText || expectedText.length > 4096 ||
+      !Number.isFinite(visibilityTimeoutMs) || visibilityTimeoutMs < 1 || visibilityTimeoutMs > 60_000 ||
+      !Number.isFinite(visibilityPollIntervalMs) || visibilityPollIntervalMs < 1 || visibilityPollIntervalMs > 1_000) fail("Native observer read request is invalid");
   const child = spawnImpl(codexBinary, ["app-server", "--listen", "stdio://"], { cwd, shell: false, stdio: ["pipe", "pipe", "ignore"] });
   if (!child?.stdout || !child?.stdin) fail("Native observer app-server did not start");
   let buffer = "";
@@ -125,12 +128,17 @@ export async function observeNativeTurn({ spawnImpl = spawn, codexBinary, cwd, t
   };
   child.stdout.on("data", onData);
   child.once?.("error", () => { for (const p of pending.values()) p.reject(new Error("Native observer app-server failed")); });
-  const rpc = (method, params, notification = false) => {
+  const rpc = (method, params, notification = false, requestTimeoutMs = timeoutMs, timeoutCode) => {
     const id = notification ? undefined : nextId++;
     const packet = notification ? { method, params } : { id, method, params };
     if (notification) { child.stdin.write(`${JSON.stringify(packet)}\n`); return Promise.resolve(null); }
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { pending.delete(id); reject(new Error("Native observer app-server timed out")); }, timeoutMs);
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        const error = new Error("Native observer app-server timed out");
+        if (timeoutCode) error.code = timeoutCode;
+        reject(error);
+      }, requestTimeoutMs);
       pending.set(id, { resolve: (message) => { clearTimeout(timer); resolve(message); }, reject: (error) => { clearTimeout(timer); reject(error); } });
       try { child.stdin.write(`${JSON.stringify(packet)}\n`); } catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
     });
@@ -139,12 +147,24 @@ export async function observeNativeTurn({ spawnImpl = spawn, codexBinary, cwd, t
     const initialized = await rpc("initialize", { clientInfo: { name: "council-native-observer", version: "1" } });
     if (initialized?.error || !initialized || !Object.hasOwn(initialized, "result")) fail("Native observer initialization failed");
     await rpc("initialized", {}, true);
-    const response = await rpc("thread/read", { threadId, includeTurns: true });
-    if (response?.error) fail("Native observer thread read failed");
-    const thread = response?.result?.thread;
-    if (!thread || thread.id !== threadId || !Array.isArray(thread.turns)) fail("Native observer thread identity is invalid");
-    const matches = thread.turns.filter((turn) => Array.isArray(turn?.items) && turn.items.some((item) => item?.type === "userMessage" && item.clientId === requestId));
-    if (matches.length !== 1) fail("Native admission turn has not appeared", "NATIVE_TURN_NOT_FOUND");
+    const visibilityDeadline = Date.now() + visibilityTimeoutMs;
+    let matches;
+    while (true) {
+      const remaining = visibilityDeadline - Date.now();
+      if (remaining <= 0) fail("Native admission turn has not appeared", "NATIVE_TURN_NOT_FOUND");
+      const deadlineLimited = remaining <= timeoutMs;
+      const response = await rpc("thread/read", { threadId, includeTurns: true }, false, Math.min(timeoutMs, remaining),
+        deadlineLimited ? "NATIVE_TURN_NOT_FOUND" : undefined);
+      if (response?.error) fail("Native observer thread read failed");
+      const thread = response?.result?.thread;
+      if (!thread || thread.id !== threadId || !Array.isArray(thread.turns)) fail("Native observer thread identity is invalid");
+      matches = thread.turns.filter((turn) => Array.isArray(turn?.items) && turn.items.some((item) => item?.type === "userMessage" && item.clientId === requestId));
+      if (matches.length > 1) fail("Native admission turn identity is invalid");
+      if (matches.length === 1) break;
+      const delay = Math.min(visibilityPollIntervalMs, Math.max(0, visibilityDeadline - Date.now()));
+      if (delay <= 0) fail("Native admission turn has not appeared", "NATIVE_TURN_NOT_FOUND");
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
     const turn = matches[0];
     if (typeof turn.id !== "string" || !turn.id || !["inProgress", "interrupted", "completed", "failed"].includes(turn.status)) fail("Native admission turn identity is invalid");
     const exactText = responseText(turn, requestId);
@@ -345,6 +365,7 @@ export function createNativeObserver(config, options = {}, deps = {}) {
   async function findExisting(challengeId, control) {
     const expectedText = nativeControlPrompt({ challengeId, nonce: control.nonce });
     return observerReader({ threadId: config.nativeThreadId, requestId: control.requestId, expectedText, timeoutMs: deps.observerTimeoutMs ?? 15_000,
+      visibilityTimeoutMs: deps.observerVisibilityTimeoutMs ?? 5_000, visibilityPollIntervalMs: deps.observerPollIntervalMs ?? 100,
       spawnImpl: deps.spawnImpl, codexBinary: deps.codexBinary ?? "codex", cwd: deps.cwd ?? process.cwd() });
   }
 
@@ -399,9 +420,16 @@ export function createNativeObserver(config, options = {}, deps = {}) {
           },
           onTurnStarted: async (info) => {
             if (info?.sessionId !== config.nativeThreadId || typeof info.turnId !== "string") fail("Native control turn identity is invalid");
-            const found = await findExisting(challengeId, control);
-            if (found.turnId !== info.turnId) fail("Observed native turn does not match the admitted turn");
-            await admitObserved(challengeId, found);
+            try {
+              const found = await findExisting(challengeId, control);
+              if (found.turnId !== info.turnId) fail("Observed native turn does not match the admitted turn");
+              await admitObserved(challengeId, found);
+            } catch (error) {
+              // The JSON-RPC turn/start acknowledgement can precede persistence
+              // of its userMessage. Let the already-started turn continue; the
+              // same request ID is read back again after completion/recovery.
+              if (error?.code !== "NATIVE_TURN_NOT_FOUND") throw error;
+            }
           } });
       } catch (error) {
         const latest = (await readObserverState(config.statePath)).control[challengeId];
