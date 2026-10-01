@@ -227,7 +227,7 @@ test("registry announce wire events preserve safe notice metadata and allow the 
   const resumedState = readState(statePath);
   assert.equal(resumedState.pending?.length ?? 0, 0);
   assert.equal(resumedTurns.length, 2);
-  assert.ok(resumedTurns.some((input) => /advisory registry notice \(responded-recently\) from principal hermes/.test(input.prompt)));
+  assert.ok(resumedTurns.some((input) => /Registry notice event:default:639 \(sequence 639\): kind responded-recently, principal hermes/.test(input.prompt)));
   assert.ok(resumedTurns.some((input) => /Conversation conv_after_registry/.test(input.prompt)));
 });
 
@@ -282,11 +282,277 @@ test("registry notice pointer survives durable state reload without payload pros
     errorLogger: () => {},
   });
   assert.match(turnPrompt, /membership-scope/);
-  assert.match(turnPrompt, /refresh the current roster and announcements/);
+  assert.match(turnPrompt, /fetch the current roster once and the current announcements once/);
   assert.doesNotMatch(turnPrompt, /NEVER PERSIST THIS PRIVATE PROSE/);
   const restored = readState(statePath);
   assert.ok(restored.pending.some((item) => item.kind === "registry.announce" && item.noticeKind === "membership-scope" && item.principal === "hermes"));
   assert.doesNotMatch(fs.readFileSync(statePath, "utf8"), /NEVER PERSIST THIS PRIVATE PROSE/);
+});
+
+test("consecutive registry notices share one inbox turn before a following conversation", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-batch-order-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 3, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  const inputs = [];
+  const events = [
+    { seq: 4, eventId: "evt-registry-one", op: "registry.announce", kind: "responded-recently", principal: "hermes", body: "DO NOT INCLUDE REGISTRY PROSE" },
+    { seq: 5, eventId: "evt-registry-two", op: "registry.announce", kind: "membership-scope", principal: "agent-a", body: "DO NOT INCLUDE SECOND PROSE" },
+    { seq: 6, eventId: "evt-conversation-after-registry", op: "chat.conversation.send", sender: "owner", conversationId: "conv_after_batch" },
+  ];
+  const stream = events.map((item) => ["id: " + item.seq, "event: council.event", "data: " + JSON.stringify(item), "", ""].join("\n")).join("");
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(stream),
+    turnRunner: async (input) => {
+      inputs.push(input);
+      input.onTurnStarted({ sessionId: "inbox-thread", turnId: "batch-turn-" + inputs.length });
+      const admitted = readState(statePath);
+      if (inputs.length === 1) assert.deepEqual(admitted.pending.map((item) => item.eventId), ["evt-conversation-after-registry"]);
+      if (inputs.length === 2) controller.abort();
+    },
+    sleep: async () => { await waitFor(() => inputs.length === 2); controller.abort(); },
+    errorLogger: () => {},
+  });
+  assert.equal(inputs.length, 2);
+  assert.notEqual(inputs[0].requestId, inputs[1].requestId);
+  assert.match(inputs[0].requestId, /^council-registry-refresh:[a-f0-9]{48}$/);
+  assert.match(inputs[0].prompt, /evt-registry-one.*responded-recently.*hermes/s);
+  assert.match(inputs[0].prompt, /evt-registry-two.*membership-scope.*agent-a/s);
+  assert.match(inputs[0].prompt, /fetch the current roster once and the current announcements once/);
+  assert.doesNotMatch(inputs[0].prompt, /DO NOT INCLUDE/);
+  assert.match(inputs[1].prompt, /Conversation conv_after_batch/);
+  assert.doesNotMatch(inputs[1].prompt, /evt-registry-one|evt-registry-two/);
+  const stored = readState(statePath);
+  assert.equal(stored.cursor, 6);
+  assert.deepEqual(stored.pending ?? [], []);
+  assert.equal(stored.inbox.execution, undefined);
+  assert.doesNotMatch(fs.readFileSync(statePath, "utf8"), /DO NOT INCLUDE/);
+});
+
+test("registry batch admits after an unresolved independent job and retains that job pointer", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-after-job-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  const pending = [
+    { seq: 4, eventId: "evt-job-stalled-before-registry", kind: "job.offer", target: "codex", executor: "codex", jobId: "job_stalled", caseId: "case_stalled" },
+    { seq: 5, eventId: "evt-registry-after-job-a", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" },
+    { seq: 6, eventId: "evt-registry-after-job-b", kind: "registry.announce", noticeKind: "capabilities-changed", principal: "agent_b" },
+  ];
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 6, notified: [], pending }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  const started = [];
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(new ReadableStream()),
+    turnRunner: async (input) => {
+      started.push(input);
+      if (input.requestId === "council-event:evt-job-stalled-before-registry") return await new Promise(() => {});
+      assert.match(input.requestId, /^council-registry-refresh:/);
+      try {
+        input.onTurnStarted({ sessionId: "inbox-thread", turnId: "registry-after-job" });
+      } finally {
+        controller.abort();
+      }
+      return await new Promise(() => {});
+    },
+    sleep: nextTurn,
+    errorLogger: () => {},
+  });
+  assert.equal(started.length, 2);
+  assert.match(started[1].prompt, /evt-registry-after-job-a/);
+  assert.match(started[1].prompt, /evt-registry-after-job-b/);
+  const restored = readState(statePath);
+  assert.deepEqual(restored.pending.map((item) => item.eventId), ["evt-job-stalled-before-registry"]);
+  assert.equal(restored.inbox.execution.stage, "running");
+  assert.deepEqual(restored.inbox.execution.registryBatch.map((item) => item.eventId), [
+    "evt-registry-after-job-a", "evt-registry-after-job-b",
+  ]);
+});
+
+test("legacy uncertain registry execution recovers singly before batching later notices", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-legacy-recovery-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  const legacyPointer = { seq: 4, eventId: "evt-registry-legacy", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" };
+  const laterPointers = [
+    { seq: 5, eventId: "evt-registry-after-legacy-a", kind: "registry.announce", noticeKind: "capabilities-changed", principal: "agent_a" },
+    { seq: 6, eventId: "evt-registry-after-legacy-b", kind: "registry.announce", noticeKind: "runtime-restarted", principal: "agent_b" },
+  ];
+  const legacyExecution = {
+    eventId: legacyPointer.eventId,
+    stage: "turn-starting",
+    sessionId: "legacy-registry-thread",
+    turnId: "legacy-registry-turn",
+    threadSource: "legacy-registry-source",
+    uncertainUntil: "2026-10-01T06:00:00.000Z",
+  };
+  fs.writeFileSync(statePath, JSON.stringify({
+    schemaVersion: 1,
+    cursor: 6,
+    notified: [],
+    pending: [legacyPointer, ...laterPointers],
+    inbox: { sessionId: legacyExecution.sessionId, execution: legacyExecution },
+  }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  const started = [];
+  let stateAtLegacyStart;
+  let afterLegacyAdmission;
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(new ReadableStream()),
+    turnRunner: async (input) => {
+      started.push(input);
+      if (started.length === 1) {
+        if (input.requestId !== "council-event:" + legacyPointer.eventId) {
+          controller.abort();
+          return;
+        }
+        stateAtLegacyStart = readState(statePath);
+        input.onTurnStarted({ sessionId: legacyExecution.sessionId, turnId: legacyExecution.turnId });
+        afterLegacyAdmission = readState(statePath);
+        return;
+      }
+      input.onTurnStarted({ sessionId: "legacy-registry-thread", turnId: "new-registry-batch" });
+      controller.abort();
+    },
+    sleep: async () => { await waitFor(() => started.length === 2); controller.abort(); },
+    errorLogger: () => {},
+  });
+  assert.equal(started.length, 2);
+  assert.equal(started[0].requestId, "council-event:" + legacyPointer.eventId);
+  assert.deepEqual(started[0].execution, legacyExecution);
+  assert.deepEqual(stateAtLegacyStart.inbox.execution, legacyExecution);
+  assert.match(started[0].prompt, /Event evt-registry-legacy \(sequence 4\), kind registry\.announce/);
+  assert.doesNotMatch(started[0].prompt, /evt-registry-after-legacy/);
+  assert.deepEqual(afterLegacyAdmission.pending.map((item) => item.eventId), laterPointers.map((item) => item.eventId));
+  assert.match(started[1].requestId, /^council-registry-refresh:[a-f0-9]{48}$/);
+  assert.doesNotMatch(started[1].prompt, /evt-registry-legacy/);
+  assert.match(started[1].prompt, /evt-registry-after-legacy-a/);
+  assert.match(started[1].prompt, /evt-registry-after-legacy-b/);
+});
+
+test("uncertain registry batch retry keeps frozen membership as later notices arrive", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-batch-retry-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 3, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops" } };
+  const toStream = (events) => events.map((item) => ["id: " + item.seq, "event: council.event", "data: " + JSON.stringify(item), "", ""].join("\n")).join("");
+  const firstEvents = [
+    { seq: 4, eventId: "evt-registry-original-a", op: "registry.announce", kind: "responded-recently", principal: "hermes", body: "ORIGINAL SECRET A" },
+    { seq: 5, eventId: "evt-registry-original-b", op: "registry.announce", kind: "response-proven", principal: "hermes", body: "ORIGINAL SECRET B" },
+  ];
+  const firstController = new AbortController();
+  let firstInput;
+  await runRelay(config, {
+    signal: firstController.signal,
+    streamOpener: async () => new Response(toStream(firstEvents)),
+    turnRunner: async (input) => {
+      firstInput = input;
+      input.onThreadCreating({ threadSource: "stable-registry-refresh", uncertainUntil: new Date(Date.now() + 60000).toISOString() });
+      firstController.abort();
+      throw new CodexThreadStartUncertainError();
+    },
+    sleep: nextTurn,
+    errorLogger: () => {},
+  });
+  const firstState = readState(statePath);
+  assert.deepEqual(firstState.inbox.execution.registryBatch.map((item) => item.eventId), ["evt-registry-original-a", "evt-registry-original-b"]);
+  assert.equal(firstState.inbox.execution.eventId, "evt-registry-original-a");
+  assert.deepEqual(firstState.pending.map((item) => item.eventId), ["evt-registry-original-a", "evt-registry-original-b"]);
+  assert.doesNotMatch(fs.readFileSync(statePath, "utf8"), /ORIGINAL SECRET/);
+
+  const secondController = new AbortController();
+  let retryInput;
+  const laterEvents = [
+    { seq: 6, eventId: "evt-registry-later-a", op: "registry.announce", kind: "capabilities-changed", principal: "agent-b" },
+    { seq: 7, eventId: "evt-registry-later-b", op: "registry.announce", kind: "runtime-restarted", principal: "agent-b" },
+  ];
+  await runRelay(config, {
+    signal: secondController.signal,
+    streamOpener: async () => new Response(toStream(laterEvents)),
+    turnRunner: async (input) => {
+      retryInput = input;
+      throw new CodexTaskBusyError("the native start was definitively rejected", { turnStartRejected: true });
+    },
+    sleep: async () => {
+      await waitFor(() => retryInput && readState(statePath).pending?.length === 4 && readState(statePath).inbox.execution.stage === "prepared");
+      secondController.abort();
+    },
+    errorLogger: () => {},
+  });
+  const queuedState = readState(statePath);
+  assert.deepEqual(queuedState.pending.map((item) => item.eventId), [
+    "evt-registry-original-a", "evt-registry-original-b", "evt-registry-later-a", "evt-registry-later-b",
+  ]);
+  assert.deepEqual(queuedState.inbox.execution.registryBatch.map((item) => item.eventId), ["evt-registry-original-a", "evt-registry-original-b"]);
+  assert.equal(retryInput.requestId, firstInput.requestId);
+  assert.deepEqual(retryInput.execution.registryBatch.map((item) => item.eventId), ["evt-registry-original-a", "evt-registry-original-b"]);
+  assert.doesNotMatch(retryInput.prompt, /evt-registry-later/);
+
+  const finalController = new AbortController();
+  const delivered = [];
+  await runRelay(config, {
+    signal: finalController.signal,
+    streamOpener: async () => new Response(""),
+    turnRunner: async (input) => {
+      delivered.push(input);
+      input.onTurnStarted({ sessionId: "inbox-thread", turnId: "delivered-" + delivered.length });
+      if (delivered.length === 2) finalController.abort();
+    },
+    sleep: async () => { await waitFor(() => delivered.length === 2); finalController.abort(); },
+    errorLogger: () => {},
+  });
+  assert.equal(delivered.length, 2);
+  assert.equal(delivered[0].requestId, firstInput.requestId);
+  assert.notEqual(delivered[1].requestId, firstInput.requestId);
+  assert.match(delivered[0].prompt, /evt-registry-original-a/);
+  assert.doesNotMatch(delivered[0].prompt, /evt-registry-later/);
+  assert.match(delivered[1].prompt, /evt-registry-later-a/);
+  assert.match(delivered[1].prompt, /evt-registry-later-b/);
+  const completed = readState(statePath);
+  assert.deepEqual(completed.pending ?? [], []);
+  assert.equal(completed.cursor, 7);
+  assert.equal(completed.inbox.execution, undefined);
+});
+
+test("malformed frozen registry batch metadata fails before stream access", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-batch-invalid-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  const pointer = { seq: 4, eventId: "evt-invalid-batch", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" };
+  fs.writeFileSync(statePath, JSON.stringify({
+    schemaVersion: 1,
+    cursor: 4,
+    notified: [],
+    pending: [pointer],
+    inbox: { execution: { eventId: pointer.eventId, stage: "thread-creating", registryBatch: "malformed" } },
+  }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  let opened = false;
+  const controller = new AbortController();
+  await assert.rejects(runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => { opened = true; return new Response(""); },
+    turnRunner: async () => { controller.abort(); },
+    sleep: nextTurn,
+  }), /Council relay state is invalid/);
+  assert.equal(opened, false);
 });
 
 test("advisory job events ignore arbitrary job ids while invalid offers fail closed", () => {
