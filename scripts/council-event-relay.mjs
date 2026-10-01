@@ -29,6 +29,10 @@ const SAFE_REGISTRY_NOTICE_KINDS = new Set([
   "connection-modes-changed", "runtime-restarted", "membership-approve", "membership-resume",
   "membership-scope", "membership-pause", "membership-revoke",
 ]);
+const SAFE_PASSIVE_ONBOARDING_OPS = new Set([
+  "connect.profile.put", "connect.challenge.issue", "connect.challenge.answer",
+  "connect.verify", "connect.modes", "connect.restart",
+]);
 const SAFE_CHAT_EVENT_KINDS = new Set([
   "chat.conversation.create", "chat.conversation.get", "chat.conversation.send", "chat.conversation.read",
   "chat.conversation.invite", "chat.conversation.address", "chat.conversation.archive",
@@ -553,15 +557,24 @@ export async function runRelay(config, { signal = new AbortController().signal, 
           eventId: typeof rawEvent?.eventId === "string" && rawEvent.eventId ? rawEvent.eventId : `event:${String(rawEvent?.workspace ?? "default")}:${seq}`,
           kind: rawEvent?.op === "registry.announce"
             ? "registry.announce"
+            : SAFE_PASSIVE_ONBOARDING_OPS.has(rawEvent?.op)
+            ? rawEvent.op
             : typeof rawEvent?.kind === "string" && rawEvent.kind ? rawEvent.kind : String(rawEvent?.op ?? "council.event"),
           ...(rawEvent?.op === "registry.announce" ? { noticeKind: rawEvent.kind, principal: rawEvent.principal } : {}),
         };
         if (event.seq <= state.cursor) continue;
-        if (!SAFE_IDENTIFIER.test(event.eventId) || (!SAFE_EVENT_KINDS.has(event.kind) && !SAFE_CHAT_EVENT_KINDS.has(event.kind))) throw new Error("Council event is invalid");
+        if (!SAFE_IDENTIFIER.test(event.eventId)
+          || (typeof rawEvent?.op === "string" && rawEvent.op.startsWith("connect.") && !SAFE_PASSIVE_ONBOARDING_OPS.has(rawEvent.op))
+          || (!SAFE_EVENT_KINDS.has(event.kind) && !SAFE_CHAT_EVENT_KINDS.has(event.kind) && !SAFE_PASSIVE_ONBOARDING_OPS.has(event.kind))) throw new Error("Council event is invalid");
         if (event.kind === "registry.announce" && (!SAFE_REGISTRY_NOTICE_KINDS.has(event.noticeKind) || typeof event.principal !== "string" || !SAFE_IDENTIFIER.test(event.principal))) throw new Error("Council registry notice is invalid");
         // Creation, reads, and draft file activity do not address an agent.
         // Likewise, an agent's own chat mutation must not wake itself again.
         if (PASSIVE_CHAT_EVENT_KINDS.has(event.kind) || (event.sender === "codex" && SAFE_CHAT_EVENT_KINDS.has(event.kind))) {
+          state = { ...state, cursor: event.seq };
+          writeState(options.statePath, state);
+          continue;
+        }
+        if (SAFE_PASSIVE_ONBOARDING_OPS.has(event.kind)) {
           state = { ...state, cursor: event.seq };
           writeState(options.statePath, state);
           continue;

@@ -144,6 +144,25 @@ test("relay rejects unknown chat operations without advancing the cursor", async
   assert.equal(turnCalled, false);
   assert.equal(result.cursor, 4);
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 4);
+  await t.test("unlisted connect operations remain rejected", async (t) => {
+    const connectDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "council-connect-unknown-"));
+    t.after(() => fs.rmSync(connectDirectory, { recursive: true, force: true }));
+    const connectCredentialFile = path.join(connectDirectory, "codex-token");
+    const connectStatePath = path.join(connectDirectory, "state.json");
+    fs.writeFileSync(connectCredentialFile, "codex-token\n", { mode: 0o600 });
+    fs.writeFileSync(connectStatePath, JSON.stringify({ schemaVersion: 1, cursor: 4, notified: [] }), { mode: 0o600 });
+    const connectController = new AbortController();
+    const connectConfig = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: connectCredentialFile, cwd: connectDirectory, statePath: connectStatePath } };
+    const connectResult = await runRelay(connectConfig, {
+      signal: connectController.signal,
+      streamOpener: async () => new Response(`id: 5\nevent: council.event\ndata: ${JSON.stringify({ seq: 5, eventId: "evt-connect-unknown", op: "connect.profile.delete", kind: "chat.conversation.send", conversationId: "conv_unknown", sender: "codex" })}\n\n`),
+      turnRunner: async () => assert.fail("an unlisted connect operation must not start a turn"),
+      sleep: async () => connectController.abort(),
+      errorLogger: () => {},
+    });
+    assert.equal(connectResult.cursor, 4);
+    assert.equal(JSON.parse(fs.readFileSync(connectStatePath, "utf8")).cursor, 4);
+  });
 });
 
 test("registry announce wire events preserve safe notice metadata and allow the next conversation event", async (t) => {
@@ -152,14 +171,19 @@ test("registry announce wire events preserve safe notice metadata and allow the 
   const credentialFile = path.join(directory, "codex-token");
   const statePath = path.join(directory, "state.json");
   fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
-  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 553, notified: [] }), { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 638, notified: [] }), { mode: 0o600 });
   const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops" } };
   const controller = new AbortController();
   const turns = [];
   const events = [
-    { seq: 554, op: "registry.announce", kind: "responded-recently", principal: "hermes", sender: "hermes", body: "NEVER PERSIST THIS NOTICE BODY" },
-    { seq: 555, op: "chat.conversation.read", sender: "owner", conversationId: "conv_registry" },
-    { seq: 556, op: "registry.announce", kind: "capabilities-changed", principal: "codex", sender: "codex" },
+    { seq: 639, op: "registry.announce", kind: "responded-recently", principal: "hermes", sender: "hermes", body: "NEVER PERSIST THIS NOTICE BODY" },
+    { seq: 640, op: "connect.profile.put", kind: "job.offer", sender: "codex" },
+    { seq: 641, op: "connect.challenge.issue", sender: "codex" },
+    { seq: 642, op: "connect.challenge.answer", sender: "codex" },
+    { seq: 643, op: "connect.verify", sender: "codex" },
+    { seq: 644, op: "connect.modes", sender: "codex" },
+    { seq: 645, op: "connect.restart", sender: "codex" },
+    { seq: 646, op: "registry.announce", kind: "capabilities-changed", principal: "codex", sender: "codex" },
   ];
   const stream = events.map((item) => `id: ${item.seq}\nevent: council.event\ndata: ${JSON.stringify(item)}\n\n`).join("");
   const result = await runRelay(config, {
@@ -169,15 +193,16 @@ test("registry announce wire events preserve safe notice metadata and allow the 
     sleep: async () => controller.abort(),
     errorLogger: () => {},
   });
-  assert.equal(result.cursor, 556);
-  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 556);
+  assert.equal(result.cursor, 646);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 646);
   assert.equal(turns.length, 0);
   const persisted = readState(statePath);
-  const pointer = persisted.pending.find((item) => item.eventId === "event:default:554");
-  assert.deepEqual(pointer, { seq: 554, eventId: "event:default:554", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" });
-  assert.equal(persisted.pending.some((item) => item.eventId === "event:default:556"), false);
+  const pointer = persisted.pending.find((item) => item.eventId === "event:default:639");
+  assert.deepEqual(pointer, { seq: 639, eventId: "event:default:639", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" });
+  assert.equal(persisted.pending.length, 1);
+  assert.equal(persisted.pending.some((item) => item.eventId === "event:default:646"), false);
   assert.doesNotMatch(fs.readFileSync(statePath, "utf8"), /NEVER PERSIST THIS NOTICE BODY/);
-  const prompt = eventPrompt({ seq: 554, eventId: "event:default:554", ...pointer }, "solar_ops");
+  const prompt = eventPrompt({ seq: 639, eventId: "event:default:639", ...pointer }, "solar_ops");
   assert.match(prompt, /advisory registry notice \(responded-recently\) from principal hermes/);
   assert.match(prompt, /refresh the current roster and announcements/);
   assert.match(prompt, /grants no approval, assignment, permission, or execution authority/);
@@ -187,7 +212,7 @@ test("registry announce wire events preserve safe notice metadata and allow the 
   const resumedTurns = [];
   const resumed = await runRelay(config, {
     signal: resumedController.signal,
-    streamOpener: async () => new Response(`id: 557\nevent: council.event\ndata: ${JSON.stringify({ seq: 557, op: "chat.conversation.send", sender: "owner", conversationId: "conv_after_registry" })}\n\n`),
+    streamOpener: async () => new Response(`id: 647\nevent: council.event\ndata: ${JSON.stringify({ seq: 647, op: "chat.conversation.send", sender: "owner", conversationId: "conv_after_registry" })}\n\n`),
     turnRunner: async (input) => {
       resumedTurns.push(input);
       input.onTurnStarted({ sessionId: "inbox", turnId: `turn-${resumedTurns.length}` });
@@ -198,7 +223,7 @@ test("registry announce wire events preserve safe notice metadata and allow the 
     },
     errorLogger: () => {},
   });
-  assert.equal(resumed.cursor, 557);
+  assert.equal(resumed.cursor, 647);
   const resumedState = readState(statePath);
   assert.equal(resumedState.pending?.length ?? 0, 0);
   assert.equal(resumedTurns.length, 2);
