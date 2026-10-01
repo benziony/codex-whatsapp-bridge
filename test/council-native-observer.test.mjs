@@ -156,6 +156,77 @@ test("SSE arriving before the issue response is durably buffered and promoted wi
   assert.equal(startCount, 1);
 });
 
+test("native runner rejection before onTurnStarting retries the same request ID", async (t) => {
+  const f = fixture();
+  t.after(f.cleanup);
+  let now = Date.parse("2026-10-01T12:00:00Z");
+  let runCount = 0;
+  let callbackReached = false;
+  const requestIds = [];
+  const turnId = "turn-after-retry";
+  const nonce = "e".repeat(64);
+  const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
+    request: async (operation) => operation === "challenge"
+      ? { id: "prestart-challenge", expiresAt: new Date(now + 60_000).toISOString(), runtimeId: "runtime-a", profileRevision: 4, generation: 3, grantRevision: 2 }
+      : { mode: "native-wake", kind: "native-admission", expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(), generation: 3, profileRevision: 4, grantRevision: 2 },
+    observerReader: async ({ requestId }) => {
+      if (!callbackReached) { const error = new Error("native turn not found"); error.code = "NATIVE_TURN_NOT_FOUND"; throw error; }
+      return { turnId, status: "inProgress", nonce, observedAt: new Date(now).toISOString(), requestId };
+    },
+    turnRunner: async (args) => {
+      runCount++;
+      requestIds.push(args.requestId);
+      if (runCount === 1) throw new Error("runner failed before turn start callback");
+      callbackReached = true;
+      await args.onTurnStarting({ sessionId: args.sessionId });
+      await args.onTurnStarted({ sessionId: args.sessionId, turnId });
+    },
+    clock: () => now, random: () => 0, randomId: () => "prestart-retry", canRunControl: () => true,
+  });
+  await observer.tick({ force: true });
+  await observer.acceptEvent({ op: "connect.native.challenge", kind: "native-admission-control", seq: 1, eventId: "prestart-event",
+    challengeId: "prestart-challenge", nonce, workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a", profileRevision: 4,
+    generation: 3, grantRevision: 2, expiresAt: new Date(now + 60_000).toISOString(), recipients: ["codex"] });
+
+  await observer.tick();
+  const rejected = JSON.parse(fs.readFileSync(f.statePath, "utf8")).control["prestart-challenge"];
+  assert.equal(rejected.uncertain, false);
+  assert.equal(rejected.stage, "native-start-rejected");
+  assert.equal(runCount, 1);
+
+  await observer.tick();
+  assert.equal(runCount, 2);
+  assert.equal(requestIds.length, 2);
+  assert.equal(requestIds[1], requestIds[0], "retry keeps the persisted native request ID");
+  assert.equal(JSON.parse(fs.readFileSync(f.statePath, "utf8")).control["prestart-challenge"].admission.status, "verified");
+});
+
+test("native runner failure after onTurnStarting remains uncertain and never starts a duplicate", async (t) => {
+  const f = fixture();
+  t.after(f.cleanup);
+  let now = Date.parse("2026-10-01T12:00:00Z");
+  let runCount = 0;
+  const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
+    request: async (operation) => operation === "challenge"
+      ? { id: "postcallback-challenge", expiresAt: new Date(now + 60_000).toISOString(), runtimeId: "runtime-a", profileRevision: 4, generation: 3, grantRevision: 2 }
+      : { mode: "native-wake", kind: "native-admission", expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(), generation: 3, profileRevision: 4, grantRevision: 2 },
+    observerReader: async () => { const error = new Error("native turn not found"); error.code = "NATIVE_TURN_NOT_FOUND"; throw error; },
+    turnRunner: async (args) => { runCount++; await args.onTurnStarting({ sessionId: args.sessionId }); throw new Error("runner failed after turn start callback"); },
+    clock: () => now, random: () => 0, randomId: () => "postcallback-uncertain", canRunControl: () => true,
+  });
+  await observer.tick({ force: true });
+  await observer.acceptEvent({ op: "connect.native.challenge", kind: "native-admission-control", seq: 1, eventId: "postcallback-event",
+    challengeId: "postcallback-challenge", nonce: "f".repeat(64), workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a",
+    profileRevision: 4, generation: 3, grantRevision: 2, expiresAt: new Date(now + 60_000).toISOString(), recipients: ["codex"] });
+
+  await observer.tick();
+  await observer.tick();
+  const state = JSON.parse(fs.readFileSync(f.statePath, "utf8")).control["postcallback-challenge"];
+  assert.equal(runCount, 1, "possible native start is never blindly repeated");
+  assert.equal(state.uncertain, true);
+  assert.equal(state.stage, "native-start-pending");
+});
+
 test("expired unstarted controls stay bounded through a long inbox outage and the newest challenge admits after recovery", async (t) => {
   const f = fixture();
   t.after(f.cleanup);
