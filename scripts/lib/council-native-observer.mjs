@@ -389,10 +389,14 @@ export function createNativeObserver(config, options = {}, deps = {}) {
       });
       const expectedText = nativeControlPrompt({ challengeId, nonce: control.nonce });
       let rejected = false;
+      let turnStartingReached = false;
       try {
         await deps.turnRunner({ sessionId: config.nativeThreadId, requestId: control.requestId, prompt: expectedText, codexBinary: deps.codexBinary ?? "codex",
           cwd: deps.cwd ?? process.cwd(), title: "Council native admission control", turnTimeoutMs: 60_000,
-          onTurnStarting: async (info) => { if (info?.sessionId !== config.nativeThreadId) fail("Native control session changed"); },
+          onTurnStarting: async (info) => {
+            turnStartingReached = true;
+            if (info?.sessionId !== config.nativeThreadId) fail("Native control session changed");
+          },
           onTurnStarted: async (info) => {
             if (info?.sessionId !== config.nativeThreadId || typeof info.turnId !== "string") fail("Native control turn identity is invalid");
             const found = await findExisting(challengeId, control);
@@ -402,7 +406,7 @@ export function createNativeObserver(config, options = {}, deps = {}) {
       } catch (error) {
         const latest = (await readObserverState(config.statePath)).control[challengeId];
         if (latest?.admitBody) throw error;
-        if (error?.turnStartRejected === true) rejected = true;
+        if (!turnStartingReached || error?.turnStartRejected === true) rejected = true;
         else {
           try {
             const found = await findExisting(challengeId, control);
