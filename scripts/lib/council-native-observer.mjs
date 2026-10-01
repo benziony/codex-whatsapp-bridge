@@ -146,7 +146,7 @@ export async function observeNativeTurn({ spawnImpl = spawn, codexBinary, cwd, t
     const matches = thread.turns.filter((turn) => Array.isArray(turn?.items) && turn.items.some((item) => item?.type === "userMessage" && item.clientId === requestId));
     if (matches.length !== 1) fail("Native admission turn has not appeared", "NATIVE_TURN_NOT_FOUND");
     const turn = matches[0];
-    if (typeof turn.id !== "string" || !turn.id || !["inProgress", "completed", "failed"].includes(turn.status)) fail("Native admission turn identity is invalid");
+    if (typeof turn.id !== "string" || !turn.id || !["inProgress", "interrupted", "completed", "failed"].includes(turn.status)) fail("Native admission turn identity is invalid");
     const exactText = responseText(turn, requestId);
     if (exactText !== expectedText) fail("Native admission prompt did not match");
     const challengeLine = exactText.split("\n").find((line) => line.startsWith("Challenge: "));
