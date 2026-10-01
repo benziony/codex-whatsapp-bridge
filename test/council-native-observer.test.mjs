@@ -397,8 +397,12 @@ test("native reader starts its protected read-only child with the production def
   const f = fixture(); t.after(f.cleanup);
   const nonce = "c".repeat(64), requestId = "native-default-spawn", expectedText = `Native admission control challenge.\nChallenge: ${JSON.stringify({ challengeId: "default-spawn-challenge", nonce })}\nAcknowledge only.`;
   const binary = path.join(f.directory, "synthetic-native-reader.mjs");
-  const thread = { id: "thread-a", turns: [{ id: "default-spawn-turn", status: "completed", items: [{ type: "userMessage", clientId: requestId, content: [{ type: "text", text: expectedText }] }] }] };
-  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');process.stdout.write(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:{thread:${JSON.stringify(thread)}}})+'\\n')});\n`, { mode: 0o700 });
+  const writeReader = (thread) => fs.writeFileSync(binary, `#!/usr/bin/env node\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');process.stdout.write(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:{thread:${JSON.stringify(thread)}}})+'\\n')});\n`, { mode: 0o700 });
+  const threadFor = (text, status = "interrupted") => ({ id: "thread-a", turns: [{ id: "default-spawn-turn", status, items: [{ type: "userMessage", clientId: requestId, content: [{ type: "text", text }] }] }] });
+  writeReader(threadFor(expectedText));
   const observed = await observeNativeTurn({ codexBinary: binary, cwd: f.directory, threadId: "thread-a", requestId, expectedText, timeoutMs: 2000 });
-  assert.equal(observed.turnId, "default-spawn-turn"); assert.equal(observed.nonce, nonce);
+  assert.equal(observed.turnId, "default-spawn-turn"); assert.equal(observed.status, "interrupted"); assert.equal(observed.nonce, nonce);
+  const wrongNonceText = expectedText.replace(nonce, "d".repeat(64));
+  writeReader(threadFor(wrongNonceText));
+  await assert.rejects(observeNativeTurn({ codexBinary: binary, cwd: f.directory, threadId: "thread-a", requestId, expectedText, timeoutMs: 2000 }), /prompt did not match/);
 });
