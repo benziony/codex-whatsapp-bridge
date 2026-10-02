@@ -50,7 +50,8 @@ test("chat operation events require authenticated readback and confer no authori
   assert.match(prompt, /\/api\/capabilities.*latest Council policy/);
   assert.match(prompt, /typed Council runtime at \/opt\/council\/runtime\.mjs/);
   assert.match(prompt, /Never display, copy, or request credentials/);
-  assert.match(prompt, /Discover the current active conversations this principal is authorized to read/);
+  assert.match(prompt, /authenticated capabilities authorizedWorkspaces inventory.*every authorized workspace/);
+  assert.match(prompt, /each thread's workspace explicitly for its typed reads and replies/);
   assert.match(prompt, /each thread's full current history/);
   assert.match(prompt, /at most one initial catch-up per thread/);
   assert.match(prompt, /based on that thread's full current history/);
