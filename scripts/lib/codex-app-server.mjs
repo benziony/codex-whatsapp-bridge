@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 const RPC_TIMEOUT_MS = 20_000;
+const PROCESS_EXIT_TIMEOUT_MS = 5_000;
 const TURN_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_CAPTURED_TEXT = 48_000;
 const AMBIGUITY_WINDOW_MS = 2 * 60 * 1_000;
@@ -10,6 +11,7 @@ const MAX_BUFFERED_TURNS = 64;
 const MAX_BUFFERED_ITEMS = 256;
 const THREAD_LIST_PAGE_LIMIT = 100;
 const THREAD_LIST_MAX_PAGES = 3;
+const TERMINAL_TURN_STATUSES = new Set(["completed", "interrupted", "failed"]);
 const ALL_THREAD_SOURCE_KINDS = [
   "cli",
   "vscode",
@@ -331,6 +333,30 @@ class AppServerConnection {
     }
     this.pending.clear();
   }
+
+  async closeAndWait(timeoutMs = PROCESS_EXIT_TIMEOUT_MS) {
+    const child = this.child;
+    if (!child) throw new Error("Codex App Server process ownership could not be confirmed");
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise((resolve, reject) => {
+      let timer;
+      const cleanup = () => {
+        clearTimeout(timer);
+        child.removeListener("close", onClose);
+      };
+      const onClose = () => { cleanup(); resolve(); };
+      child.once("close", onClose);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("Codex App Server shutdown could not be confirmed"));
+      }, timeoutMs);
+      this.close();
+      if (child.exitCode !== null || child.signalCode !== null) {
+        cleanup();
+        resolve();
+      }
+    });
+  }
 }
 
 function threadStatus(thread) {
@@ -345,6 +371,49 @@ export function isActiveWriterRpcError(error, sessionId = null) {
   const message = String(error?.rpcError?.message ?? "");
   if (!/already has (?:an )?(?:active writer|live local writer)/i.test(message)) return false;
   return sessionId ? message.includes(String(sessionId)) : true;
+}
+
+export async function verifyCodexAppServerExecutionTerminal({
+  codexBinary,
+  cwd,
+  sessionId,
+  turnId,
+  spawnTask = spawn,
+  rpcTimeoutMs = RPC_TIMEOUT_MS,
+  processExitTimeoutMs = PROCESS_EXIT_TIMEOUT_MS,
+}) {
+  if (!codexBinary || !cwd || typeof sessionId !== "string" || !sessionId.trim() || sessionId.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(sessionId)
+    || typeof turnId !== "string" || !turnId.trim() || turnId.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(turnId)) {
+    throw new Error("Codex execution recovery identity is invalid");
+  }
+  const connection = await new AppServerConnection({ codexBinary, cwd, spawnTask, rpcTimeoutMs }).open();
+  try {
+    const readExactTurn = async () => {
+      const result = await connection.request("thread/read", { threadId: sessionId, includeTurns: true });
+      const thread = result?.thread;
+      if (!thread || thread.id !== sessionId || !Array.isArray(thread.turns)) throw new Error("The Codex execution identity could not be confirmed");
+      const matches = thread.turns.filter((turn) => turn?.id === turnId);
+      if (matches.length !== 1 || !TERMINAL_TURN_STATUSES.has(matches[0]?.status)) throw new Error("The exact Codex turn is missing, uncertain, or still active");
+      return matches[0].status;
+    };
+
+    const firstStatus = await readExactTurn();
+    let resumed;
+    try { resumed = await connection.request("thread/resume", { threadId: sessionId }); }
+    catch (error) {
+      if (isActiveWriterRpcError(error, sessionId)) throw new CodexActiveWriterError();
+      throw error;
+    }
+    const thread = resumed?.thread;
+    if (!thread || thread.id !== sessionId) throw new Error("The Codex execution identity changed while resuming");
+    if (threadStatus(thread) === "active") throw new CodexTaskBusyError();
+    if (threadStatus(thread) !== "idle") throw new Error("Codex writer availability could not be confirmed");
+    const confirmedStatus = await readExactTurn();
+    if (confirmedStatus !== firstStatus) throw new Error("The Codex turn status changed during recovery");
+    return { sessionId, turnId, turnStatus: confirmedStatus, threadStatus: "idle" };
+  } finally {
+    await connection.closeAndWait(processExitTimeoutMs);
+  }
 }
 
 export async function runCodexAppServerTurn({

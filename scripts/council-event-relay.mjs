@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { CodexTaskBusyError, runCodexAppServerTurn } from "./lib/codex-app-server.mjs";
+import { CodexActiveWriterError, CodexTaskBusyError, runCodexAppServerTurn, verifyCodexAppServerExecutionTerminal } from "./lib/codex-app-server.mjs";
 import { sendWhatsAppNotification, sendWhatsAppPoll } from "./lib/bridge-state.mjs";
 import { bridgePaths, codexBinaryPath, readConfig } from "./lib/runtime-config.mjs";
 import { isCurrentWhatsappPermit, readBearerCredential } from "./lib/council-approvals.mjs";
@@ -15,6 +15,7 @@ const MAX_RECONCILE_BYTES = 64 * 1024;
 const MAX_RECONCILE_PROMPT = 12 * 1024;
 const MAX_PENDING_EVENTS = 1024;
 const MAX_ACTIVE_DISPATCHES = 4;
+const DEFAULT_EXECUTION_RECOVERY_RETRY_MS = 30_000;
 const MAX_REGISTRY_BATCH_EVENTS = 32;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_SCOPE = /^[A-Za-z0-9_.*:/-]{1,128}$/;
@@ -550,10 +551,69 @@ async function reconcileCursor(options, cursor, config, turnRunner) {
   return { currentCursor, requestId };
 }
 
-export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, runtimeRenewalRunner = runRuntimeRenewal, nativeObserverFactory = createNativeObserver, observerCredentialLoader = loadObserverCredential, nativeObserverRequest, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
+export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, executionRecoveryRunner = verifyCodexAppServerExecutionTerminal, executionRecoveryRetryMs = DEFAULT_EXECUTION_RECOVERY_RETRY_MS, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, runtimeRenewalRunner = runRuntimeRenewal, nativeObserverFactory = createNativeObserver, observerCredentialLoader = loadObserverCredential, nativeObserverRequest, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
   const options = relayConfig(config);
   if (!options) throw new Error("Council push is not configured");
   let state = readState(options.statePath);
+  let inboxRecoveryDeferred = false;
+  let inboxRecoveryRetryTimer = null;
+  const deferInboxRecovery = (message) => {
+    inboxRecoveryDeferred = true;
+    try { errorLogger(message); } catch { /* logging must not interrupt the relay */ }
+  };
+  const recoverOrphanedInboxExecution = async () => {
+    const execution = state.inbox?.execution;
+    if (!execution || execution.stage !== "running" || (state.pending ?? []).some((item) => item.eventId === execution.eventId)) {
+      inboxRecoveryDeferred = false;
+      return;
+    }
+    if (typeof execution.eventId !== "string" || !SAFE_IDENTIFIER.test(execution.eventId)
+      || typeof execution.sessionId !== "string" || !execution.sessionId.trim()
+      || typeof execution.turnId !== "string" || !execution.turnId.trim()) {
+      deferInboxRecovery("Council inbox recovery deferred (incomplete turn identity); execution marker and queued pointers are retained.");
+      return;
+    }
+    let proof;
+    try {
+      proof = await executionRecoveryRunner({
+        codexBinary: codexBinaryPath(config), cwd: options.cwd,
+        sessionId: execution.sessionId, turnId: execution.turnId,
+      });
+    } catch (error) {
+      const reason = error instanceof CodexActiveWriterError ? "active writer" : error instanceof CodexTaskBusyError ? "active turn" : "native proof unavailable";
+      deferInboxRecovery(`Council inbox recovery deferred (${reason}); execution marker and queued pointers are retained.`);
+      return;
+    }
+    if (proof?.sessionId !== execution.sessionId || proof?.turnId !== execution.turnId
+      || !["completed", "interrupted", "failed"].includes(proof?.turnStatus) || proof?.threadStatus !== "idle") {
+      deferInboxRecovery("Council inbox recovery deferred (native identity or terminal status changed); execution marker and queued pointers are retained.");
+      return;
+    }
+    let latest;
+    try { latest = readState(options.statePath); }
+    catch {
+      deferInboxRecovery("Council inbox recovery deferred (durable state could not be rechecked); execution marker and queued pointers are retained.");
+      return;
+    }
+    const current = latest.inbox?.execution;
+    if (!current || JSON.stringify(current) !== JSON.stringify(execution) || (latest.pending ?? []).some((item) => item.eventId === execution.eventId)) {
+      state = latest;
+      deferInboxRecovery("Council inbox recovery deferred (execution changed during native readback); durable state is retained.");
+      return;
+    }
+    const recovered = { ...latest, inbox: { ...latest.inbox } };
+    delete recovered.inbox.execution;
+    try { writeState(options.statePath, recovered); }
+    catch {
+      state = latest;
+      deferInboxRecovery("Council inbox recovery deferred (durable marker could not be cleared); execution marker and queued pointers are retained.");
+      return;
+    }
+    state = recovered;
+    inboxRecoveryDeferred = false;
+    try { errorLogger("Council inbox recovery completed (exact terminal turn confirmed; no turn was replayed)."); } catch { /* logging must not interrupt the relay */ }
+  };
+  await recoverOrphanedInboxExecution();
   let backoff = 1_000;
   let pendingRetryMs = 1_000;
   let pendingRetryTimer = null;
@@ -652,6 +712,30 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       runScheduledDrain();
     });
   };
+  const scheduleInboxRecoveryRetry = () => {
+    if (signal.aborted || !inboxRecoveryDeferred || inboxRecoveryRetryTimer) return;
+    const delayMs = Number.isFinite(executionRecoveryRetryMs) && executionRecoveryRetryMs > 0
+      ? executionRecoveryRetryMs
+      : DEFAULT_EXECUTION_RECOVERY_RETRY_MS;
+    inboxRecoveryRetryTimer = setTimeout(async () => {
+      inboxRecoveryRetryTimer = null;
+      if (signal.aborted) return;
+      try {
+        state = readState(options.statePath);
+        await recoverOrphanedInboxExecution();
+      } catch {
+        deferInboxRecovery("Council inbox recovery deferred (durable state could not be reloaded); execution marker and queued pointers are retained.");
+      }
+      if (inboxRecoveryDeferred) scheduleInboxRecoveryRetry();
+      else schedulePendingDrain();
+    }, delayMs);
+    inboxRecoveryRetryTimer.unref?.();
+  };
+  if (inboxRecoveryDeferred) scheduleInboxRecoveryRetry();
+  signal.addEventListener("abort", () => {
+    if (inboxRecoveryRetryTimer) clearTimeout(inboxRecoveryRetryTimer);
+    inboxRecoveryRetryTimer = null;
+  }, { once: true });
   drainPending = () => {
     const blockedSlots = new Set();
     for (const queued of [...(state.pending ?? [])]) {
@@ -666,7 +750,7 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       const inbox = state.inbox ?? { sessionId: options.sessionId || null };
       const slot = exactJobId ? (state.jobs?.[exactJobId] ?? {}) : exactTaskId ? (state.tasks?.[exactTaskId] ?? {}) : inbox;
       const slotKey = exactJobId ? `job:${exactJobId}` : exactTaskId ? `task:${exactTaskId}` : "inbox";
-      if (blockedSlots.has(slotKey) || activeSlots.has(slotKey) || (slotKey === "inbox" && nativeObserver?.status().busy)) continue;
+      if (blockedSlots.has(slotKey) || activeSlots.has(slotKey) || (slotKey === "inbox" && inboxRecoveryDeferred && (slot.execution?.stage === "running" || (slot.execution && slot.execution.eventId !== event.eventId))) || (slotKey === "inbox" && nativeObserver?.status().busy)) continue;
       const activeExecution = slot.execution?.eventId === event.eventId ? slot.execution : null;
       let registryBatch = null;
       if (event.kind === "registry.announce") {
