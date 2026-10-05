@@ -22,6 +22,7 @@ import {
   runCodexAppServerTurn,
 } from "./lib/codex-app-server.mjs";
 import { parseJson, run } from "./lib/process.mjs";
+import { classifyRoutineTurn, fingerprintError, isDigestDue, localDateString, routineConfigFrom, sanitizeLabel, normalizeTrailing } from "./lib/routine-notifications.mjs";
 import {
   attachmentFingerprint,
   validateAttachmentRecords,
@@ -199,6 +200,70 @@ export function latestAssistantText(transcriptText) {
   return latest;
 }
 
+export function currentTranscriptPrompt(transcriptText) {
+  let last = null;
+  let readable = true;
+  let sawUser = false;
+  try {
+    for (const line of String(transcriptText ?? "").split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { readable = false; continue; }
+      const payload = record?.payload;
+      if (record?.type === "event_msg" && payload?.type === "task_started") { last = null; sawUser = false; }
+      let candidate = null;
+      if (record?.type === "response_item" && payload?.type === "message" && payload?.role === "user" && Array.isArray(payload?.content)) {
+        const parts = [];
+        for (const part of payload.content) {
+          if (part && typeof part === "object" && part.type === "input_text" && typeof part.text === "string") parts.push(part.text);
+          else if (part && typeof part === "object" && typeof part.text === "string" && (part.type === "text" || !part.type)) parts.push(part.text);
+        }
+        const joined = parts.join("");
+        if (joined.trim()) candidate = joined;
+      } else if (record?.type === "event_msg" && payload?.type === "user_message" && typeof payload?.message === "string" && payload.message.trim()) {
+        candidate = payload.message;
+      } else {
+        const role = payload?.role ?? record?.role;
+        const text = payload?.text ?? payload?.content ?? record?.text;
+        if ((record?.type === "user_message" || role === "user") && typeof text === "string" && text.trim()) candidate = text;
+      }
+      if (candidate !== null) { last = candidate; sawUser = true; }
+    }
+  } catch { return { prompt: null, readable: false }; }
+  if (!sawUser || last === null) return { prompt: null, readable: false };
+  if (!readable) return { prompt: null, readable: false };
+  return { prompt: last, readable: true };
+}
+
+export function routineErrorScope(task, originHost) {
+  const fam = String(task?.name ?? task?.initialTitle ?? task?.firstUserMessage ?? "automation").slice(0, 80);
+  return `${String(originHost ?? "gateway").toLowerCase()}::${fam}`;
+}
+export function routineFamilyHash(task, originHost, cwd) {
+  const host = String(originHost ?? "gateway").toLowerCase();
+  const name = String(task?.name ?? task?.initialTitle ?? task?.title ?? task?.firstUserMessage ?? "automation");
+  const proj = String(task?.projectName ?? task?.gitOriginUrl ?? "");
+  const dir = String(cwd ?? task?.cwd ?? "");
+  return createHash("sha256").update(host + "::" + name + "::" + proj + "::" + dir).digest("hex");
+}
+export function routineCandidateForTurn({ task, transcriptText, finalText, fingerprintInfo, originHost, cwd } = {}) {
+  const current = currentTranscriptPrompt(transcriptText);
+  const scope = routineErrorScope(task, originHost ?? hostId());
+  const fp = fingerprintError(String(finalText ?? ""), [], scope);
+  let famHash = null;
+  try { famHash = routineFamilyHash(task, originHost ?? hostId(), cwd ?? task?.cwd ?? ""); } catch { famHash = null; }
+  return {
+    threadSource: task?.threadSource ?? null,
+    firstUserMessage: task?.firstUserMessage ?? "",
+    currentPrompt: current.prompt,
+    promptReadable: current.readable,
+    finalText: String(finalText ?? ""),
+    fingerprint: fp,
+    ...(famHash ? { familySeed: famHash } : {}),
+    ...(fingerprintInfo ?? {}),
+  };
+}
+
 export function isInternalSuggestionsEnvelope(value) {
   const parsed = parseJson(String(value).trim());
   if (!parsed.ok || !parsed.value || typeof parsed.value !== "object" || Array.isArray(parsed.value)) return false;
@@ -282,6 +347,7 @@ export function turnFromStopPayload(payload, transcriptReader = readTail, sessio
     finalText,
     updates: visibleTurnUpdates(transcriptText, normalized.turnId),
     transcriptCwd: transcriptWorkingDirectory(transcriptText),
+    transcriptText,
   };
 }
 
@@ -394,8 +460,9 @@ export function formatWhatsAppTurn({ finalText, updates = [], project, thread, o
 
 export function readCodexTaskMetadata(sessionId, { database = codexDatabase, execute = run } = {}) {
   if (!validCodexSessionId(sessionId) || !fs.existsSync(database)) return null;
-  const query = `SELECT t.name, t.title AS initial_title, t.first_user_message, t.cwd, t.archived, t.git_origin_url, p.name AS project_name FROM threads t LEFT JOIN projects p ON p.id = t.project_id WHERE t.id = '${sessionId}' LIMIT 1;`;
-  const result = execute("/usr/bin/sqlite3", ["-json", database, query], { timeoutMs: 2_000 });
+  void 0;
+  const query = `SELECT t.name, t.title AS initial_title, t.first_user_message, t.cwd, t.archived, t.git_origin_url, t.thread_source, p.name AS project_name FROM threads t LEFT JOIN projects p ON p.id = t.project_id WHERE t.id = '${sessionId}' LIMIT 1;`;
+  const result = execute("/usr/bin/sqlite3", ["-readonly", "-json", database, query], { timeoutMs: 2_000 });
   if (!result?.ok) return null;
   const parsed = parseJson(result.stdout || "[]");
   const task = parsed.ok && Array.isArray(parsed.value) ? parsed.value[0] : null;
@@ -408,6 +475,7 @@ export function readCodexTaskMetadata(sessionId, { database = codexDatabase, exe
     archived: Number(task.archived) === 1,
     projectName: typeof task.project_name === "string" && task.project_name ? task.project_name : null,
     gitOriginUrl: typeof task.git_origin_url === "string" && task.git_origin_url ? task.git_origin_url : null,
+    threadSource: typeof task.thread_source === "string" ? task.thread_source : null,
   };
 }
 
@@ -505,12 +573,29 @@ async function stopHook(payload) {
       thread: taskLabelFromMetadata(task, turn.sessionId),
       originHost,
     });
+    let routine = null;
+    try {
+      const config = routineConfigFrom(runtimeConfig);
+      if (config.enabled) {
+        const candidate = routineCandidateForTurn({ task, transcriptText: turn.transcriptText ?? "", finalText: turn.finalText, originHost, cwd });
+        const verdict = classifyRoutineTurn(candidate);
+        const family = routineFamilyHash(task, originHost, cwd);
+        const label = sanitizeLabel(task?.name || task?.initialTitle || "Automation check");
+        if (verdict.defer || verdict.reason === "new-failure") {
+          routine = { kind: verdict.defer ? "healthy" : "failure", label, family, fingerprint: candidate.fingerprint };
+        } else if (candidate.threadSource === "automation" && candidate.promptReadable &&
+            normalizeTrailing(candidate.currentPrompt) === normalizeTrailing(candidate.firstUserMessage)) {
+          routine = { kind: "reset", family };
+        }
+      }
+    } catch { routine = null; }
     const result = broker("create", {
       originHost,
       sessionId: turn.sessionId,
       turnId: turn.turnId,
       finalText: formatted.finalMessage,
       ...(formatted.activityMessage ? { activityText: formatted.activityMessage } : {}),
+      ...(routine ? { routine } : {}),
     });
     recordStopHookStatus(result.notification?.status === "sent" ? "sent" : result.notification?.status ?? result.status);
   } catch { recordStopHookStatus("broker-error"); }
@@ -984,8 +1069,19 @@ async function deliver() {
   }
 }
 
+export function routineFlushIfDue({ nowMs = Date.now(), flush, config } = {}) {
+  const cfg = config ?? routineConfigFrom(runtimeConfig);
+  if (!cfg.enabled) return { status: "disabled" };
+  if (!isDigestDue(nowMs, cfg)) return { status: "not-due" };
+  const date = localDateString(nowMs, cfg.timeZone);
+  return flush({ date });
+}
+
 async function poll() {
   withStateLock((state) => pruneClientState(state));
+  try {
+    routineFlushIfDue({ flush: ({ date }) => broker("flush-routine", { date, host: hostId() }) });
+  } catch { /* digest flush retries on next poll */ }
   sweepMaterializedAttachments(localAttachmentRoot, Date.now(), Object.keys(readState().activeWriterDeliveries));
   launchDeliveryWorker();
 }

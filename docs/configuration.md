@@ -157,3 +157,33 @@ Setup also makes the exact dedicated group reachable under Hermes' normal
 group intake rules and exempts only that group from mention requirements. It
 preserves an existing open group policy and unions existing group/free-response
 lists.
+
+## Routine automation summaries
+
+Enable the same policy on each Codex client and the gateway broker:
+
+```json
+{
+  "codex": {
+    "routineNotifications": {
+      "mode": "daily",
+      "timeZone": "America/New_York",
+      "hour": 18
+    }
+  }
+}
+```
+
+Only turns recorded by Codex as automations, with the scheduled prompt still
+active, are eligible. Ordinary conversations, manual followups, WhatsApp
+responses, requests for input, substantive completions, new failures and
+ambiguous outcomes keep their immediate notifications. Eligible routine turns
+omit both progress and final notifications and contribute bounded metadata to
+one informational daily summary. Repeated unchanged failures may be grouped
+once their initial alert has been recorded.
+
+The existing client polling service flushes summaries; no extra Codex
+scheduled chat is needed. A summary contains counts and bounded labels/statuses,
+not transcripts or message bodies. Quotes of a summary cannot be used to resume
+a task; reply to an individual task update instead. Missing configuration or
+`"mode": "off"` keeps the original immediate delivery behavior.

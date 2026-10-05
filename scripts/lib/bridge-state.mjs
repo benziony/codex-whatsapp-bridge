@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { formatDigest, isDigestDue, localDateString, routineConfigFrom, sanitizeLabel } from "./routine-notifications.mjs";
 import {
   CodexAttachmentStore,
   validateAttachmentRecords,
@@ -90,7 +91,7 @@ function validateRoute(route) {
   time(route.createdAt, "stored createdAt", 0);
   time(route.expiresAt, "stored expiresAt", 0);
   if (!route.notification || typeof route.notification !== "object" || Array.isArray(route.notification)) throw new Error("Stored notification is invalid");
-  if (!new Set(["ready", "sending", "failed", "sent", "partial", "exhausted"]).has(route.notification.status)) throw new Error("Stored notification status is invalid");
+  if (!new Set(["ready", "sending", "failed", "sent", "partial", "exhausted", "uncertain"]).has(route.notification.status)) throw new Error("Stored notification status is invalid");
   if (!Number.isInteger(route.notification.attempts) || route.notification.attempts < 0 || route.notification.attempts > MAX_SEND_ATTEMPTS) throw new Error("Stored notification attempts are invalid");
   if (route.finalText !== undefined) text(route.finalText, "stored finalText", MAX_FINAL_LENGTH, true);
   if (route.activityText !== undefined) text(route.activityText, "stored activityText", MAX_ACTIVITY_LENGTH, true);
@@ -105,9 +106,30 @@ function validateRoute(route) {
     text(route.notification.deliveryId, "stored notification deliveryId", 64);
     time(route.notification.leaseExpiresAt, "stored notification lease", 0);
   }
-  if (new Set(["ready", "sending", "failed"]).has(route.notification.status) && route.finalText === undefined) throw new Error("Stored pending route is invalid");
+  if (new Set(["ready", "sending", "failed", "uncertain"]).has(route.notification.status) && route.finalText === undefined && route.digestIdentity === undefined) throw new Error("Stored pending route is invalid");
   if (new Set(["partial", "exhausted"]).has(route.notification.status) && (route.finalText !== undefined || route.activityText !== undefined)) throw new Error("Stored terminal route is invalid");
+  if (route.digestIdentity !== undefined || route.informational === true) {
+    if (route.informational !== true || !/^routine-digest-global-\d{4}-\d{2}-\d{2}$/.test(route.digestIdentity) ||
+        route.id !== route.digestIdentity || route.turnId !== route.id || route.id !== `routine-digest-global-${route.digestDate}` ||
+        route.sessionId !== `routine-${route.digestDate}` || !Array.isArray(route.digestItems) || route.digestItems.length > 100) throw new Error("Stored digest identity is invalid");
+    for (const item of route.digestItems) { text(item.label, "digest label", 120); text(item.status, "digest status", 64); if (!Number.isSafeInteger(item.count) || item.count < 1) throw new Error("Stored digest count is invalid"); }
+  }
   return route;
+}
+
+function validateRoutineEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("Stored routine entry is invalid");
+  text(entry.sessionId, "stored routine sessionId", 128);
+  text(entry.turnId, "stored routine turnId", 128);
+  host(entry.originHost);
+  text(entry.label, "stored routine label", 160);
+  text(entry.status, "stored routine status", 64);
+  if (entry.count !== undefined && (!Number.isSafeInteger(entry.count) || entry.count < 1)) throw new Error("Stored routine count is invalid");
+  time(entry.firstAt, "stored routine firstAt", 0);
+  time(entry.lastAt, "stored routine lastAt", 0);
+  storedDigest(entry.fingerprint, "routine fingerprint");
+  storedDigest(entry.turnHash, "routine turn hash");
+  return entry;
 }
 
 function validateReply(reply) {
@@ -181,9 +203,24 @@ function validateState(parsed) {
   }
   parsed.routes.forEach(validateRoute);
   parsed.replies.forEach(validateReply);
+  if (parsed.routineQueue !== undefined && !Array.isArray(parsed.routineQueue)) throw new Error("Stored routine queue is invalid");
+  (parsed.routineQueue ?? []).forEach(validateRoutineEntry);
+  if ((parsed.routineQueue ?? []).length > 50) throw new Error("Stored routine queue exceeds its limit");
+  for (const field of ["routineSeen", "routineFailures"]) {
+    if (parsed[field] !== undefined && (!parsed[field] || typeof parsed[field] !== "object" || Array.isArray(parsed[field]))) throw new Error("Stored routine metadata is invalid");
+    if (Object.keys(parsed[field] ?? {}).length > (field === "routineSeen" ? 10_000 : 1_000)) throw new Error("Stored routine metadata exceeds its limit");
+    for (const [key, value] of Object.entries(parsed[field] ?? {})) {
+      storedDigest(key, "routine metadata key");
+      if (field === "routineSeen") time(value, "routine identity time", 0);
+      else { storedDigest(value.fingerprint, "routine failure fingerprint"); text(value.routeId, "routine failure route", 64); time(value.updatedAt, "routine failure time", 0); }
+    }
+  }
   if (parsed.replies.some((reply) => reply.sequence >= parsed.nextSequence)) throw new Error("Stored reply sequence cursor is invalid");
   if (new Set(parsed.routes.map((route) => route.id)).size !== parsed.routes.length) throw new Error("Stored route IDs are invalid");
   if (new Set(parsed.replies.map((reply) => reply.inboundMessageDigest)).size !== parsed.replies.length) throw new Error("Stored inbound message digests are invalid");
+  parsed.routineQueue ??= [];
+  parsed.routineSeen ??= {};
+  parsed.routineFailures ??= {};
   const routeIds = new Set(parsed.routes.map((route) => route.id));
   if (parsed.replies.some((reply) => reply.kind === "quoted" && !routeIds.has(reply.routeId))) throw new Error("Stored reply route is invalid");
   return parsed;
@@ -200,7 +237,7 @@ export class CodexApprovalStore {
 
   load() {
     if (!fs.existsSync(this.filePath)) {
-      return { schemaVersion: SCHEMA_VERSION, routes: [], replies: [], nextSequence: 1 };
+      return { schemaVersion: SCHEMA_VERSION, routes: [], replies: [], nextSequence: 1, routineQueue: [] };
     }
     return validateState(JSON.parse(fs.readFileSync(this.filePath, "utf8")));
   }
@@ -268,7 +305,17 @@ export class CodexApprovalStore {
   }
 }
 
+function pruneRoutine(state, now) {
+  state.routineQueue ??= [];
+  state.routineSeen ??= {};
+  state.routineFailures ??= {};
+  const cutoff = now - ROUTE_TTL_MS;
+  for (const [key, at] of Object.entries(state.routineSeen)) if (at < cutoff) delete state.routineSeen[key];
+  for (const [key, record] of Object.entries(state.routineFailures)) if (record.updatedAt < cutoff) delete state.routineFailures[key];
+}
+
 function prune(state, now) {
+  pruneRoutine(state, now);
   const removedAttachments = [];
   const live = new Set(state.routes.filter((route) => route.expiresAt > now).map((route) => route.id));
   state.routes = state.routes.filter((route) => live.has(route.id));
@@ -290,6 +337,7 @@ function routeSummary(route) {
     expiresAt: route.expiresAt,
     notificationStatus: route.notification.status,
     messageCount: route.messageDigests?.length ?? 0,
+    ...(route.informational ? { informational: true } : {}),
   };
 }
 
@@ -377,8 +425,14 @@ function receiptTarget(chatId, senderId, messageId) {
   };
 }
 
+function localDay(ms) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+  } catch { return new Date(ms).toISOString().slice(0, 10); }
+}
+
 export class CodexWhatsAppBroker {
-  constructor({ statePath, allowedSenders = [], allowedChats = [], notificationTarget = null, taskInboxTarget = null, attachmentStorePath = null, attachmentSourceRoots = [], now = () => Date.now(), claimLeaseMs = CLAIM_LEASE_MS, store = null, attachmentStore = null }) {
+  constructor({ statePath, allowedSenders = [], allowedChats = [], notificationTarget = null, taskInboxTarget = null, attachmentStorePath = null, attachmentSourceRoots = [], now = () => Date.now(), claimLeaseMs = CLAIM_LEASE_MS, store = null, attachmentStore = null, routinePolicy = null }) {
     this.store = store ?? new CodexApprovalStore(statePath);
     const resolvedAttachmentStorePath = attachmentStorePath ?? path.join(path.dirname(statePath), "attachments");
     this.attachmentStore = attachmentStore ?? new CodexAttachmentStore(resolvedAttachmentStorePath, attachmentSourceRoots);
@@ -392,6 +446,9 @@ export class CodexWhatsAppBroker {
     } else this.taskInboxTarget = null;
     this.now = now;
     this.claimLeaseMs = claimLeaseMs;
+    this.routinePolicy = routineConfigFrom({ codex: { routineNotifications: {
+      mode: routinePolicy?.enabled ? "daily" : "off", timeZone: routinePolicy?.timeZone, hour: routinePolicy?.hour,
+    } } });
   }
 
   transact(now, callback) {
@@ -418,27 +475,127 @@ export class CodexWhatsAppBroker {
       ? null
       : text(input.activityText, "activityText", MAX_ACTIVITY_LENGTH, true);
     const createdAt = time(input?.createdAt, "createdAt", now);
+    const raw = input?.routine;
+    const validHash = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+    const candidate = this.routinePolicy.enabled && raw && validHash(raw.family) &&
+      new Set(["healthy", "failure", "reset"]).has(raw.kind) &&
+      (raw.kind === "reset" || validHash(raw.fingerprint)) ? raw : null;
+    const family = candidate ? digest(JSON.stringify([originHost, candidate.family])) : null;
+    const turnHash = digest(JSON.stringify([originHost, sessionId, turnId]));
     return this.transact(now, (state) => {
       const existing = state.routes.find((route) => route.originHost === originHost && route.sessionId === sessionId && route.turnId === turnId);
       if (existing) {
         const notificationDeliveryId = reserve(existing, now);
-        return {
-          ok: true,
-          status: existing.notification.status,
-          created: false,
-          route: routeSummary(existing),
-          ...(notificationDeliveryId ? { notificationDeliveryId, notification: outboundNotification(existing, this.notificationTarget) } : {}),
-        };
+        return { ok: true, status: existing.notification.status, created: false, route: routeSummary(existing),
+          ...(notificationDeliveryId ? { notificationDeliveryId, notification: outboundNotification(existing, this.notificationTarget) } : {}) };
       }
-      const route = {
-        id: crypto.randomUUID(), originHost, sessionId, turnId, finalText,
-        ...(activityText ? { activityText } : {}),
-        createdAt, expiresAt: createdAt + ROUTE_TTL_MS,
-        notification: { status: "ready", attempts: 0 },
-      };
+      if (state.routineSeen[turnHash]) return { ok: true, status: "routine-queued", created: false, dedup: true };
+      if (candidate) {
+        const label = sanitizeLabel(candidate.label, "Automation check");
+        const queueOne = () => {
+          const grouped = state.routineQueue.find((entry) => entry.label === label && entry.kind === candidate.kind && entry.fingerprint === candidate.fingerprint);
+          if ((!grouped && state.routineQueue.length >= 50) || Object.keys(state.routineSeen).length >= 10_000 || (grouped && grouped.count >= 1_000_000_000)) return null;
+          state.routineSeen[turnHash] = now;
+          if (grouped) { grouped.count += 1; grouped.lastAt = now; }
+          else state.routineQueue.push({ originHost, sessionId, turnId, turnHash, label, kind: candidate.kind,
+            status: candidate.kind === "failure" ? "repeat blocked" : "no change", fingerprint: candidate.fingerprint,
+            count: 1, firstAt: now, lastAt: now });
+          return { ok: true, status: "routine-queued", created: !grouped };
+        };
+        if (candidate.kind === "healthy" || candidate.kind === "reset") delete state.routineFailures[family];
+        const previous = state.routineFailures[family];
+        const priorRoute = previous && state.routes.find((route) => route.id === previous.routeId);
+        const delivered = priorRoute && ["sent", "partial"].includes(priorRoute.notification.status) && priorRoute.messageDigests?.length > 0;
+        if (candidate.kind === "healthy" || (candidate.kind === "failure" && delivered && previous.fingerprint === candidate.fingerprint)) {
+          const queued = queueOne();
+          if (queued) return queued;
+        }
+      }
+      const route = { id: crypto.randomUUID(), originHost, sessionId, turnId, finalText,
+        ...(activityText ? { activityText } : {}), createdAt, expiresAt: createdAt + ROUTE_TTL_MS,
+        notification: { status: "ready", attempts: 0 } };
       const notificationDeliveryId = reserve(route, now);
       state.routes.push(route);
-      return { ok: true, status: "sending", created: true, route: routeSummary(route), notificationDeliveryId, notification: outboundNotification(route, this.notificationTarget) };
+      if (candidate?.kind === "failure") {
+        state.routineFailures[family] = { fingerprint: candidate.fingerprint, routeId: route.id, updatedAt: now };
+        const keys = Object.keys(state.routineFailures).sort((a, b) => state.routineFailures[b].updatedAt - state.routineFailures[a].updatedAt);
+        for (const key of keys.slice(1_000)) delete state.routineFailures[key];
+      }
+      return { ok: true, status: "sending", created: true, route: routeSummary(route), notificationDeliveryId,
+        notification: outboundNotification(route, this.notificationTarget) };
+    });
+  }
+
+  beginNotificationDelivery(input = {}) {
+    const now = this.now();
+    return this.transact(now, (state) => {
+      const route = state.routes.find((item) => item.id === input.routeId);
+      if (!route || route.notification.status !== "sending" || route.notification.deliveryId !== input.notificationDeliveryId ||
+          route.notification.leaseExpiresAt <= now || route.notification.sendIntent) throw new Error("Notification lease is stale or already started");
+      route.notification.sendIntent = true;
+      return { ok: true, status: "send-intent", route: routeSummary(route) };
+    });
+  }
+
+  flushRoutineDigest() {
+    const now = this.now();
+    if (!this.routinePolicy.enabled) return { ok: true, status: "disabled" };
+    const date = localDateString(now, this.routinePolicy.timeZone);
+    const identity = `routine-digest-global-${date}`;
+    return this.transact(now, (state) => {
+      const existing = state.routes.find((route) => route.id === identity);
+      if (existing) {
+        if (existing.notification.status === "sending" && existing.notification.leaseExpiresAt <= now) {
+          if (existing.notification.sendIntent) {
+            existing.notification = { status: "uncertain", uncertainAt: now, attempts: existing.notification.attempts };
+            delete existing.finalText;
+            return { ok: true, status: "uncertain", identity };
+          }
+          existing.notification = { status: "ready", attempts: Math.max(0, existing.notification.attempts - 1) };
+        }
+        const retryable = existing.notification.status === "ready" ||
+          (existing.notification.status === "failed" && existing.notification.failedAt + RETRY_DELAY_MS <= now);
+        const deliveryId = retryable ? reserve(existing, now) : null;
+        return { ok: true, status: existing.notification.status, identity,
+          ...(deliveryId ? { route: routeSummary(existing), notificationDeliveryId: deliveryId,
+            notification: outboundNotification(existing, this.notificationTarget) } : {}) };
+      }
+      if (!isDigestDue(now, this.routinePolicy)) return { ok: true, status: "not-due", identity };
+      const carries = state.routes.filter((route) => route.digestIdentity && route.digestDate < date && !route.carriedTo &&
+        !["sent", "partial"].includes(route.notification.status));
+      const items = state.routineQueue.map((entry) => ({ label: entry.label, status: entry.status, count: entry.count }));
+      for (const previous of carries) {
+        const unconfirmed = previous.notification.status === "uncertain" ||
+          (previous.notification.status === "sending" && previous.notification.sendIntent);
+        items.push(...previous.digestItems.map((entry) => ({ ...entry, status: unconfirmed ? "delivery unconfirmed" : entry.status })));
+      }
+      if (!items.length) return { ok: true, status: "empty", identity };
+      // Keep a bounded snapshot without dropping overflow counts.
+      const groups = new Map();
+      for (const item of items) {
+        const key = JSON.stringify([item.label, item.status]);
+        if (groups.has(key)) groups.get(key).count += item.count;
+        else if (groups.size < 99) groups.set(key, { ...item });
+        else {
+          const overflow = groups.get("overflow") ?? { label: "Additional routine checks", status: "earlier checks", count: 0 };
+          overflow.count += item.count; groups.set("overflow", overflow);
+        }
+      }
+      const snapshot = [...groups.values()];
+      const finalText = formatDigest({ date, items: snapshot });
+      const route = { id: identity, originHost: "gateway", sessionId: `routine-${date}`, turnId: identity,
+        finalText, digestItems: snapshot, createdAt: now, expiresAt: now + ROUTE_TTL_MS,
+        informational: true, digestDate: date, digestIdentity: identity, notification: { status: "ready", attempts: 0 } };
+      const deliveryId = reserve(route, now);
+      state.routes.push(route);
+      state.routineQueue = [];
+      for (const previous of carries) {
+        previous.carriedTo = identity;
+        previous.notification = { status: "exhausted", exhaustedAt: now, attempts: previous.notification.attempts };
+        delete previous.finalText;
+      }
+      return { ok: true, status: "sending", identity, route: routeSummary(route), notificationDeliveryId: deliveryId,
+        notification: outboundNotification(route, this.notificationTarget) };
     });
   }
 
@@ -447,13 +604,13 @@ export class CodexWhatsAppBroker {
     const originHost = optional(input.originHost, "originHost", 128)?.toLowerCase() ?? null;
     return this.transact(now, (state) => {
       for (const item of state.routes) {
-        if (item.finalText && item.notification.status === "sending" && item.notification.leaseExpiresAt <= now) {
+        if (!item.digestIdentity && item.finalText && item.notification.status === "sending" && item.notification.leaseExpiresAt <= now) {
           item.notification = { status: "exhausted", exhaustedAt: now, attempts: item.notification.attempts };
           delete item.finalText;
           delete item.activityText;
         }
       }
-      const route = state.routes.filter((item) => item.finalText && (!originHost || item.originHost === originHost) && item.notification.status === "failed" && item.notification.attempts < MAX_SEND_ATTEMPTS && item.notification.failedAt + RETRY_DELAY_MS <= now).sort((a, b) => a.createdAt - b.createdAt)[0];
+      const route = state.routes.filter((item) => !item.digestIdentity && item.finalText && (!originHost || item.originHost === originHost) && item.notification.status === "failed" && item.notification.attempts < MAX_SEND_ATTEMPTS && item.notification.failedAt + RETRY_DELAY_MS <= now).sort((a, b) => a.createdAt - b.createdAt)[0];
       if (!route) return { ok: true, status: "empty" };
       const notificationDeliveryId = reserve(route, now);
       return notificationDeliveryId ? { ok: true, status: "sending", route: routeSummary(route), notificationDeliveryId, notification: outboundNotification(route, this.notificationTarget) } : { ok: true, status: "empty" };
@@ -472,6 +629,10 @@ export class CodexWhatsAppBroker {
       if (activityMessageIds.length > 0) {
         route.messageDigests = [...new Set([...(route.messageDigests ?? []), ...activityMessageIds.map(digest)])];
         delete route.activityText;
+      }
+      if (route.digestIdentity && input?.sent !== true && input?.uncertain === true) {
+        route.notification = { status: "uncertain", uncertainAt: now, attempts: route.notification.attempts };
+        return { ok: false, status: "notification-uncertain", route: routeSummary(route) };
       }
       if (input?.sent === true && messageIds.length > 0) {
         route.messageDigests = [...new Set([...(route.messageDigests ?? []), ...messageIds.map(digest)])];
@@ -508,6 +669,8 @@ export class CodexWhatsAppBroker {
     const admission = this.transact(now, (state) => {
       const duplicate = state.replies.find((reply) => reply.inboundMessageDigest === inboundMessageDigest);
       if (duplicate) return { result: { ok: true, status: "duplicate", reply: replySummary(duplicate), acknowledgement: "That reply was already queued for Codex." } };
+      const digestRoutes = state.routes.filter((route) => route.digestIdentity && (route.id === route.digestIdentity) && route.messageDigests?.includes(quotedDigest));
+      if (digestRoutes.length) return { result: { ok: false, status: "digest-quote-rejected", acknowledgement: "That reply quoted the daily digest. Send a fresh message describing the task instead." } };
       const candidates = state.routes.filter((route) => route.messageDigests?.includes(quotedDigest));
       if (candidates.length !== 1) return { result: { ok: true, status: "stale", acknowledgement: "That quoted Codex turn is unknown or expired. Reply in Codex instead." } };
       return { routeId: candidates[0].id };
