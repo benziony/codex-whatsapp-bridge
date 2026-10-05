@@ -103,7 +103,8 @@ test('real SQLite and native transcript hook path defers routine but keeps unkno
 test('real Stop hook suppresses only a confirmed repeated error, then sends changed error',async t=>{
  const f=await pipeline(t);await f.hook('BLOCKED E_SERVICE: disk full','t1');assert.equal(f.calls.length,1);
  await f.hook('BLOCKED E_SERVICE: disk full','t2');assert.equal(f.calls.length,1);
- await f.hook('BLOCKED E_SERVICE: certificate invalid','t3');assert.equal(f.calls.length,2);
+ await f.hook('BLOCKED E_SERVICE: disk full\nE_DATABASE: backup corrupt','t3');assert.equal(f.calls.length,2);
+ await f.hook('BLOCKED E_SERVICE: certificate invalid','t4');assert.equal(f.calls.length,3);
 });
 test('real broker CLI serializes flushes, rejects digest quotes and preserves definite send failure for retry',async t=>{
  const f=await pipeline(t);await f.hook('All checks passed.');f.setDelay(100);

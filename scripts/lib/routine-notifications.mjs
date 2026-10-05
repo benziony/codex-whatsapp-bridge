@@ -38,21 +38,9 @@ const FAILURE = /\b(blocked|failed|failure|error|exception)\b/i;
 const WORK_COMPLETION = /\b(shipped|deployed|merged|published|fixed|resolved|implemented)\b/i;
 
 export function fingerprintError(finalText, knownCodes = [], scope = "") {
-  const body = String(finalText ?? "");
-  const scoped = (s) => crypto.createHash("sha256").update(`${scope}::${s}`).digest("hex");
-  for (const code of knownCodes) {
-    if (code && body.includes(String(code))) {
-      const line = body.split("\n").find((l) => l.includes(String(code))) ?? String(code);
-      return scoped(`code:${code}|line:${line.trim()}`);
-    }
-  }
-  const m = body.match(/\b([A-Z]+_[A-Z_0-9]+|E[A-Z0-9_]+)\b/);
-  if (m) {
-    const line = body.split("\n").find((l) => l.includes(m[1])) ?? m[1];
-    return scoped(`code:${m[1]}|line:${line.trim()}`);
-  }
-  const errLine = body.split("\n").map((l) => l.trim()).filter(Boolean).find((l) => /(blocked|failed|failure|error\b|exception)/i.test(l)) ?? body;
-  return scoped(`text:${errLine}`);
+  // Any changed outcome remains actionable, including new errors after a familiar one.
+  const body = normalizeTrailing(finalText).replace(/\r\n/g, "\n");
+  return crypto.createHash("sha256").update(`${scope}::${body}`).digest("hex");
 }
 
 export function sanitizeLabel(value, fallback = "routine check") {
