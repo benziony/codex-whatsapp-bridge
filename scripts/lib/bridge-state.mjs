@@ -505,7 +505,7 @@ export class CodexWhatsAppBroker {
         if (candidate.kind === "healthy" || candidate.kind === "reset") delete state.routineFailures[family];
         const previous = state.routineFailures[family];
         const priorRoute = previous && state.routes.find((route) => route.id === previous.routeId);
-        const delivered = priorRoute && ["sent", "partial"].includes(priorRoute.notification.status) && priorRoute.messageDigests?.length > 0;
+        const delivered = priorRoute && priorRoute.notification.status === "sent" && priorRoute.messageDigests?.length > 0;
         if (candidate.kind === "healthy" || (candidate.kind === "failure" && delivered && previous.fingerprint === candidate.fingerprint)) {
           const queued = queueOne();
           if (queued) return queued;

@@ -78,7 +78,9 @@ test('gateway clock owns 18:00 and one global digest; late checks wait for next 
 test('only a matching delivered failure can group; changed failures and failed alerts stay immediate',t=>{
  const f=fixture(t);const b=f.broker;const first=b.create(input('a','failure','E_SERVICE: disk full'));assert.ok(first.notification);
  b.finishNotification({routeId:first.route.id,notificationDeliveryId:first.notificationDeliveryId,sent:false});
- assert.ok(b.create(input('b','failure','E_SERVICE: disk full')).notification);
+ const partial=b.create(input('b','failure','E_SERVICE: disk full'));assert.ok(partial.notification);
+ b.finishNotification({routeId:partial.route.id,notificationDeliveryId:partial.notificationDeliveryId,sent:true,partial:true,messageIds:['WA.partial']});
+ assert.ok(b.create(input('partial-retry','failure','E_SERVICE: disk full')).notification);
  const delivered=b.create(input('c','failure','E_SERVICE: disk full'));b.finishNotification({routeId:delivered.route.id,notificationDeliveryId:delivered.notificationDeliveryId,sent:true,messageIds:['WA.1']});
  assert.equal(b.create(input('d','failure','E_SERVICE: disk full')).notification,undefined);
  assert.ok(b.create(input('e','failure','E_SERVICE: certificate invalid')).notification);
