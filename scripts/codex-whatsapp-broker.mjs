@@ -7,6 +7,7 @@ import {
 } from "./lib/bridge-state.mjs";
 import { processCouncilApproval, processCouncilPollVote, recoverCouncilApproval } from "./lib/council-approvals.mjs";
 import { bridgePaths, readConfig } from "./lib/runtime-config.mjs";
+import { routineConfigFrom } from "./lib/routine-notifications.mjs";
 
 async function readStandardInput() {
   let body = "";
@@ -49,7 +50,9 @@ function brokerFromEnvironment() {
   const allowedUsers = split(
     process.env.CODEX_WHATSAPP_ALLOWED_SENDERS ?? config.whatsapp?.allowedSenders,
   );
+  const routinePolicy = routineConfigFrom(config);
   const broker = new CodexWhatsAppBroker({
+    routinePolicy,
     statePath,
     allowedSenders: allowedUsers,
     allowedChats: [
@@ -70,11 +73,12 @@ function brokerFromEnvironment() {
 }
 
 async function execute(broker, command, payload, bridgeUrl) {
-  if (command === "create" || command === "retry-notification") {
+  if (command === "create" || command === "retry-notification" || command === "flush-routine") {
     let result =
-      command === "create" ? broker.create(payload) : broker.retryNotification(payload);
+      command === "create" ? broker.create(payload) : command === "flush-routine" ? broker.flushRoutineDigest() : broker.retryNotification(payload);
     if (command === "retry-notification" && !result.notification) result = broker.retryFailureNotification(payload);
     if (!result.notification) return result;
+    if (result.route?.informational) broker.beginNotificationDelivery({ routeId: result.route.id, notificationDeliveryId: result.notificationDeliveryId });
     let sent = false;
     let messageIds = [];
     let partial = false;
@@ -103,6 +107,7 @@ async function execute(broker, command, payload, bridgeUrl) {
     if (!sent) result.status = recorded.status;
     return result;
   }
+  if (command === "begin-notification-delivery") return broker.beginNotificationDelivery(payload);
   if (command === "ingest") return broker.ingest(payload);
   if (command === "ingest-new-task") return broker.ingestNewTask(payload);
   if (command === "council-approval") {

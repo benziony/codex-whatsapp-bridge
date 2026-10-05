@@ -86,7 +86,7 @@ test("Codex task admission calls the broker once with the exact claimed delivery
 
 test("Stop payload prefers the exact final assistant message", () => {
   const result = turnFromStopPayload({ session_id: sessionId, turn_id: "turn-1", transcript_path: "/unused", last_assistant_message: " Final **markdown**\nline two.\n" }, () => { throw new Error("transcript race"); });
-  assert.deepEqual(result, { status: "ready", sessionId, turnId: "turn-1", finalText: " Final **markdown**\nline two.\n", updates: [], transcriptCwd: null });
+  assert.deepEqual(result, { status: "ready", sessionId, turnId: "turn-1", finalText: " Final **markdown**\nline two.\n", updates: [], transcriptCwd: null, transcriptText: "" });
 });
 
 test("only visible commentary from the completed turn becomes the WhatsApp work log", () => {
@@ -202,10 +202,10 @@ test("task metadata is read exactly and read-only from the host-local Codex data
       return { ok: true, stdout: JSON.stringify([{ name: "Existing task", initial_title: "original", first_user_message: "original", cwd: "/Users/operator/Documents/Codex", archived: 0, git_origin_url: null, project_name: "Codex" }]) };
     },
   });
-  assert.deepEqual(task, { name: "Existing task", initialTitle: "original", firstUserMessage: "original", cwd: "/Users/operator/Documents/Codex", archived: false, projectName: "Codex", gitOriginUrl: null });
+  assert.deepEqual(task, { name: "Existing task", initialTitle: "original", firstUserMessage: "original", cwd: "/Users/operator/Documents/Codex", archived: false, projectName: "Codex", gitOriginUrl: null, threadSource: null });
   assert.equal(calls[0].command, "/usr/bin/sqlite3");
-  assert.deepEqual(calls[0].args.slice(0, 2), ["-json", database]);
-  assert.match(calls[0].args[2], new RegExp(sessionId));
+  assert.deepEqual(calls[0].args.slice(0, 3), ["-readonly", "-json", database]);
+  assert.match(calls[0].args[3], new RegExp(sessionId));
   assert.equal(readCodexTaskMetadata("invalid", { database, execute: () => { throw new Error("must not execute"); } }), null);
 });
 

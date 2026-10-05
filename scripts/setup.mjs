@@ -340,6 +340,7 @@ async function main() {
         ...(codexHome ? { home: codexHome } : {}),
         defaultCwd,
         mirrorProgress: /^y(es)?$/i.test(progressAnswer),
+        ...(existing?.codex?.routineNotifications ? { routineNotifications: existing.codex.routineNotifications } : {}),
         ...(existing?.codex?.statePath ? { statePath: existing.codex.statePath } : {}),
         ...(existing?.codex?.attachmentPath ? { attachmentPath: existing.codex.attachmentPath } : {}),
       },
