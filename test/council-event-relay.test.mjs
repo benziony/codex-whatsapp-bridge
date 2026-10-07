@@ -2186,8 +2186,8 @@ test("410 recovery refuses a blocked active-job cursor before native execution",
   globalThis.fetch = async () => {
     fetches += 1;
     return new Response(JSON.stringify({ latestCursor: 9, replayFloor: 5, pendingProposals: [], activeJobs: [], inboxRefs: [],
-      pendingProposalTotal: 0, pendingProposalsHasMore: false, activeJobTotal: 1, activeJobsHasMore: false,
-      inboxTotal: 0, inboxHasMore: false, nextCursors: { inboxSince: 0, proposalAfter: null, jobAfter: "job_7" },
+      pendingProposalTotal: 0, pendingProposalsHasMore: false, activeJobTotal: 1, activeJobsHasMore: true,
+      inboxTotal: 0, inboxHasMore: false, nextCursors: { inboxSince: 0, proposalAfter: null, jobAfter: null },
       jobCursorBlocked: true, jobCursorBlockedCaseId: "case_7" }), { status: 200 });
   };
   try {
