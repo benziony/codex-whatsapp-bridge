@@ -13,11 +13,14 @@ const MAX_REPLAY_EVENTS = 1000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
 const MAX_RECONCILE_BYTES = 64 * 1024;
 const MAX_RECONCILE_PROMPT = 12 * 1024;
+const MAX_RECONCILE_INBOX_REFS = 50;
 const MAX_PENDING_EVENTS = 1024;
 const MAX_ACTIVE_DISPATCHES = 4;
 const DEFAULT_EXECUTION_RECOVERY_RETRY_MS = 30_000;
+const RELAY_HEALTH_INTERVAL_MS = 30_000;
 const MAX_REGISTRY_BATCH_EVENTS = 32;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SAFE_RECONCILE_JOB_ID = /^[A-Za-z0-9_.:-]{1,1024}$/;
 const SAFE_SCOPE = /^[A-Za-z0-9_.*:/-]{1,128}$/;
 const SAFE_CASE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const SAFE_DIGEST = /^[a-f0-9]{64}$/i;
@@ -78,7 +81,7 @@ function relayConfig(config) {
   if (renewalEnabled && (!runtimePath || (!credentialFile && !tokenEnv))) return null;
   const renewalStatePath = value.renewalStatePath == null ? `${statePath}.renewal.json` : String(value.renewalStatePath).trim();
   if (!path.isAbsolute(renewalStatePath)) return null;
-  return { councilUrl, credentialFile, tokenEnv, sessionId, cwd, workspace, runtimePath, statePath, renewalEnabled, renewalStatePath };
+  return { councilUrl, credentialFile, tokenEnv, sessionId, cwd, workspace, runtimePath, statePath, healthPath: `${statePath}.health.json`, renewalEnabled, renewalStatePath };
 }
 
 export function runtimeRenewalCommand(options) {
@@ -120,14 +123,41 @@ async function runRuntimeRenewal(command, { signal, spawnImpl = spawn } = {}) {
 
 function readState(filePath) {
   if (!fs.existsSync(filePath)) return { schemaVersion: 1, cursor: 0, notified: [] };
-  const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  let value = JSON.parse(fs.readFileSync(filePath, "utf8"));
   if (!value || value.schemaVersion !== 1 || !Number.isSafeInteger(value.cursor) || value.cursor < 0 || (value.notified !== undefined && (!Array.isArray(value.notified) || value.notified.some((id) => typeof id !== "string"))) ||
       (value.skippedNativeControls !== undefined && (!Array.isArray(value.skippedNativeControls) || value.skippedNativeControls.length > 64 || value.skippedNativeControls.some((item) =>
         !item || typeof item !== "object" || typeof item.eventId !== "string" || !SAFE_IDENTIFIER.test(item.eventId) || typeof item.challengeId !== "string" || !SAFE_IDENTIFIER.test(item.challengeId) || !Number.isSafeInteger(item.seq) || item.seq < 1 ||
         item.reason !== "observer-disabled" || !Number.isFinite(Date.parse(item.at)))))) throw new Error("Council relay state is invalid");
   if (value.pending !== undefined && (!Array.isArray(value.pending) || value.pending.length > MAX_PENDING_EVENTS || value.pending.some((item) => !validPendingPointer(item)))) throw new Error("Council relay pending queue is invalid");
   if (!validFrozenRegistryBatch(value.inbox, value.pending ?? [])) throw new Error("Council relay state is invalid");
+  if (value.reconcileCheckpoint !== undefined && !validLegacyReconcileCheckpoint(value.reconcileCheckpoint)) throw new Error("Council relay reconciliation checkpoint is invalid");
+  if (value.reconcile !== undefined && !validReconcileMarker(value.reconcile, value.cursor)) {
+    if (!validLegacyReconcileCheckpoint(value.reconcile)) throw new Error("Council relay reconciliation state is invalid");
+    value = { ...value, reconcileCheckpoint: value.reconcile };
+    delete value.reconcile;
+  }
   return value;
+}
+
+function validLegacyReconcileCheckpoint(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const allowed = new Set(["fromCursor", "currentCursor", "status", "reviewedAt", "visibleEventsReviewed", "historicalJobOffersPreserved", "unackedInboxPreserved", "nonRecipientEventAt405", "requestId"]);
+  if (Object.keys(value).some((key) => !allowed.has(key))
+    || !Number.isSafeInteger(value.fromCursor) || value.fromCursor < 0
+    || !Number.isSafeInteger(value.currentCursor) || value.currentCursor < 0
+    || typeof value.status !== "string" || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value.status)
+    || (value.reviewedAt !== undefined && (typeof value.reviewedAt !== "string" || !Number.isFinite(Date.parse(value.reviewedAt))))
+    || (value.visibleEventsReviewed !== undefined && !Number.isSafeInteger(value.visibleEventsReviewed) && typeof value.visibleEventsReviewed !== "boolean")
+    || (value.visibleEventsReviewed !== undefined && Number.isSafeInteger(value.visibleEventsReviewed) && value.visibleEventsReviewed < 0)
+    || (value.historicalJobOffersPreserved !== undefined && typeof value.historicalJobOffersPreserved !== "boolean"
+      && !Number.isSafeInteger(value.historicalJobOffersPreserved))
+    || (Number.isSafeInteger(value.historicalJobOffersPreserved) && value.historicalJobOffersPreserved < 0)
+    || (value.unackedInboxPreserved !== undefined && typeof value.unackedInboxPreserved !== "boolean")
+    || (value.nonRecipientEventAt405 !== undefined && !(typeof value.nonRecipientEventAt405 === "boolean"
+      || (Number.isSafeInteger(value.nonRecipientEventAt405) && value.nonRecipientEventAt405 >= 0)
+      || (typeof value.nonRecipientEventAt405 === "string" && /^[\x20-\x7E]{1,64}$/.test(value.nonRecipientEventAt405))))
+    || (value.requestId !== undefined && (typeof value.requestId !== "string" || !SAFE_IDENTIFIER.test(value.requestId)))) return false;
+  try { return JSON.stringify(value).length <= 2048; } catch { return false; }
 }
 
 function validPendingPointer(value) {
@@ -196,16 +226,28 @@ function validFrozenRegistryBatch(inbox, pending) {
 }
 
 function writeState(filePath, state) {
+  if (state.reconcile !== undefined && !validReconcileMarker(state.reconcile, state.cursor)) throw new Error("Council relay reconciliation state is invalid");
+  if (state.reconcileCheckpoint !== undefined && !validLegacyReconcileCheckpoint(state.reconcileCheckpoint)) throw new Error("Council relay reconciliation checkpoint is invalid");
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   fs.chmodSync(path.dirname(filePath), 0o700);
   const temporary = `${filePath}.${process.pid}.tmp`;
   const persisted = { schemaVersion: 1, cursor: state.cursor, notified: (state.notified ?? []).slice(-256), ...(state.reconcile ? { reconcile: state.reconcile } : {}),
+    ...(state.reconcileCheckpoint ? { reconcileCheckpoint: state.reconcileCheckpoint } : {}),
     ...(state.skippedNativeControls ? { skippedNativeControls: state.skippedNativeControls.slice(-64) } : {}) };
   if (state.inbox) persisted.inbox = state.inbox;
   if (state.jobs && Object.keys(state.jobs).length) persisted.jobs = state.jobs;
   if (state.tasks && Object.keys(state.tasks).length) persisted.tasks = state.tasks;
   if (state.pending?.length) persisted.pending = state.pending;
   fs.writeFileSync(temporary, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, filePath);
+  fs.chmodSync(filePath, 0o600);
+}
+
+function writeRelayHealth(filePath, health) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.dirname(filePath), 0o700);
+  const temporary = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(health)}\n`, { mode: 0o600 });
   fs.renameSync(temporary, filePath);
   fs.chmodSync(filePath, 0o600);
 }
@@ -481,6 +523,46 @@ function safeReconcileSnapshot(snapshot) {
   if (!Number.isSafeInteger(snapshot.replayFloor) || snapshot.replayFloor < 0 || !Array.isArray(snapshot.pendingProposals) || !Array.isArray(snapshot.activeJobs) || !Array.isArray(snapshot.inboxRefs)) throw new Error("Council reconciliation snapshot is invalid");
   const status = new Set(["open", "pending", "running", "completed", "failed", "cancelled", "approved", "rejected"]);
   const text = (value, pattern = SAFE_IDENTIFIER) => typeof value === "string" && pattern.test(value) ? value : undefined;
+  const pageMetadata = (totalName, moreName, page) => {
+    if ((snapshot[totalName] === undefined) !== (snapshot[moreName] === undefined)) throw new Error("Council reconciliation snapshot is invalid");
+    if (snapshot[totalName] === undefined) return {};
+    const total = snapshot[totalName];
+    const hasMore = snapshot[moreName];
+    if (!Number.isSafeInteger(total) || total < page.length || typeof hasMore !== "boolean" || hasMore !== (total > page.length)) {
+      throw new Error("Council reconciliation snapshot is invalid");
+    }
+    return { [totalName]: total, [moreName]: hasMore };
+  };
+  const pageFields = {
+    ...pageMetadata("pendingProposalTotal", "pendingProposalsHasMore", snapshot.pendingProposals),
+    ...pageMetadata("activeJobTotal", "activeJobsHasMore", snapshot.activeJobs),
+    ...pageMetadata("inboxTotal", "inboxHasMore", snapshot.inboxRefs),
+  };
+  if (snapshot.jobCursorBlocked !== undefined && typeof snapshot.jobCursorBlocked !== "boolean") throw new Error("Council reconciliation snapshot is invalid");
+  if (snapshot.jobCursorBlockedCaseId !== undefined && (typeof snapshot.jobCursorBlockedCaseId !== "string" || !SAFE_CASE_ID.test(snapshot.jobCursorBlockedCaseId))) throw new Error("Council reconciliation snapshot is invalid");
+  if (snapshot.jobCursorBlockedCaseId !== undefined && snapshot.jobCursorBlocked !== true) throw new Error("Council reconciliation snapshot is invalid");
+  const blockedJob = snapshot.jobCursorBlocked === true ? {
+    jobCursorBlocked: true,
+    ...(snapshot.jobCursorBlockedCaseId ? { jobCursorBlockedCaseId: snapshot.jobCursorBlockedCaseId } : {}),
+  } : {};
+  let nextCursors;
+  if (snapshot.nextCursors !== undefined) {
+    const value = snapshot.nextCursors;
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).some((key) => !["inboxSince", "proposalAfter", "jobAfter"].includes(key))) throw new Error("Council reconciliation snapshot is invalid");
+    if (value.inboxSince !== undefined && (!Number.isSafeInteger(value.inboxSince) || value.inboxSince < 0)) throw new Error("Council reconciliation snapshot is invalid");
+    if (value.proposalAfter !== undefined && value.proposalAfter !== null) {
+      const proposalCursor = typeof value.proposalAfter === "string" ? /^([A-Za-z0-9][A-Za-z0-9_-]{0,63}):([1-9][0-9]*)$/.exec(value.proposalAfter) : null;
+      if (!proposalCursor || !Number.isSafeInteger(Number(proposalCursor[2]))) throw new Error("Council reconciliation snapshot is invalid");
+    }
+    if (value.jobAfter !== undefined && value.jobAfter !== null && (typeof value.jobAfter !== "string" || !SAFE_RECONCILE_JOB_ID.test(value.jobAfter))) throw new Error("Council reconciliation snapshot is invalid");
+    nextCursors = {
+      ...(value.inboxSince !== undefined ? { inboxSince: value.inboxSince } : {}),
+      ...(value.proposalAfter !== undefined ? { proposalAfter: value.proposalAfter } : {}),
+      ...(value.jobAfter !== undefined ? { jobAfter: value.jobAfter } : {}),
+    };
+    if (Object.keys(nextCursors).length !== 3) throw new Error("Council reconciliation snapshot is invalid");
+  }
   const list = (name, mapper, limit = 100) => {
     if (snapshot[name] === undefined) return undefined;
     if (!Array.isArray(snapshot[name]) || snapshot[name].length > limit) throw new Error("Council reconciliation snapshot is invalid");
@@ -500,61 +582,183 @@ function safeReconcileSnapshot(snapshot) {
       return result;
     }),
     activeJobs: list("activeJobs", (item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Council reconciliation snapshot is invalid");
-      const result = {};
-      for (const key of ["id", "caseId", "executor", "verifier"]) { const value = text(item[key], key === "caseId" ? SAFE_CASE_ID : SAFE_IDENTIFIER); if (value) result[key] = value; }
+      if (!item || typeof item !== "object" || Array.isArray(item)
+        || typeof item.id !== "string" || !SAFE_RECONCILE_JOB_ID.test(item.id)) throw new Error("Council reconciliation snapshot is invalid");
+      const result = { id: item.id };
+      for (const key of ["caseId", "executor", "verifier"]) { const value = text(item[key], key === "caseId" ? SAFE_CASE_ID : SAFE_IDENTIFIER); if (value) result[key] = value; }
       if (status.has(item.status)) result.status = item.status;
       if (Number.isSafeInteger(item.approvalRev) && item.approvalRev > 0) result.approvalRev = item.approvalRev;
+      if (item.scopeOmitted !== undefined && typeof item.scopeOmitted !== "boolean") throw new Error("Council reconciliation snapshot is invalid");
+      if (item.scopeOmitted === true) result.scopeOmitted = true;
+      if (item.scope !== undefined) {
+        if (typeof item.scope !== "string" || !SAFE_SCOPE.test(item.scope)) throw new Error("Council reconciliation snapshot is invalid");
+        result.scope = item.scope;
+      }
       return result;
     }),
     inboxRefs: list("inboxRefs", (item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("Council reconciliation snapshot is invalid");
-      const result = {};
-      if (Number.isSafeInteger(item.seq) && item.seq > 0) result.seq = item.seq;
-      if (typeof item.op === "string" && SAFE_EVENT_KINDS.has(item.op)) result.op = item.op;
-      const caseId = text(item.caseId, SAFE_CASE_ID); if (caseId) result.caseId = caseId;
-      return result;
-    }, 200),
+      if (!item || typeof item !== "object" || Array.isArray(item)
+        || !Number.isSafeInteger(item.seq) || item.seq < 1
+        || typeof item.kind !== "string" || !SAFE_IDENTIFIER.test(item.kind)
+        || typeof item.ref !== "string" || !SAFE_RECONCILE_JOB_ID.test(item.ref)) throw new Error("Council reconciliation snapshot is invalid");
+      return { seq: item.seq, kind: item.kind, ref: item.ref };
+    }, MAX_RECONCILE_INBOX_REFS),
   };
-  const compact = { replayFloor: snapshot.replayFloor, ...Object.fromEntries(Object.entries(safe).filter(([, value]) => value !== undefined)) };
+  const compact = { replayFloor: snapshot.replayFloor,
+    ...pageFields,
+    ...blockedJob,
+    ...(nextCursors ? { nextCursors } : {}),
+    ...Object.fromEntries(Object.entries(safe).filter(([, value]) => value !== undefined)) };
   if (JSON.stringify(compact).length > MAX_RECONCILE_PROMPT) throw new Error("Council reconciliation snapshot is too large");
   return compact;
 }
 
-function reconciliationPrompt(fromCursor, currentCursor, snapshot, workspace) {
+function validReconcileMarker(marker, cursor) {
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)
+    || Object.keys(marker).some((key) => !["fromCursor", "currentCursor", "requestId", "snapshot", "execution"].includes(key))
+    || !Number.isSafeInteger(marker.fromCursor) || marker.fromCursor > cursor
+    || !Number.isSafeInteger(marker.currentCursor) || marker.currentCursor < marker.fromCursor
+    || typeof marker.requestId !== "string" || !/^council-reconcile:[a-f0-9]{48}$/.test(marker.requestId)) return false;
+  let sanitized;
+  try { sanitized = safeReconcileSnapshot(marker.snapshot); } catch { return false; }
+  if (JSON.stringify(sanitized) !== JSON.stringify(marker.snapshot)) return false;
+  const execution = marker.execution;
+  if (execution === undefined) return true;
+  if (!execution || typeof execution !== "object" || Array.isArray(execution)
+    || Object.keys(execution).some((key) => !["stage", "threadSource", "uncertainUntil", "sessionId", "turnId"].includes(key))
+    || !["prepared", "thread-creating", "thread-ready", "turn-starting", "turn-start-uncertain", "running"].includes(execution.stage)) return false;
+  if (execution.threadSource !== undefined && (typeof execution.threadSource !== "string" || !/^whatsapp:council-reconcile:[a-f0-9]{48}$/.test(execution.threadSource))) return false;
+  if (execution.uncertainUntil !== undefined && (typeof execution.uncertainUntil !== "string" || !Number.isFinite(Date.parse(execution.uncertainUntil)))) return false;
+  if (execution.sessionId !== undefined && (typeof execution.sessionId !== "string" || !SAFE_IDENTIFIER.test(execution.sessionId))) return false;
+  if (execution.turnId !== undefined && (typeof execution.turnId !== "string" || !SAFE_IDENTIFIER.test(execution.turnId))) return false;
+  if (execution.stage === "thread-creating") return Boolean(execution.threadSource && execution.uncertainUntil && !execution.sessionId && !execution.turnId);
+  if (["thread-ready", "turn-starting", "turn-start-uncertain"].includes(execution.stage)) return Boolean(execution.sessionId && (execution.stage === "thread-ready" || execution.uncertainUntil));
+  if (execution.stage === "running") return Boolean(execution.sessionId && execution.turnId);
+  return execution.stage === "prepared" && !execution.threadSource && !execution.sessionId && !execution.turnId && !execution.uncertainUntil;
+}
+
+function reconciliationPrompt(fromCursor, currentCursor, snapshot, workspace, runtimePath = "") {
   const prompt = [
     "Agent Council event replay recovery is required.",
     `The durable event cursor ${fromCursor} is older than the server replay window; the current server cursor is ${currentCursor}. Workspace: ${workspace}.`,
-    "Use this bounded redacted snapshot only to reconcile state. Re-read Council before acting, do not infer approval or execution authority, and do not disclose credentials or private artifacts.",
+    `${runtimePath ? `Use the configured typed Council runtime at ${runtimePath}.` : "Use the configured typed Council runtime."} Its workspace must be ${workspace}.`,
+    "Use this bounded redacted snapshot only as a starting point. Use the configured typed runtime's authenticated `reconcile` command with the returned `nextCursors` (`--inbox-since`, `--proposal-after`, `--job-after`) and repeat pages until every total/hasMore pair is exhausted. If any active job has `scopeOmitted:true`, reread that exact job record from the authoritative runtime before any scope-dependent action. Then separately page the durable inbox with `poll --limit 5` and continue with `--since <last-seq>`; reconcile cursors do not acknowledge inbox items. Do not acknowledge an item before its exact handling and readback complete; leave unresolved items durably unacknowledged and retryable. Read the full current history of any referenced threads before replying. Deduplicate replies against posted history and read back any write before treating it as complete. Never claim, execute, or replay historical jobs, infer approval or execution authority, or disclose credentials or private artifacts.",
     `Snapshot: ${JSON.stringify(snapshot)}`,
   ].join("\n");
   if (prompt.length > MAX_RECONCILE_PROMPT) throw new Error("Council reconciliation prompt is too large");
   return prompt;
 }
 
-async function reconcileCursor(options, cursor, config, turnRunner) {
-  const token = readBearerCredential({ credentialFile: options.credentialFile, tokenEnv: options.tokenEnv });
-  const url = new URL(`${options.councilUrl}/api/events/reconcile`);
-  url.searchParams.set("since", String(cursor));
-  url.searchParams.set("workspace", options.workspace);
-  const response = await fetch(url, { redirect: "error", headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
-  if (!response.ok) throw new Error(`Council reconciliation failed (${response.status})`);
-  const body = await response.text();
-  if (body.length > MAX_RECONCILE_BYTES) throw new Error("Council reconciliation response is too large");
-  let data;
-  try { data = JSON.parse(body); } catch { throw new Error("Council reconciliation response is invalid"); }
-  const currentCursor = Number(data?.latestCursor);
-  if (!Number.isSafeInteger(currentCursor) || currentCursor < cursor) throw new Error("Council reconciliation cursor is invalid");
-  const snapshot = safeReconcileSnapshot(data);
-  const requestId = `council-reconcile:${createHash("sha256").update(`${options.workspace}:${cursor}:${currentCursor}`).digest("hex").slice(0, 48)}`;
-  await turnRunner({ codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt: reconciliationPrompt(cursor, currentCursor, snapshot, options.workspace), requestId, sessionId: null, title: "Agent Council replay recovery", turnTimeoutMs: 15 * 60 * 1000 });
-  return { currentCursor, requestId };
+async function reconcileCursor(options, cursor, config, turnRunner, onMarker = () => {}) {
+  let persisted = readState(options.statePath);
+  let marker = persisted.reconcile;
+  if (marker) {
+    if (persisted.cursor !== cursor || marker.fromCursor !== cursor) throw new Error("Council reconciliation cursor changed during recovery");
+  } else {
+    const token = readBearerCredential({ credentialFile: options.credentialFile, tokenEnv: options.tokenEnv });
+    const url = new URL(`${options.councilUrl}/api/events/reconcile`);
+    url.searchParams.set("since", String(cursor));
+    url.searchParams.set("workspace", options.workspace);
+    const response = await fetch(url, { redirect: "error", headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
+    if (!response.ok) throw new Error(`Council reconciliation failed (${response.status})`);
+    const body = await response.text();
+    if (body.length > MAX_RECONCILE_BYTES) throw new Error("Council reconciliation response is too large");
+    let data;
+    try { data = JSON.parse(body); } catch { throw new Error("Council reconciliation response is invalid"); }
+    const currentCursor = Number(data?.latestCursor);
+    if (!Number.isSafeInteger(currentCursor) || currentCursor < cursor) throw new Error("Council reconciliation cursor is invalid");
+    const snapshot = safeReconcileSnapshot(data);
+    if (snapshot.jobCursorBlocked === true) {
+      const pointer = snapshot.jobCursorBlockedCaseId ? ` Re-read case ${snapshot.jobCursorBlockedCaseId} and its exact active job through the authenticated runtime before retrying.` : " Re-read the exact blocked active job through the authenticated runtime before retrying.";
+      throw new Error(`Council reconciliation is blocked by an active job whose cursor cannot advance.${pointer}`);
+    }
+    const requestId = `council-reconcile:${createHash("sha256").update(`${options.workspace}:${cursor}:${currentCursor}`).digest("hex").slice(0, 48)}`;
+    marker = { fromCursor: cursor, currentCursor, requestId, snapshot, execution: { stage: "prepared" } };
+    persisted = readState(options.statePath);
+    if (persisted.cursor !== cursor || persisted.reconcile) throw new Error("Council reconciliation state changed before recovery");
+    writeState(options.statePath, { ...persisted, reconcile: marker });
+    onMarker(marker);
+  }
+  onMarker(marker);
+  const saveExecution = (execution) => {
+    const latest = readState(options.statePath);
+    if (latest.cursor < marker.fromCursor || !latest.reconcile || latest.reconcile.requestId !== marker.requestId
+      || latest.reconcile.currentCursor !== marker.currentCursor) throw new Error("Council reconciliation identity changed during recovery");
+    const nextMarker = { ...marker, execution };
+    writeState(options.statePath, { ...latest, reconcile: nextMarker });
+    marker = nextMarker;
+    onMarker(marker);
+  };
+  const execution = marker.execution ?? { stage: "prepared" };
+  try { await turnRunner({
+    codexBinary: codexBinaryPath(config), cwd: options.cwd,
+    prompt: reconciliationPrompt(marker.fromCursor, marker.currentCursor, marker.snapshot, options.workspace, options.runtimePath),
+    requestId: marker.requestId,
+    sessionId: (execution.sessionId ?? options.sessionId) || null,
+    execution,
+    title: "Agent Council replay recovery",
+    turnTimeoutMs: 15 * 60 * 1000,
+    onThreadCreating: ({ threadSource, uncertainUntil }) => saveExecution({ stage: "thread-creating", threadSource, uncertainUntil }),
+    onThreadReady: ({ sessionId, threadSource }) => {
+      const source = threadSource ?? execution.threadSource;
+      saveExecution({ stage: "thread-ready", sessionId, ...(source ? { threadSource: source } : {}) });
+    },
+    onTurnStarting: ({ sessionId, uncertainUntil }) => saveExecution({ stage: "turn-starting", sessionId, uncertainUntil }),
+    onTurnStarted: ({ sessionId, turnId }) => saveExecution({ stage: "running", sessionId, turnId }),
+  }); } catch (error) {
+    const previous = marker.execution ?? execution;
+    if (error instanceof CodexTaskBusyError && error.turnStartRejected === true) {
+      if (previous.sessionId) saveExecution({ stage: "thread-ready", sessionId: previous.sessionId,
+        ...(previous.threadSource ? { threadSource: previous.threadSource } : {}) });
+      else saveExecution({ stage: "prepared" });
+    } else if (error?.rpcError && previous.stage === "thread-creating") {
+      saveExecution({ stage: "prepared" });
+    } else if (error?.rpcError && previous.stage === "turn-starting" && previous.sessionId) {
+      saveExecution({ stage: "thread-ready", sessionId: previous.sessionId,
+        ...(previous.threadSource ? { threadSource: previous.threadSource } : {}) });
+    }
+    throw error;
+  }
+  return { currentCursor: marker.currentCursor, requestId: marker.requestId };
 }
 
 export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, executionRecoveryRunner = verifyCodexAppServerExecutionTerminal, executionRecoveryRetryMs = DEFAULT_EXECUTION_RECOVERY_RETRY_MS, reconcileRunner = reconcileCursor, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, runtimeRenewalRunner = runRuntimeRenewal, nativeObserverFactory = createNativeObserver, observerCredentialLoader = loadObserverCredential, nativeObserverRequest, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
   const options = relayConfig(config);
   if (!options) throw new Error("Council push is not configured");
   let state = readState(options.statePath);
+  let previousHealth = {};
+  try {
+    const candidate = JSON.parse(fs.readFileSync(options.healthPath, "utf8"));
+    if (candidate?.schemaVersion === 1) previousHealth = candidate;
+  } catch { /* first run or an unreadable old status file */ }
+  const validTimestamp = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
+  const processStartedAt = new Date().toISOString();
+  let health = {
+    schemaVersion: 1,
+    processStartedAt,
+    heartbeatAt: processStartedAt,
+    streamState: "disconnected",
+    streamDisconnectedAt: processStartedAt,
+    ...(validTimestamp(previousHealth.lastConnectedAt) ? { lastConnectedAt: previousHealth.lastConnectedAt } : {}),
+    ...(validTimestamp(previousHealth.lastRecoverySuccessAt) ? { lastRecoverySuccessAt: previousHealth.lastRecoverySuccessAt } : {}),
+    ...(previousHealth.lastAdmission && validTimestamp(previousHealth.lastAdmission.at)
+      && Number.isSafeInteger(previousHealth.lastAdmission.seq) && previousHealth.lastAdmission.seq > 0
+      && typeof previousHealth.lastAdmission.eventId === "string" && SAFE_IDENTIFIER.test(previousHealth.lastAdmission.eventId)
+      && typeof previousHealth.lastAdmission.sessionId === "string" && SAFE_IDENTIFIER.test(previousHealth.lastAdmission.sessionId)
+      && typeof previousHealth.lastAdmission.turnId === "string" && SAFE_IDENTIFIER.test(previousHealth.lastAdmission.turnId)
+      ? { lastAdmission: { at: previousHealth.lastAdmission.at, seq: previousHealth.lastAdmission.seq, eventId: previousHealth.lastAdmission.eventId,
+        sessionId: previousHealth.lastAdmission.sessionId, turnId: previousHealth.lastAdmission.turnId } } : {}),
+  };
+  const updateHealth = (patch = {}) => {
+    health = { ...health, ...patch, heartbeatAt: new Date().toISOString() };
+    try { writeRelayHealth(options.healthPath, health); }
+    catch { try { errorLogger("Council relay health metadata could not be written."); } catch { /* health reporting must not interrupt delivery */ } }
+  };
+  const markDisconnected = () => updateHealth(health.streamState === "disconnected"
+    ? {} : { streamState: "disconnected", streamDisconnectedAt: new Date().toISOString() });
+  updateHealth();
+  const healthTimer = setInterval(() => updateHealth(), RELAY_HEALTH_INTERVAL_MS);
+  healthTimer.unref?.();
   let inboxRecoveryDeferred = false;
   let inboxRecoveryRetryTimer = null;
   const deferInboxRecovery = (message) => {
@@ -808,6 +1012,10 @@ export async function runRelay(config, { signal = new AbortController().signal, 
         const current = exactJobId ? (state.jobs?.[exactJobId] ?? {}) : exactTaskId ? (state.tasks?.[exactTaskId] ?? {}) : (state.inbox ?? { sessionId: options.sessionId || null });
         saveSlot({ ...(current.execution ?? {}), stage: "running", ...(turn.turnId ? { turnId: turn.turnId } : {}), ...(turn.sessionId ?? current.sessionId ? { sessionId: turn.sessionId ?? current.sessionId } : {}) }, true);
         admitted = true;
+        if (typeof turn.sessionId === "string" && SAFE_IDENTIFIER.test(turn.sessionId)
+          && typeof turn.turnId === "string" && SAFE_IDENTIFIER.test(turn.turnId)) {
+          updateHealth({ lastAdmission: { at: new Date().toISOString(), seq: event.seq, eventId: event.eventId, sessionId: turn.sessionId, turnId: turn.turnId } });
+        }
         pendingRetryMs = 1_000;
         // Admission removes the queued pointer, but the app-server process and
         // turn remain live until completion. Keep this slot counted until then.
@@ -867,10 +1075,39 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       // start other independent slots without waiting on Codex admission.
     }
   };
+  const runReconciliation = async () => {
+    const recovery = await reconcileRunner(options, state.cursor, config, turnRunner, (marker) => {
+      state = { ...state, reconcile: marker };
+    });
+    if (!recovery || !Number.isSafeInteger(recovery.currentCursor) || recovery.currentCursor < 0
+      || typeof recovery.requestId !== "string" || !SAFE_IDENTIFIER.test(recovery.requestId)) throw new Error("Council reconciliation result is invalid");
+    const latest = readState(options.statePath);
+    if (latest.reconcile && (latest.reconcile.fromCursor > latest.cursor || latest.reconcile.requestId !== recovery.requestId
+      || latest.reconcile.currentCursor !== recovery.currentCursor)) throw new Error("Council reconciliation identity changed before cursor commit");
+    const recoveredState = { ...latest, cursor: Math.max(latest.cursor, recovery.currentCursor), reconcile: undefined };
+    writeState(options.statePath, recoveredState);
+    state = recoveredState;
+    updateHealth({ lastRecoverySuccessAt: new Date().toISOString() });
+  };
   while (!signal.aborted) {
+    if (state.reconcile) {
+      try {
+        await runReconciliation();
+        backoff = 1_000;
+        continue;
+      } catch (recoveryError) {
+        if (signal.aborted) break;
+        try { state = readState(options.statePath); } catch { /* retain the in-memory recovery marker */ }
+        try { errorLogger(relayErrorSummary(recoveryError, state.cursor, backoff)); } catch { /* logging must not interrupt retry */ }
+        await sleep(backoff);
+        backoff = Math.min(MAX_BACKOFF_MS, backoff * 2);
+        continue;
+      }
+    }
     try {
       schedulePendingDrain();
       const response = await streamOpener(options, state.cursor, signal);
+      updateHealth({ streamState: "connected", lastConnectedAt: new Date().toISOString() });
       for await (const record of sseEvents(response, signal)) {
         if (signal.aborted) break;
         if (record.type !== "council.event" && record.type !== "council" && record.type !== "message") continue;
@@ -994,17 +1231,28 @@ export async function runRelay(config, { signal = new AbortController().signal, 
     } catch (error) {
       if (signal.aborted) break;
       if (error?.code === "COUNCIL_CURSOR_TOO_OLD") {
-        const recovery = await reconcileRunner(options, state.cursor, config, turnRunner);
-        state = { ...state, cursor: recovery.currentCursor, reconcile: { fromCursor: state.cursor, currentCursor: recovery.currentCursor, requestId: recovery.requestId, status: "completed" } };
-        writeState(options.statePath, state);
-        backoff = 1_000;
-        continue;
+        markDisconnected();
+        try {
+          await runReconciliation();
+          backoff = 1_000;
+          continue;
+        } catch (recoveryError) {
+          if (signal.aborted) break;
+          try { state = readState(options.statePath); } catch { /* retain the in-memory recovery marker */ }
+          try { errorLogger(relayErrorSummary(recoveryError, state.cursor, backoff)); } catch { /* logging must not interrupt retry */ }
+          await sleep(backoff);
+          backoff = Math.min(MAX_BACKOFF_MS, backoff * 2);
+          continue;
+        }
       }
+      markDisconnected();
       errorLogger(relayErrorSummary(error, state.cursor, backoff));
       await sleep(backoff);
       backoff = Math.min(MAX_BACKOFF_MS, backoff * 2);
     }
   }
+  clearInterval(healthTimer);
+  markDisconnected();
   if (renewalTimer) clearInterval(renewalTimer);
   if (observerTimer) clearInterval(observerTimer);
   return { ok: true, cursor: state.cursor };
