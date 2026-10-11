@@ -1628,6 +1628,37 @@ test("relay preserves exponential backoff until an event is processed and logs b
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
+test("relay reconnects graceful stream EOFs quickly and preserves exponential backoff for real failures", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-stream-eof-reconnect-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 61, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  const cursors = [], sleeps = [], logs = [];
+  let opened = 0, turns = 0;
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async (_options, cursor) => {
+      cursors.push(cursor);
+      opened += 1;
+      if (opened <= 3) return new Response("");
+      throw new Error(`temporary stream failure ${opened}`);
+    },
+    turnRunner: async () => { turns += 1; assert.fail("empty or failed streams must not start a model turn"); },
+    sleep: async (ms) => { sleeps.push(ms); if (sleeps.length === 5) controller.abort(); },
+    errorLogger: (line) => { logs.push(JSON.parse(line)); },
+  });
+  assert.deepEqual(cursors, [61, 61, 61, 61, 61], "reconnect must use the unchanged durable cursor");
+  assert.deepEqual(sleeps, [1000, 1000, 1000, 1000, 2000], "graceful EOFs stay fixed while genuine errors back off exponentially");
+  assert.deepEqual(logs.map((item) => item.retryMs), [1000, 2000], "only genuine stream failures are logged");
+  assert.equal(turns, 0);
+  assert.equal(readState(statePath).cursor, 61);
+  assert.deepEqual(readState(statePath).pending ?? [], []);
+});
+
 test("relay wakes one configured task, writes a private cursor after durable admission, and uses stable event request id", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-relay-"));
   const credentialFile = path.join(directory, "codex-token");
