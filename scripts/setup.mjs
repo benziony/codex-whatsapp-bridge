@@ -7,7 +7,7 @@ import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { codexHomePath, configPath, readConfig } from "./lib/runtime-config.mjs";
-import { launchAgentPlist } from "./lib/launch-agent.mjs";
+import { installLaunchAgent, launchAgentPlist } from "./lib/launch-agent.mjs";
 import { isBridgeHookCommand, makeTreeOwnerWritable, removeBridgeHooks } from "./lib/setup-files.mjs";
 
 const apply = process.argv.includes("--apply");
@@ -132,18 +132,6 @@ function mergeHooks(current, hookCommand) {
 
 function plist(options, codexHome = "") {
   return launchAgentPlist({ ...options, workingDirectory: root, home, codexHome, configPath: targetConfig, nodeBinary: process.execPath });
-}
-
-function installPlist(label, content, snapshot) {
-  const target = path.join(home, "Library", "LaunchAgents", `${label}.plist`);
-  snapshot(target);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, content, { mode: 0o600 });
-  const domain = `gui/${process.getuid()}`;
-  command("/bin/launchctl", ["bootout", `${domain}/${label}`]);
-  const loaded = command("/bin/launchctl", ["bootstrap", domain, target]);
-  if (loaded.status !== 0) throw new Error(loaded.stderr || `Could not load ${label}`);
-  return target;
 }
 
 async function main() {
@@ -451,34 +439,31 @@ async function main() {
           const legacyCurrent = JSON.parse(fs.readFileSync(legacyHooks, "utf8"));
           secureJson(legacyHooks, removeBridgeHooks(legacyCurrent));
         }
-        touchedServices.push("com.codex-whatsapp-bridge.client");
-        installPlist("com.codex-whatsapp-bridge.client", plist({
+        installLaunchAgent({ label: "com.codex-whatsapp-bridge.client", target: path.join(home, "Library", "LaunchAgents", "com.codex-whatsapp-bridge.client.plist"), domain: `gui/${process.getuid()}`, snapshot, touchedServices, command, content: plist({
           label: "com.codex-whatsapp-bridge.client",
           args: [process.execPath, path.join(root, "scripts", "codex-whatsapp-client.mjs"), "poll"],
           interval: 5,
           stdout: path.join(logs, "client.log"),
           stderr: path.join(logs, "client.error.log"),
-        }, codexHome), snapshot);
+        }, codexHome) });
         if (councilPushEnabled) {
-          touchedServices.push("com.codex-whatsapp-bridge.council-events");
-          installPlist("com.codex-whatsapp-bridge.council-events", plist({
+          installLaunchAgent({ label: "com.codex-whatsapp-bridge.council-events", target: path.join(home, "Library", "LaunchAgents", "com.codex-whatsapp-bridge.council-events.plist"), domain: `gui/${process.getuid()}`, snapshot, touchedServices, command, content: plist({
             label: "com.codex-whatsapp-bridge.council-events",
             args: [process.execPath, path.join(root, "scripts", "council-event-relay.mjs"), "run"],
             keepAlive: true,
             stdout: path.join(logs, "council-events.log"),
             stderr: path.join(logs, "council-events.error.log"),
-          }, codexHome), snapshot);
+          }, codexHome) });
         }
       }
       if (isGateway) {
-        touchedServices.push("com.codex-whatsapp-bridge.updates");
-        installPlist("com.codex-whatsapp-bridge.updates", plist({
+        installLaunchAgent({ label: "com.codex-whatsapp-bridge.updates", target: path.join(home, "Library", "LaunchAgents", "com.codex-whatsapp-bridge.updates.plist"), domain: `gui/${process.getuid()}`, snapshot, touchedServices, command, content: plist({
           label: "com.codex-whatsapp-bridge.updates",
           args: [process.execPath, path.join(root, "scripts", "update-check.mjs")],
           interval: 7 * 24 * 60 * 60,
           stdout: path.join(logs, "updates.log"),
           stderr: path.join(logs, "updates.error.log"),
-        }, codexHome), snapshot);
+        }, codexHome) });
       }
     } catch (error) {
       rollback();

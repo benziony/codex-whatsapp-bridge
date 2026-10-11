@@ -1630,6 +1630,12 @@ test("an admitted Codex turn cannot block later Council events when background e
   assert.deepEqual(requestIds, ["council-event:evt-admitted-paused", "council-event:evt-after-paused"]);
   assert.deepEqual(logs, [{ level: "warn", component: "council-event-relay", name: "Error", message: "Council event was admitted to Codex but its background turn did not complete", cursor: 5 }]);
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 5);
+  const health = JSON.parse(fs.readFileSync(`${statePath}.health.json`, "utf8"));
+  assert.equal(health.lastAdmission.seq, 4);
+  assert.equal(health.lastAdmission.eventId, "evt-admitted-paused");
+  assert.equal(health.lastAdmission.sessionId, "thread-1");
+  assert.equal(health.lastAdmission.turnId, "turn-1");
+  assert.ok(Number.isFinite(Date.parse(health.lastAdmission.at)));
 });
 
 test("a busy durable Council inbox never spawns a fallback task and preserves pending dispatch", async (t) => {
@@ -2035,17 +2041,62 @@ test("relay config rejects owner credential-shaped or incomplete push settings",
   assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "http://council.example", codexCredentialFile: "/tmp/a", sessionId: "t", cwd: "/tmp" } }), null);
 });
 
-test("reconciliation snapshot is bounded and redacts body, credentials, and arbitrary private fields", () => {
+test("reconciliation snapshot accepts typed inbox refs, rejects oversized pages, and redacts private fields", () => {
   const safe = safeReconcileSnapshot({
     replayFloor: 3,
+    pendingProposalTotal: 2,
+    pendingProposalsHasMore: true,
+    activeJobTotal: 1,
+    activeJobsHasMore: false,
+    inboxTotal: 4,
+    inboxHasMore: true,
+    nextCursors: { inboxSince: 6, proposalAfter: "case_a:2", jobAfter: "job_7" },
     pendingProposals: [{ caseId: "case_a", rev: 1, digest: "a".repeat(64), body: "private proposal", token: "secret", riskClass: "routine" }],
-    activeJobs: [{ id: "job-1", status: "running", secret: "private" }],
-    inboxRefs: [{ seq: 4, op: "proposal.publish", body: "private" }],
+    activeJobs: [{ id: `job-${"x".repeat(130)}`, status: "running", scopeOmitted: true, secret: "private" }],
+    inboxRefs: [
+      { seq: 4, kind: "chat_message", ref: "msg_x", body: "private" },
+      { seq: 5, kind: "connect_challenge", ref: "challenge_x" },
+      { seq: 6, kind: "decision", ref: `job-${"x".repeat(130)}` },
+    ],
   });
   assert.deepEqual(safe.pendingProposals[0], { caseId: "case_a", rev: 1, digest: "a".repeat(64), riskClass: "routine" });
-  assert.deepEqual(safe.activeJobs[0], { id: "job-1", status: "running" });
-  assert.doesNotMatch(reconciliationPrompt(2, 7, safe, "default"), /private proposal|secret|private goal/);
+  assert.deepEqual(safe.activeJobs[0], { id: `job-${"x".repeat(130)}`, status: "running", scopeOmitted: true });
+  assert.deepEqual(safe.inboxRefs, [
+    { seq: 4, kind: "chat_message", ref: "msg_x" },
+    { seq: 5, kind: "connect_challenge", ref: "challenge_x" },
+    { seq: 6, kind: "decision", ref: `job-${"x".repeat(130)}` },
+  ]);
+  assert.equal(safe.pendingProposalTotal, 2);
+  assert.equal(safe.pendingProposalsHasMore, true);
+  assert.equal(safe.activeJobTotal, 1);
+  assert.equal(safe.activeJobsHasMore, false);
+  assert.equal(safe.inboxTotal, 4);
+  assert.equal(safe.inboxHasMore, true);
+  assert.deepEqual(safe.nextCursors, { inboxSince: 6, proposalAfter: "case_a:2", jobAfter: "job_7" });
+  const prompt = reconciliationPrompt(2, 7, safe, "default");
+  assert.doesNotMatch(prompt, /private proposal|secret|private goal/);
+  assert.match(prompt, /repeat pages until every total\/hasMore pair is exhausted/);
+  assert.match(prompt, /poll --limit 5/);
+  assert.match(prompt, /--since <last-seq>/);
+  assert.match(prompt, /nextCursors/);
+  assert.match(prompt, /scopeOmitted:true/);
+  assert.match(prompt, /reread that exact job record from the authoritative runtime/);
+  assert.match(prompt, /Deduplicate replies against posted history/);
+  assert.match(prompt, /leave unresolved items durably unacknowledged and retryable/);
+  assert.match(prompt, /Never claim, execute, or replay historical jobs/);
+  assert.match(reconciliationPrompt(2, 7, safe, "default", "/opt/council/runtime.mjs"), /typed Council runtime at \/opt\/council\/runtime\.mjs/);
   assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposals: new Array(101).fill({}), activeJobs: [], inboxRefs: [] }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposals: [], activeJobs: [], inboxRefs: [{ seq: 1, kind: "msg.send", ref: "private/body" }] }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposals: [], activeJobs: [], inboxRefs: new Array(201).fill({ seq: 1, kind: "msg.send", ref: "inbox_1" }) }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, inboxTotal: 1, pendingProposals: [], activeJobs: [], inboxRefs: [] }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, inboxTotal: 2, inboxHasMore: false, pendingProposals: [], activeJobs: [], inboxRefs: [{ seq: 1, kind: "chat_message", ref: "msg_x" }] }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, inboxTotal: 1, inboxHasMore: true, pendingProposals: [], activeJobs: [], inboxRefs: [{ seq: 1, kind: "chat_message", ref: "msg_x" }] }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposalTotal: 2, pendingProposalsHasMore: false, pendingProposals: [{}], activeJobs: [], inboxRefs: [] }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposals: [], activeJobs: [], inboxRefs: [], nextCursors: { inboxSince: -1, proposalAfter: null, jobAfter: null } }), /invalid/);
+  assert.deepEqual(safeReconcileSnapshot({ replayFloor: 0, pendingProposals: [], activeJobs: [], inboxRefs: [], jobCursorBlocked: true, jobCursorBlockedCaseId: "case_7" }).jobCursorBlockedCaseId, "case_7");
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposals: [], activeJobs: [], inboxRefs: [], jobCursorBlocked: "true" }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposals: [], activeJobs: [], inboxRefs: [], jobCursorBlockedCaseId: "bad/id" }), /invalid/);
+  assert.throws(() => safeReconcileSnapshot({ replayFloor: 0, pendingProposals: [], activeJobs: [{ id: "job_1", scope: "private scope" }], inboxRefs: [] }), /invalid/);
 });
 
 test("410 recovery runs one stable reconciliation task and only then advances the cursor", async () => {
@@ -2069,7 +2120,7 @@ test("410 recovery runs one stable reconciliation task and only then advances th
       return { currentCursor: 9, requestId: stable };
     },
     turnRunner: async (input) => {
-      assert.match(input.prompt, /reconcile state/);
+      assert.match(input.prompt, /durable inbox/);
       controller.abort();
       return { turnId: "turn-reconcile" };
     },
@@ -2080,4 +2131,173 @@ test("410 recovery runs one stable reconciliation task and only then advances th
   assert.equal(recoveryInput.cursor, 2);
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 9);
   fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("failed 410 reconciliation remains retryable and does not advance the durable cursor", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-reconcile-retry-"));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [] }), { mode: 0o600 });
+  const config = { role: "combined", hostId: "test", councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  let recoveryCalls = 0;
+  const sleeps = [];
+  let cursorObservedOnRetry;
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => { throw new CouncilCursorTooOldError(); },
+    reconcileRunner: async (_options, cursor, _passedConfig, turnRunner) => {
+      recoveryCalls += 1;
+      assert.equal(cursor, 2);
+      if (recoveryCalls === 1) throw new Error("temporary reconciliation failure");
+      cursorObservedOnRetry = JSON.parse(fs.readFileSync(statePath, "utf8")).cursor;
+      await turnRunner({ codexBinary: "/bin/false", cwd: directory, prompt: "reconcile durable Council state", requestId: "council-reconcile:stable", sessionId: null });
+      return { currentCursor: 9, requestId: "council-reconcile:stable" };
+    },
+    turnRunner: async () => { controller.abort(); return { turnId: "turn-reconcile" }; },
+    sleep: async (ms) => { sleeps.push(ms); },
+    errorLogger: () => {},
+  });
+  assert.equal(result.cursor, 9);
+  assert.equal(recoveryCalls, 2);
+  assert.equal(cursorObservedOnRetry, 2);
+  assert.deepEqual(sleeps, [1_000]);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 9);
+  const health = JSON.parse(fs.readFileSync(`${statePath}.health.json`, "utf8"));
+  assert.equal(health.schemaVersion, 1);
+  assert.equal(fs.statSync(`${statePath}.health.json`).mode & 0o777, 0o600);
+  assert.equal(health.streamState, "disconnected");
+  assert.ok(Number.isFinite(Date.parse(health.heartbeatAt)));
+  assert.ok(Number.isFinite(Date.parse(health.lastRecoverySuccessAt)));
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test("410 recovery refuses a blocked active-job cursor before native execution", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-reconcile-blocked-job-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token"), statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath } };
+  const controller = new AbortController();
+  let fetches = 0, turns = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    return new Response(JSON.stringify({ latestCursor: 9, replayFloor: 5, pendingProposals: [], activeJobs: [], inboxRefs: [],
+      pendingProposalTotal: 0, pendingProposalsHasMore: false, activeJobTotal: 1, activeJobsHasMore: true,
+      inboxTotal: 0, inboxHasMore: false, nextCursors: { inboxSince: 0, proposalAfter: null, jobAfter: null },
+      jobCursorBlocked: true, jobCursorBlockedCaseId: "case_7" }), { status: 200 });
+  };
+  try {
+    const result = await runRelay(config, {
+      signal: controller.signal,
+      streamOpener: async () => { throw new CouncilCursorTooOldError(); },
+      turnRunner: async () => { turns += 1; },
+      sleep: async () => controller.abort(),
+      errorLogger: () => {},
+    });
+    assert.equal(result.cursor, 2);
+    assert.equal(fetches, 1);
+    assert.equal(turns, 0);
+    assert.equal(readState(statePath).reconcile, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("410 recovery freezes its snapshot and exact admitted turn across restart and cursor-write failure", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-reconcile-execution-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [], inbox: { sessionId: "owner-inbox" } }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, runtimePath: "/opt/council/runtime.mjs" } };
+  const originalFetch = globalThis.fetch;
+  let reconcileFetches = 0;
+  globalThis.fetch = async () => {
+    reconcileFetches += 1;
+    return new Response(JSON.stringify({
+      latestCursor: reconcileFetches === 1 ? 9 : 12,
+      replayFloor: 5,
+      pendingProposals: [], activeJobs: [], inboxRefs: [],
+      pendingProposalTotal: 0, pendingProposalsHasMore: false,
+      activeJobTotal: 0, activeJobsHasMore: false,
+      inboxTotal: 0, inboxHasMore: false,
+      nextCursors: { inboxSince: 0, proposalAfter: null, jobAfter: null },
+    }), { status: 200 });
+  };
+  let starts = 0;
+  let firstRequestId;
+  const originalRename = fs.renameSync;
+  const common = {
+    streamOpener: async () => { throw new CouncilCursorTooOldError(); },
+    errorLogger: () => {},
+  };
+  try {
+    const firstController = new AbortController();
+    const firstResult = await runRelay(config, {
+      ...common,
+      signal: firstController.signal,
+      turnRunner: async (input) => {
+        starts += 1;
+        firstRequestId = input.requestId;
+        const beforeTurn = JSON.parse(fs.readFileSync(statePath, "utf8"));
+        assert.equal(beforeTurn.cursor, 2);
+        assert.equal(beforeTurn.reconcile.currentCursor, 9);
+        assert.equal(beforeTurn.reconcile.snapshot.nextCursors.inboxSince, 0);
+        assert.match(input.prompt, /runtime\.mjs/);
+        input.onThreadCreating({ threadSource: `whatsapp:${input.requestId}`, uncertainUntil: new Date(Date.now() + 60_000).toISOString() });
+        input.onThreadReady({ sessionId: "reconcile-thread" });
+        input.onTurnStarting({ sessionId: "reconcile-thread", uncertainUntil: new Date(Date.now() + 60_000).toISOString() });
+        input.onTurnStarted({ sessionId: "reconcile-thread", turnId: "reconcile-turn" });
+        throw new CodexTurnStartUncertainError();
+      },
+      sleep: async () => firstController.abort(),
+    });
+    assert.equal(firstResult.cursor, 2);
+    const afterLostCompletion = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(afterLostCompletion.cursor, 2);
+    assert.equal(afterLostCompletion.inbox.sessionId, "owner-inbox");
+    assert.equal(afterLostCompletion.reconcile.execution.stage, "running");
+    assert.equal(afterLostCompletion.reconcile.execution.turnId, "reconcile-turn");
+
+    const secondController = new AbortController();
+    let failNextStateRename = true;
+    fs.renameSync = function (from, to) {
+      if (to === statePath && failNextStateRename) {
+        failNextStateRename = false;
+        throw new Error("simulated cursor-state write failure");
+      }
+      return originalRename.call(this, from, to);
+    };
+    const observed = [];
+    const result = await runRelay(config, {
+      ...common,
+      signal: secondController.signal,
+      turnRunner: async (input) => {
+        observed.push({ requestId: input.requestId, execution: input.execution });
+        assert.equal(input.requestId, firstRequestId);
+        assert.equal(input.execution.stage, "running");
+        assert.equal(input.execution.sessionId, "reconcile-thread");
+        assert.equal(input.execution.turnId, "reconcile-turn");
+        if (observed.length === 2) secondController.abort();
+        return { sessionId: input.execution.sessionId, turnId: input.execution.turnId, recovered: true };
+      },
+      sleep: async () => {},
+    });
+    assert.equal(result.cursor, 9);
+    assert.equal(starts, 1, "lost completion and failed cursor write must never start a second turn");
+    assert.equal(observed.length, 2, "the terminal native turn is read back again after cursor persistence fails");
+    assert.equal(reconcileFetches, 1, "a later server cursor cannot replace the frozen recovery snapshot");
+    const completed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(completed.cursor, 9);
+    assert.equal(completed.reconcile, undefined);
+    assert.equal(completed.inbox.sessionId, "owner-inbox");
+  } finally {
+    fs.renameSync = originalRename;
+    globalThis.fetch = originalFetch;
+  }
 });

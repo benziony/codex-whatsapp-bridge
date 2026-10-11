@@ -105,11 +105,33 @@ past that event.
 
 If the Council stream returns `410 Gone` because the cursor is older than the
 replay floor, the relay calls the authenticated
-`GET /api/events/reconcile?since=N&workspace=...` endpoint. Council must return
-the flat bounded shape `{latestCursor,replayFloor,pendingProposals,activeJobs,inboxRefs}`.
-The relay sends only an allowlisted redacted snapshot to a fresh reconciliation
-task and advances the cursor after that task completes; it never silently
-resets or discards a cursor.
+`GET /api/events/reconcile?since=N&workspace=...` endpoint. Council returns the
+flat bounded shape `{latestCursor,replayFloor,pendingProposals,activeJobs,inboxRefs,pendingProposalTotal,pendingProposalsHasMore,activeJobTotal,activeJobsHasMore,inboxTotal,inboxHasMore,nextCursors}`.
+Each inbox reference has a safe positive `seq`, an identifier-shaped advisory
+`kind`, and safe opaque `ref`; the page contains at most 50 references. These
+kind labels are metadata and confer no action authority. Each total/hasMore
+pair is returned together and must match its page length. The relay sends only
+an allowlisted redacted snapshot and prompt, each capped at 12 KiB, to the
+configured shared inbox task when `sessionId` is set, or a dedicated
+reconciliation task otherwise. Its `nextCursors` contain `inboxSince`,
+`proposalAfter` (`caseId:rev`), and `jobAfter`; use them with the configured
+typed runtime's authenticated `reconcile` command until all three pages are
+exhausted. Separately, poll and handle the durable inbox, read full thread
+histories before replies, deduplicate against posted history, read back writes,
+and leave unconfirmed acknowledgments durably unacknowledged and retryable. The
+reconciliation task cannot claim historical jobs or infer authority. The relay advances its cursor only after recovery
+completes and persists; a failed recovery keeps the old cursor and retries with
+bounded backoff.
+
+The relay writes a small redacted health sidecar at `<statePath>.health.json`
+with mode `0600` inside a `0700` directory. `heartbeatAt` is refreshed every 30
+seconds while the process runs; age indicates process liveness. `streamState`
+and `streamConnectedAt`/`streamDisconnectedAt` describe transport connection
+only. `lastRecoverySuccessAt` is set only after reconciliation completes and
+the recovered cursor is durably written. `lastAdmission` records the time,
+sequence, event ID, session ID, and turn ID from the Codex turn-start callback;
+it proves that exact turn was admitted, not that it completed. These timestamps are separate
+evidence and must not be treated as interchangeable.
 
 For split topology the gateway configures `codexInbox.originHost` and the
 absolute new-task directory on the Codex Mac. The Codex host configures

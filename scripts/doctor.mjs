@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { bridgePaths, codexBinaryPath, isCodexHost, isGatewayHost, readConfig } from "./lib/runtime-config.mjs";
+import { validateLaunchAgentPlist } from "./lib/launch-agent.mjs";
 
 function command(binary, args, options = {}) {
   return spawnSync(binary, args, { encoding: "utf8", timeout: options.timeout ?? 10_000, cwd: options.cwd });
@@ -35,6 +36,15 @@ async function main() {
     checks.push({ name: "codex-default-cwd", ok: path.isAbsolute(cwd) && fs.existsSync(cwd), detail: cwd || "missing" });
     const client = command(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), "codex-whatsapp-client.mjs"), "status"], { timeout: 20_000 });
     checks.push({ name: "client", ok: client.status === 0, detail: client.status === 0 ? "ready" : "not ready" });
+    if (config.councilPush?.enabled) {
+      const agent = path.join(os.homedir(), "Library", "LaunchAgents", "com.codex-whatsapp-bridge.council-events.plist");
+      try {
+        validateLaunchAgentPlist(agent, "com.codex-whatsapp-bridge.council-events");
+        checks.push({ name: "council-events-launch-agent", ok: true, detail: agent });
+      } catch (error) {
+        checks.push({ name: "council-events-launch-agent", ok: false, detail: `${agent}: ${error.message}` });
+      }
+    }
   }
   if (isGatewayHost(config)) {
     const hermes = config.gateway?.hermesCheckout;
