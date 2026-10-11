@@ -11,6 +11,7 @@ import { createNativeObserver, loadObserverCredential } from "./lib/council-nati
 const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_REPLAY_EVENTS = 1000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
+const STREAM_EOF_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONCILE_BYTES = 64 * 1024;
 const MAX_RECONCILE_PROMPT = 12 * 1024;
 const MAX_RECONCILE_INBOX_REFS = 50;
@@ -60,6 +61,13 @@ class CouncilCursorTooOldError extends Error {
     super("Council event cursor is too old");
     this.name = "CouncilCursorTooOldError";
     this.code = "COUNCIL_CURSOR_TOO_OLD";
+  }
+}
+
+class CouncilEventStreamClosedError extends Error {
+  constructor() {
+    super("Council event stream closed");
+    this.name = "CouncilEventStreamClosedError";
   }
 }
 
@@ -1452,9 +1460,15 @@ export async function runRelay(config, { signal = new AbortController().signal, 
         schedulePendingDrain();
         backoff = 1_000;
       }
-      throw new Error("Council event stream closed");
+      throw new CouncilEventStreamClosedError();
     } catch (error) {
       if (signal.aborted) break;
+      if (error instanceof CouncilEventStreamClosedError) {
+        markDisconnected();
+        backoff = 1_000;
+        await sleep(STREAM_EOF_RECONNECT_DELAY_MS);
+        continue;
+      }
       if (error?.code === "COUNCIL_CURSOR_TOO_OLD") {
         markDisconnected();
         try {
