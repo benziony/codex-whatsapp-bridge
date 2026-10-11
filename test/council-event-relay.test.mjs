@@ -18,6 +18,36 @@ const permit = (caseId = "case_a", rev = 2, digest = "a".repeat(64), scope = "de
 
 const event = { seq: 4, eventId: "evt-4", kind: "whatsapp.permit", caseId: "case_a", rev: 2, digest: "a".repeat(64), permitId: "wp_opaque_permit_123456", safeSummary: "Review the bounded plan.", proposalBody: "A concise proposal body.", approvalChannels: ["web"], riskClass: "financial", scope: "design", whatsappPermit: permit() };
 
+function readOnlyReconcileFixture(directory, pages) {
+  const runtimePath = path.join(directory, "runtime.mjs"), responsesPath = path.join(directory, "responses.json"), callsPath = path.join(directory, "calls.json");
+  fs.writeFileSync(responsesPath, JSON.stringify(pages), { mode: 0o600 });
+  fs.writeFileSync(runtimePath, [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    'import { fileURLToPath } from "node:url";',
+    'const root = path.dirname(fileURLToPath(import.meta.url));',
+    'const callsPath = path.join(root, "calls.json");',
+    'const calls = fs.existsSync(callsPath) ? JSON.parse(fs.readFileSync(callsPath, "utf8")) : [];',
+    'calls.push(process.argv.slice(2));',
+    'fs.writeFileSync(callsPath, JSON.stringify(calls));',
+    'if (calls.length === 2 && fs.existsSync(path.join(root, "fail-second"))) { fs.unlinkSync(path.join(root, "fail-second")); process.exit(1); }',
+    'const pages = JSON.parse(fs.readFileSync(path.join(root, "responses.json"), "utf8"));',
+    'process.stdout.write(JSON.stringify(pages[Math.min(calls.length - 1, pages.length - 1)]));',
+  ].join("\n"), { mode: 0o600 });
+  return { runtimePath, callsPath };
+}
+
+function reconcilePage({ latestCursor = 9, pendingProposals = [], activeJobs = [], inboxRefs = [], pendingProposalTotal = pendingProposals.length, activeJobTotal = activeJobs.length, inboxTotal = inboxRefs.length, pendingProposalsHasMore = false, activeJobsHasMore = false, inboxHasMore = false, nextCursors = { inboxSince: inboxRefs.at(-1)?.seq ?? 2, proposalAfter: pendingProposals.length ? `${pendingProposals.at(-1).caseId}:${pendingProposals.at(-1).rev}` : null, jobAfter: activeJobs.at(-1)?.id ?? null } } = {}) {
+  return { latestCursor, replayFloor: 5, pendingProposals, activeJobs, inboxRefs, pendingProposalTotal, pendingProposalsHasMore, activeJobTotal, activeJobsHasMore, inboxTotal, inboxHasMore, nextCursors };
+}
+
+function writeReadOnlyCredential(directory, { token = "q".repeat(40), agent = "codex", workspace = "solar_ops", url = "https://council.example" } = {}) {
+  const file = path.join(directory, "runtime-credential.json");
+  fs.writeFileSync(file, JSON.stringify({ agent, token, workspace, url }), { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  return file;
+}
+
 function orphanExecutionFixture(t, { execution = { eventId: "event:default:4", stage: "running", sessionId: "thread-inbox", turnId: "turn-admitted" }, pending = [], cursor = 7 } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-orphan-execution-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -251,6 +281,28 @@ test("chat operation events require authenticated readback and confer no authori
   assert.match(prompt, /grants no approval, assignment authority, or execution authority/);
   assert.match(prompt, /Do not claim or execute a job during this chat-notification turn/);
   assert.doesNotMatch(prompt, /execution trigger|claim by the resolved live job/);
+});
+
+test("event-only conversation replies are scoped to one event conversation and missing IDs remain read-only", () => {
+  const exact = eventPrompt({ seq: 10, eventId: "evt-chat-send", kind: "chat.conversation.send", conversationId: "conv_exact" }, "solar_ops", "/opt/council runtime.mjs", "event-only", "/private/runtime credential.json");
+  assert.match(exact, /only the exact event conversation conv_exact in configured workspace solar_ops/);
+  assert.match(exact, /node '\/opt\/council runtime\.mjs' mutate --operation conversation-get --agent codex --credential '\/private\/runtime credential\.json' --workspace 'solar_ops'/);
+  assert.match(exact, /limit 20, an operation-specific stable requestId, and optional before cursor; page backward/);
+  assert.match(exact, /page backward until the complete current history is read, including Codex-authored posts/);
+  assert.match(exact, /stable requestId/);
+  assert.match(exact, /read back the conversation to confirm the post/);
+  assert.match(exact, /Do not use old descriptors.*environment variables, vault lookup, credential discovery/);
+  assert.doesNotMatch(exact, /authorizedWorkspaces inventory|every authorized workspace|initial catch-up|standing improvements topic|all active conversations/);
+  const missing = eventPrompt({ seq: 11, eventId: "evt-chat-missing", kind: "chat.conversation.send" }, "solar_ops", "/opt/council runtime.mjs", "event-only", "/private/runtime credential.json");
+  assert.match(missing, /no conversationId\. Stay read-only/);
+  assert.doesNotMatch(missing, /authorizedWorkspaces inventory|initial catch-up|Read and reply only/);
+  const registry = eventPrompt({ seq: 12, eventId: "evt-registry", kind: "registry.announce", noticeKind: "responded-recently", principal: "hermes" }, "solar_ops", "/opt/council runtime.mjs", "event-only", "/private/runtime credential.json");
+  assert.match(registry, /read-only advisory registry notice/);
+  assert.match(registry, /Refresh only registry metadata/);
+  assert.doesNotMatch(registry, /initial catch-up|authorizedWorkspaces inventory|standing improvements topic/);
+  const generic = eventPrompt(event, "solar_ops", "/opt/council runtime.mjs", "event-only", "/private/runtime credential.json");
+  assert.match(generic, /--credential '\/private\/runtime credential\.json' --workspace 'solar_ops'/);
+  assert.match(generic, /Do not use old descriptors.*vault lookup, credential discovery/);
 });
 
 test("task notifications instruct Codex to accept only a current offered assignment", () => {
@@ -715,6 +767,38 @@ test("consecutive registry notices share one inbox turn before a following conve
   assert.deepEqual(stored.pending ?? [], []);
   assert.equal(stored.inbox.execution, undefined);
   assert.doesNotMatch(fs.readFileSync(statePath, "utf8"), /DO NOT INCLUDE/);
+});
+
+test("event-only registry batches stay read-only and the following chat event stays conversation-scoped", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-registry-event-only-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token"), statePath = path.join(directory, "state.json");
+  const token = "c".repeat(40);
+  fs.writeFileSync(credentialFile, `${token}\n`, { mode: 0o600 });
+  const runtimeCredentialFile = writeReadOnlyCredential(directory, { token, workspace: "solar_ops" });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 3, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile, cwd: directory, statePath, workspace: "solar_ops", runtimePath: path.join(directory, "runtime.mjs"), runtimeCredentialFile, conversationReplyPolicy: "event-only" } };
+  const controller = new AbortController(), inputs = [];
+  const events = [
+    { seq: 4, eventId: "evt-registry-only-a", op: "registry.announce", kind: "responded-recently", principal: "hermes" },
+    { seq: 5, eventId: "evt-registry-only-b", op: "registry.announce", kind: "membership-scope", principal: "agent-a" },
+    { seq: 6, eventId: "evt-chat-only", op: "chat.conversation.send", sender: "owner", conversationId: "conv_event_only" },
+  ];
+  const stream = events.map((item) => `id: ${item.seq}\nevent: council.event\ndata: ${JSON.stringify(item)}\n\n`).join("");
+  await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => new Response(stream),
+    turnRunner: async (input) => { inputs.push(input); input.onTurnStarted({ sessionId: "inbox-thread", turnId: `event-only-${inputs.length}` }); if (inputs.length === 2) controller.abort(); },
+    sleep: async () => { await waitFor(() => inputs.length === 2); controller.abort(); },
+    errorLogger: () => {},
+  });
+  assert.equal(inputs.length, 2);
+  assert.match(inputs[0].prompt, /refresh registry metadata only in the configured workspace/);
+  assert.doesNotMatch(inputs[0].prompt, /initial catch-up|authorizedWorkspaces inventory|standing improvements topic|one-time current-history/);
+  assert.match(inputs[0].prompt, /do not enumerate, inspect, catch up, or write to any conversation/);
+  assert.match(inputs[1].prompt, /only the exact event conversation conv_event_only in configured workspace solar_ops/);
+  assert.match(inputs[1].prompt, /--agent codex --credential '.*runtime-credential\.json' --workspace 'solar_ops'/);
+  assert.doesNotMatch(inputs[1].prompt, /authorizedWorkspaces inventory|initial catch-up|standing improvements topic|another conversation/);
 });
 
 test("registry batch admits after an unresolved independent job and retains that job pointer", async (t) => {
@@ -2039,6 +2123,14 @@ test("relay config rejects owner credential-shaped or incomplete push settings",
   assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: "/tmp/a", cwd: "/tmp", runtimePath: "relative/runtime.mjs" } }), null);
   assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: "/tmp/a", codexTokenEnv: "OWNER", sessionId: "t", cwd: "/tmp" } }), null);
   assert.equal(relayConfig({ councilPush: { enabled: true, councilUrl: "http://council.example", codexCredentialFile: "/tmp/a", sessionId: "t", cwd: "/tmp" } }), null);
+  const base = { enabled: true, councilUrl: "https://council.example", codexCredentialFile: "/tmp/a", cwd: "/tmp" };
+  assert.equal(relayConfig({ councilPush: { ...base, conversationReplyPolicy: "unbounded" } }), null);
+  assert.equal(relayConfig({ councilPush: { ...base, recoveryPolicy: "model-then-poll" } }), null);
+  assert.equal(relayConfig({ councilPush: { ...base, recoveryPolicy: "read-only", runtimePath: "/opt/council/runtime.mjs" } }), null);
+  assert.equal(relayConfig({ councilPush: { ...base, recoveryPolicy: "read-only", runtimePath: "/opt/council/runtime.mjs", runtimeCredentialFile: "relative.json" } }), null);
+  assert.equal(relayConfig({ councilPush: { ...base, recoveryPolicy: "read-only", runtimePath: "/opt/council/runtime.mjs", runtimeCredentialFile: "/private/council-runtime.json" } }).recoveryPolicy, "read-only");
+  assert.equal(relayConfig({ councilPush: { ...base, conversationReplyPolicy: "event-only" } }), null);
+  assert.equal(relayConfig({ councilPush: { ...base, conversationReplyPolicy: "event-only", runtimePath: "/opt/council/runtime.mjs", runtimeCredentialFile: "/private/council-runtime.json" } }).conversationReplyPolicy, "event-only");
 });
 
 test("reconciliation snapshot accepts typed inbox refs, rejects oversized pages, and redacts private fields", () => {
@@ -2300,4 +2392,220 @@ test("410 recovery freezes its snapshot and exact admitted turn across restart a
     fs.renameSync = originalRename;
     globalThis.fetch = originalFetch;
   }
+});
+
+test("read-only 410 recovery pages the typed runtime metadata and commits only after exhaustion", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-read-only-pages-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const token = "q".repeat(40), sseCredential = path.join(directory, "sse-token"), statePath = path.join(directory, "state.json");
+  fs.writeFileSync(sseCredential, `${token}\n`, { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [] }), { mode: 0o600 });
+  const runtimeCredentialFile = writeReadOnlyCredential(directory, { token, workspace: "solar_ops" });
+  const page1 = reconcilePage({ pendingProposals: [{ caseId: "case_a", rev: 2 }], activeJobs: [{ id: "job_a" }],
+    inboxRefs: [{ seq: 1, kind: "message.created", ref: "ref_a" }], inboxTotal: 2, inboxHasMore: true,
+    nextCursors: { inboxSince: 1, proposalAfter: "case_a:2", jobAfter: "job_a" } });
+  const page2 = reconcilePage({ latestCursor: 12, pendingProposals: [], activeJobs: [], inboxRefs: [{ seq: 4, kind: "message.created", ref: "ref_b" }],
+    pendingProposalTotal: 0, activeJobTotal: 0, inboxTotal: 1,
+    nextCursors: { inboxSince: 4, proposalAfter: "case_a:2", jobAfter: "job_a" } });
+  const { runtimePath, callsPath } = readOnlyReconcileFixture(directory, [page1, page2]);
+  const config = { role: "combined", hostId: "test", councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: sseCredential,
+    cwd: directory, statePath, workspace: "solar_ops", runtimePath, runtimeCredentialFile, recoveryPolicy: "read-only" } };
+  const controller = new AbortController(); let opens = 0, turns = 0;
+  const result = await runRelay(config, {
+    signal: controller.signal,
+    streamOpener: async () => { opens += 1; if (opens === 1) throw new CouncilCursorTooOldError(); return new Response(""); },
+    turnRunner: async () => { turns += 1; assert.fail("read-only recovery must not start a model turn"); },
+    sleep: async () => controller.abort(),
+    errorLogger: () => {},
+  });
+  assert.equal(result.cursor, 9);
+  assert.equal(turns, 0);
+  const calls = JSON.parse(fs.readFileSync(callsPath, "utf8"));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], ["reconcile", "--agent", "codex", "--credential", runtimeCredentialFile, "--workspace", "solar_ops", "--inbox-since", "0"]);
+  assert.deepEqual(calls[1], ["reconcile", "--agent", "codex", "--credential", runtimeCredentialFile, "--workspace", "solar_ops", "--inbox-since", "1", "--proposal-after", "case_a:2", "--job-after", "job_a"]);
+  const state = readState(statePath);
+  assert.equal(state.cursor, 9);
+  assert.equal(state.reconcile, undefined);
+  assert.equal(state.reconcileCheckpoint, undefined);
+});
+
+test("read-only recovery accepts Council's full-string proposal order and 100-item job page", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-read-only-large-page-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const token = "v".repeat(40), sseCredential = path.join(directory, "sse-token"), statePath = path.join(directory, "state.json");
+  fs.writeFileSync(sseCredential, `${token}\n`, { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [] }), { mode: 0o600 });
+  const runtimeCredentialFile = writeReadOnlyCredential(directory, { token, workspace: "default" });
+  const activeJobs = Array.from({ length: 51 }, (_, index) => ({ id: `job_${String(index + 1).padStart(3, "0")}` }));
+  const pendingProposals = [{ caseId: "case_a10", rev: 1 }, { caseId: "case_a1", rev: 1 }];
+  const page = reconcilePage({ pendingProposals, activeJobs, inboxRefs: [], activeJobTotal: 51,
+    nextCursors: { inboxSince: 0, proposalAfter: "case_a1:1", jobAfter: "job_051" } });
+  page.padding = "p".repeat(60_000);
+  const { runtimePath, callsPath } = readOnlyReconcileFixture(directory, [page]);
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: sseCredential,
+    cwd: directory, statePath, workspace: "default", runtimePath, runtimeCredentialFile, recoveryPolicy: "read-only" } };
+  const controller = new AbortController(); let opens = 0;
+  const result = await runRelay(config, { signal: controller.signal,
+    streamOpener: async () => { opens += 1; if (opens === 1) throw new CouncilCursorTooOldError(); return new Response(""); },
+    turnRunner: async () => assert.fail("read-only recovery must not start a model turn"),
+    sleep: async () => controller.abort(), errorLogger: () => {},
+  });
+  assert.equal(result.cursor, 9);
+  assert.equal(JSON.parse(fs.readFileSync(callsPath, "utf8")).length, 1);
+});
+
+test("read-only recovery rejects a stalled cursor dimension even when another dimension advances", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-read-only-stalled-dimension-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const token = "w".repeat(40), sseCredential = path.join(directory, "sse-token"), statePath = path.join(directory, "state.json");
+  fs.writeFileSync(sseCredential, `${token}\n`, { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [] }), { mode: 0o600 });
+  const runtimeCredentialFile = writeReadOnlyCredential(directory, { token, workspace: "default" });
+  const stalled = reconcilePage({ inboxRefs: [{ seq: 1, kind: "inbox.read", ref: "ref_a" }], inboxTotal: 2, inboxHasMore: true,
+    pendingProposalTotal: 1, pendingProposalsHasMore: true,
+    nextCursors: { inboxSince: 1, proposalAfter: null, jobAfter: null } });
+  const { runtimePath, callsPath } = readOnlyReconcileFixture(directory, [stalled]);
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: sseCredential,
+    cwd: directory, statePath, workspace: "default", runtimePath, runtimeCredentialFile, recoveryPolicy: "read-only" } };
+  const controller = new AbortController();
+  const result = await runRelay(config, { signal: controller.signal,
+    streamOpener: async () => { throw new CouncilCursorTooOldError(); },
+    turnRunner: async () => assert.fail("read-only recovery must not start a model turn"),
+    sleep: async () => controller.abort(), errorLogger: () => {},
+  });
+  assert.equal(result.cursor, 2);
+  assert.equal(JSON.parse(fs.readFileSync(callsPath, "utf8")).length, 1);
+  assert.equal(readState(statePath).reconcile, undefined);
+});
+
+test("event-only recovery credential mismatch fails before stream or turn admission", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-event-only-credential-mismatch-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const sseCredential = path.join(directory, "sse-token"), statePath = path.join(directory, "state.json");
+  fs.writeFileSync(sseCredential, `${"x".repeat(40)}\n`, { mode: 0o600 });
+  const runtimeCredentialFile = writeReadOnlyCredential(directory, { token: "y".repeat(40), workspace: "default" });
+  let streams = 0, turns = 0;
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: sseCredential,
+    cwd: directory, statePath, workspace: "default", runtimePath: path.join(directory, "runtime.mjs"), runtimeCredentialFile, conversationReplyPolicy: "event-only" } };
+  await assert.rejects(runRelay(config, { streamOpener: async () => { streams += 1; return new Response(""); },
+    turnRunner: async () => { turns += 1; }, errorLogger: () => {} }), /does not match/);
+  assert.equal(streams, 0);
+  assert.equal(turns, 0);
+});
+
+test("event-only recovery revalidates credentials at dispatch and retains the durable pointer", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-event-only-stale-credential-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const token = "a".repeat(40), sseCredential = path.join(directory, "sse-token"), statePath = path.join(directory, "state.json");
+  fs.writeFileSync(sseCredential, `${token}\n`, { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 3, notified: [] }), { mode: 0o600 });
+  const runtimeCredentialFile = writeReadOnlyCredential(directory, { token, workspace: "default" });
+  const changed = { token: "b".repeat(40), agent: "codex", workspace: "default", url: "https://council.example" };
+  const event = { seq: 4, eventId: "evt-stale-native-cred", kind: "chat.conversation.send", conversationId: "conv_exact" };
+  const controller = new AbortController(); let streams = 0, turns = 0, errors = 0;
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: sseCredential,
+    cwd: directory, statePath, workspace: "default", runtimePath: path.join(directory, "runtime.mjs"), runtimeCredentialFile, conversationReplyPolicy: "event-only" } };
+  const result = await runRelay(config, { signal: controller.signal,
+    streamOpener: async () => {
+      streams += 1;
+      if (streams === 1) {
+        fs.writeFileSync(runtimeCredentialFile, JSON.stringify(changed), { mode: 0o600 });
+        fs.chmodSync(runtimeCredentialFile, 0o600);
+        return new Response(`id: 4\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+      return new Response("");
+    },
+    turnRunner: async () => { turns += 1; },
+    sleep: async () => { await waitFor(() => errors > 0); controller.abort(); },
+    errorLogger: () => { errors += 1; },
+  });
+  const state = readState(statePath);
+  assert.equal(result.cursor, 4);
+  assert.equal(turns, 0, "changed credentials must stop before native turn admission");
+  assert.ok(state.pending?.some((item) => item.eventId === event.eventId), "the durable event pointer remains retryable");
+});
+
+test("read-only 410 recovery checkpoints pages and resumes without polling, turns, or cursor loss", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-read-only-resume-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const token = "r".repeat(40), sseCredential = path.join(directory, "sse-token"), statePath = path.join(directory, "state.json");
+  fs.writeFileSync(sseCredential, `${token}\n`, { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [] }), { mode: 0o600 });
+  const runtimeCredentialFile = writeReadOnlyCredential(directory, { token, workspace: "default" });
+  const firstPage = reconcilePage({ inboxRefs: [{ seq: 3, kind: "inbox.read", ref: "ref_a" }], inboxTotal: 2, inboxHasMore: true,
+    nextCursors: { inboxSince: 3, proposalAfter: null, jobAfter: null } });
+  const secondPage = reconcilePage({ inboxRefs: [{ seq: 4, kind: "inbox.read", ref: "ref_b" }], inboxTotal: 1,
+    nextCursors: { inboxSince: 4, proposalAfter: null, jobAfter: null } });
+  const { runtimePath, callsPath } = readOnlyReconcileFixture(directory, [firstPage]);
+  fs.writeFileSync(path.join(directory, "fail-second"), "once");
+  const config = { role: "combined", hostId: "test", councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: sseCredential,
+    cwd: directory, statePath, workspace: "default", runtimePath, runtimeCredentialFile, recoveryPolicy: "read-only" } };
+  const firstController = new AbortController(); let turns = 0;
+  const first = await runRelay(config, {
+    signal: firstController.signal,
+    streamOpener: async () => { throw new CouncilCursorTooOldError(); },
+    turnRunner: async () => { turns += 1; assert.fail("read-only recovery must not start a model turn"); },
+    sleep: async () => firstController.abort(), errorLogger: () => {},
+  });
+  assert.equal(first.cursor, 2);
+  const checkpoint = readState(statePath);
+  assert.equal(checkpoint.cursor, 2);
+  assert.equal(checkpoint.reconcile.policy, "read-only");
+  assert.equal(checkpoint.reconcile.currentCursor, 9);
+  assert.deepEqual(checkpoint.reconcile.readOnlyRecovery, { version: 1, nextCursors: { inboxSince: 3, proposalAfter: null, jobAfter: null }, exhausted: { inbox: false, proposals: true, jobs: true }, pages: 1, done: false });
+  fs.writeFileSync(path.join(directory, "responses.json"), JSON.stringify([secondPage]), { mode: 0o600 });
+  const secondController = new AbortController(); let opens = 0;
+  const resumed = await runRelay(config, {
+    signal: secondController.signal,
+    streamOpener: async () => { opens += 1; if (opens === 1) return new Response(""); return new Response(""); },
+    turnRunner: async () => { turns += 1; assert.fail("read-only recovery must not start a model turn"); },
+    sleep: async () => secondController.abort(), errorLogger: () => {},
+  });
+  assert.equal(resumed.cursor, 9);
+  assert.equal(turns, 0);
+  const calls = JSON.parse(fs.readFileSync(callsPath, "utf8"));
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[2], ["reconcile", "--agent", "codex", "--credential", runtimeCredentialFile, "--workspace", "default", "--inbox-since", "3"]);
+  assert.equal(readState(statePath).reconcile, undefined);
+});
+
+test("read-only recovery rejects any credential identity or protection mismatch before runtime or model fallback", async (t) => {
+  const token = "s".repeat(40);
+  const cases = ["missing", "symlink", "permissions", "json", "principal", "workspace", "origin", "token"];
+  for (const variant of cases) await t.test(variant, async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), `council-read-only-credential-${variant}-`));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const sseCredential = path.join(directory, "sse-token"), statePath = path.join(directory, "state.json");
+    fs.writeFileSync(sseCredential, `${token}\n`, { mode: 0o600 });
+    fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 2, notified: [] }), { mode: 0o600 });
+    let runtimeCredentialFile = path.join(directory, "runtime-credential.json");
+    if (variant !== "missing") {
+      const values = { token, agent: "codex", workspace: "default", url: "https://council.example" };
+      if (variant === "principal") values.agent = "hermes";
+      if (variant === "workspace") values.workspace = "other";
+      if (variant === "origin") values.url = "https://other.example";
+      if (variant === "token") values.token = "t".repeat(40);
+      fs.writeFileSync(runtimeCredentialFile, variant === "json" ? "not-json" : JSON.stringify(values), { mode: 0o600 });
+      fs.chmodSync(runtimeCredentialFile, variant === "permissions" ? 0o644 : 0o600);
+      if (variant === "symlink") {
+        const target = `${runtimeCredentialFile}.target`;
+        fs.renameSync(runtimeCredentialFile, target);
+        fs.symlinkSync(target, runtimeCredentialFile);
+      }
+    }
+    const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: sseCredential,
+      cwd: directory, statePath, runtimePath: path.join(directory, "runtime.mjs"), runtimeCredentialFile, recoveryPolicy: "read-only" } };
+    const controller = new AbortController(); let runtimeCalls = 0, turns = 0;
+    await assert.rejects(runRelay(config, {
+      signal: controller.signal,
+      streamOpener: async () => { throw new CouncilCursorTooOldError(); },
+      readOnlyRuntimeRunner: async () => { runtimeCalls += 1; throw new Error("must not invoke mismatched runtime credential"); },
+      turnRunner: async () => { turns += 1; },
+      sleep: async () => controller.abort(), errorLogger: () => {},
+    }));
+    assert.equal(runtimeCalls, 0);
+    assert.equal(turns, 0);
+    assert.equal(readState(statePath).reconcile, undefined);
+  });
 });
