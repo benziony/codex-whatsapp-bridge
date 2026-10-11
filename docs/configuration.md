@@ -103,8 +103,8 @@ sends the bounded native poll or text fallback described above to the
 configured Council Approvals chat using a stable delivery key before advancing
 past that event.
 
-If the Council stream returns `410 Gone` because the cursor is older than the
-replay floor, the relay calls the authenticated
+With the default proactive recovery policy, if the Council stream returns
+`410 Gone` because the cursor is older than the replay floor, the relay calls the authenticated
 `GET /api/events/reconcile?since=N&workspace=...` endpoint. Council returns the
 flat bounded shape `{latestCursor,replayFloor,pendingProposals,activeJobs,inboxRefs,pendingProposalTotal,pendingProposalsHasMore,activeJobTotal,activeJobsHasMore,inboxTotal,inboxHasMore,nextCursors}`.
 Each inbox reference has a safe positive `seq`, an identifier-shaped advisory
@@ -122,6 +122,44 @@ and leave unconfirmed acknowledgments durably unacknowledged and retryable. The
 reconciliation task cannot claim historical jobs or infer authority. The relay advances its cursor only after recovery
 completes and persists; a failed recovery keeps the old cursor and retries with
 bounded backoff.
+
+Two optional `councilPush` policies can narrow this behavior:
+
+```json
+{
+  "councilPush": {
+    "conversationReplyPolicy": "event-only",
+    "recoveryPolicy": "read-only",
+    "runtimePath": "/absolute/path/to/council-runtime.mjs",
+    "runtimeCredentialFile": "/absolute/path/to/codex.runtime.json"
+  }
+}
+```
+
+Omitting either policy preserves the existing proactive conversation behavior
+and model-assisted recovery. `conversationReplyPolicy: "event-only"` limits a
+chat event to its exact `conversationId` in the configured workspace; an event
+without that ID remains read-only. Single and batched registry notices refresh
+registry metadata only and never search or post to conversations.
+Event-only mode also requires the protected runtime credential described below;
+the native prompt uses only that exact runtime, principal, credential, and
+workspace, and preserves full-history and idempotent reply checks.
+`recoveryPolicy: "read-only"` handles a stale cursor by paging the typed
+runtime's metadata-only `reconcile` command. It does not start a model turn,
+poll the durable inbox, acknowledge items, or claim, post, or execute work. The
+event cursor advances only after all proposal, active-job, and inbox-reference
+pages complete. A partial failure preserves the current cursor and page
+checkpoint for retry.
+
+Event-only replies and strict read-only recovery require an explicit absolute
+`runtimeCredentialFile` path to an owner-owned regular JSON file with exact
+mode `0600`. Its `agent`
+must be `codex`; its `workspace` must match `councilPush.workspace`; its `url`
+must be the configured HTTPS Council origin; and its `token` must exactly match
+the token selected by `codexCredentialFile` or `codexTokenEnv`. The relay never
+discovers another credential path or falls back to a historical credential or
+model turn. Setup preserves these optional settings when it rewrites the Bridge
+configuration.
 
 The relay writes a small redacted health sidecar at `<statePath>.health.json`
 with mode `0600` inside a `0700` directory. `heartbeatAt` is refreshed every 30
