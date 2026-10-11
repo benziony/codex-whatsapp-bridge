@@ -6,6 +6,8 @@
 - Admission requires Hermes transport-profile authorization and the plugin's
   narrower exact sender allowlist.
 - Runtime files use `0700` directories and `0600` files.
+- LaunchAgent installs validate a same-directory temporary plist before
+  snapshotting, replacing the installed file, or unloading its service.
 - Attachment inputs must be regular non-symlink files below approved Hermes
   cache roots. Limits are 10 files and 128 MiB total; staged copies are hashed.
 - The broker is a local process. Split installations use existing BatchMode

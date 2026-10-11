@@ -4,7 +4,88 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { launchAgentPlist } from "../scripts/lib/launch-agent.mjs";
+import { installLaunchAgent, launchAgentPlist } from "../scripts/lib/launch-agent.mjs";
+
+test("launch agent install rejects invalid plist before snapshot or service changes", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-plist-validation-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, "com.codex-whatsapp-bridge.council-events.plist");
+  const prior = "[\"invalid installed state\"]\n";
+  fs.writeFileSync(target, prior);
+  const snapshots = [];
+  const touchedServices = [];
+  const commands = [];
+  const attemptInstall = (content) => installLaunchAgent({
+    label: "com.codex-whatsapp-bridge.council-events",
+    content,
+    target,
+    domain: "gui/501",
+    snapshot: (file) => snapshots.push(file),
+    touchedServices,
+    command: (...args) => commands.push(args),
+  });
+
+  assert.throws(() => attemptInstall("<plist><dict>\u0001</dict></plist>\n"), /Invalid LaunchAgent plist/);
+  assert.throws(() => attemptInstall("[\"syntactically valid plist array\"]\n"), /top-level value must be a dictionary/);
+  const wrongLabel = launchAgentPlist({
+    label: "com.example.unrelated",
+    args: [process.execPath, "/bridge/scripts/council-event-relay.mjs", "run"],
+    interval: 5,
+    stdout: path.join(root, "out.log"),
+    stderr: path.join(root, "error.log"),
+    workingDirectory: root,
+    home: root,
+    configPath: path.join(root, "config.json"),
+    nodeBinary: process.execPath,
+  });
+  assert.throws(() => attemptInstall(wrongLabel), /Label must be com.codex-whatsapp-bridge.council-events/);
+
+  assert.equal(fs.readFileSync(target, "utf8"), prior);
+  assert.deepEqual(snapshots, []);
+  assert.deepEqual(touchedServices, []);
+  assert.deepEqual(commands, []);
+  assert.deepEqual(fs.readdirSync(root), [path.basename(target)]);
+});
+
+test("launch agent install atomically replaces only validated content", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-plist-install-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, "com.codex-whatsapp-bridge.council-events.plist");
+  fs.writeFileSync(target, "prior state\n");
+  const content = launchAgentPlist({
+    label: "com.codex-whatsapp-bridge.council-events",
+    args: [process.execPath, "/bridge/scripts/council-event-relay.mjs", "run"],
+    interval: 5,
+    keepAlive: true,
+    stdout: path.join(root, "out.log"),
+    stderr: path.join(root, "error.log"),
+    workingDirectory: root,
+    home: root,
+    configPath: path.join(root, "config.json"),
+    nodeBinary: process.execPath,
+  });
+  const snapshots = [];
+  const touchedServices = [];
+  const commands = [];
+
+  installLaunchAgent({
+    label: "com.codex-whatsapp-bridge.council-events",
+    content,
+    target,
+    domain: "gui/501",
+    snapshot: (file) => snapshots.push(fs.readFileSync(file, "utf8")),
+    touchedServices,
+    command: (...args) => {
+      commands.push(args);
+      return { status: 0, stderr: "" };
+    },
+  });
+
+  assert.equal(fs.readFileSync(target, "utf8"), content);
+  assert.deepEqual(snapshots, ["prior state\n"]);
+  assert.deepEqual(touchedServices, ["com.codex-whatsapp-bridge.council-events"]);
+  assert.deepEqual(commands.map(([, args]) => args[0]), ["bootout", "bootstrap"]);
+});
 
 test("launch agents expose the configured Node directory to env-based tools", () => {
   const content = launchAgentPlist({
