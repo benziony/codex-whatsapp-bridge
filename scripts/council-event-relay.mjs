@@ -150,6 +150,9 @@ function readState(filePath) {
         !item || typeof item !== "object" || typeof item.eventId !== "string" || !SAFE_IDENTIFIER.test(item.eventId) || typeof item.challengeId !== "string" || !SAFE_IDENTIFIER.test(item.challengeId) || !Number.isSafeInteger(item.seq) || item.seq < 1 ||
         item.reason !== "observer-disabled" || !Number.isFinite(Date.parse(item.at)))))) throw new Error("Council relay state is invalid");
   if (value.pending !== undefined && (!Array.isArray(value.pending) || value.pending.length > MAX_PENDING_EVENTS || value.pending.some((item) => !validPendingPointer(item)))) throw new Error("Council relay pending queue is invalid");
+  if (value.jobs !== undefined && (!value.jobs || typeof value.jobs !== "object" || Array.isArray(value.jobs)
+    || Object.entries(value.jobs).some(([jobId, slot]) => !SAFE_IDENTIFIER.test(jobId) || !slot || typeof slot !== "object" || Array.isArray(slot)
+      || (slot.inputBinding !== undefined && !validJobInputBinding(slot.inputBinding))))) throw new Error("Council relay job slots are invalid");
   if (!validFrozenRegistryBatch(value.inbox, value.pending ?? [])) throw new Error("Council relay state is invalid");
   if (value.reconcileCheckpoint !== undefined && !validLegacyReconcileCheckpoint(value.reconcileCheckpoint)) throw new Error("Council relay reconciliation checkpoint is invalid");
   if (value.reconcile !== undefined && !validReconcileMarker(value.reconcile, value.cursor)) {
@@ -158,6 +161,41 @@ function readState(filePath) {
     delete value.reconcile;
   }
   return value;
+}
+
+function validJobInputBinding(value) {
+  const keys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value).sort().join(",") : "";
+  return !!value && typeof value === "object" && !Array.isArray(value)
+    && ["caseId,jobId,jobOfferEventId,revision,workspace", "caseId,inputDeliveryMode,jobId,jobOfferEventId,revision,workspace"].includes(keys)
+    && typeof value.workspace === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value.workspace)
+    && typeof value.jobId === "string" && SAFE_IDENTIFIER.test(value.jobId)
+    && typeof value.caseId === "string" && SAFE_CASE_ID.test(value.caseId)
+    && Number.isSafeInteger(value.revision) && value.revision >= 0
+    && typeof value.jobOfferEventId === "string" && SAFE_IDENTIFIER.test(value.jobOfferEventId)
+    && (value.inputDeliveryMode === undefined || value.inputDeliveryMode === "native-confirmed");
+}
+
+function inputRunHasJobBinding(state, event, workspace) {
+  const slot = state.jobs?.[event?.jobId];
+  const binding = slot?.inputBinding;
+  return !!slot && validJobInputBinding(binding) && binding.jobId === event.jobId
+    && binding.caseId === event.caseId && binding.revision === event.rev && binding.workspace === workspace
+    && binding.inputDeliveryMode === "native-confirmed" && event.inputDeliveryMode === "native-confirmed"
+    && slot.sessionId === event.nativeRunId;
+}
+
+function recordNativeInputMode(options, state, event) {
+  const slot = state.jobs?.[event.jobId];
+  const binding = slot?.inputBinding;
+  if (!slot || !validJobInputBinding(binding) || binding.jobId !== event.jobId || binding.caseId !== event.caseId
+    || binding.revision !== event.rev || binding.workspace !== options.workspace || slot.sessionId !== event.nativeRunId) {
+    throw new Error("Pending owner input has no matching relay-owned job run binding");
+  }
+  if (binding.inputDeliveryMode === "native-confirmed") return state;
+  const updated = { ...slot, inputBinding: { ...binding, inputDeliveryMode: "native-confirmed" } };
+  const next = { ...state, jobs: { ...(state.jobs ?? {}), [event.jobId]: updated } };
+  writeState(options.statePath, next);
+  return next;
 }
 
 function validLegacyReconcileCheckpoint(value) {
@@ -183,7 +221,7 @@ function validLegacyReconcileCheckpoint(value) {
 
 function validPendingPointer(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || !Number.isSafeInteger(value.seq) || value.seq < 1 || typeof value.eventId !== "string" || !SAFE_IDENTIFIER.test(value.eventId) || typeof value.kind !== "string" || (!SAFE_EVENT_KINDS.has(value.kind) && !SAFE_CHAT_EVENT_KINDS.has(value.kind))) return false;
-  const allowed = new Set(["seq", "eventId", "kind", "target", "executor", "caseId", "rev", "digest", "conversationId", "taskId", "jobId", "jobIdInvalid", "noticeKind", "principal"]);
+  const allowed = new Set(["seq", "eventId", "kind", "target", "executor", "caseId", "rev", "digest", "conversationId", "taskId", "jobId", "jobIdInvalid", "noticeKind", "principal", "attemptEvent", "attemptId", "epoch", "generation", "nativeRunId", "nativeMessageId", "inputDeliveryMode"]);
   if (Object.keys(value).some((key) => !allowed.has(key))) return false;
   if (value.kind === "registry.announce") {
     if (!SAFE_REGISTRY_NOTICE_KINDS.has(value.noticeKind) || typeof value.principal !== "string" || !SAFE_IDENTIFIER.test(value.principal)) return false;
@@ -191,9 +229,22 @@ function validPendingPointer(value) {
   for (const key of ["target", "executor"]) if (value[key] !== undefined && value[key] !== "codex") return false;
   if (value.jobId !== undefined && (typeof value.jobId !== "string" || !SAFE_IDENTIFIER.test(value.jobId))) return false;
   for (const key of ["caseId", "conversationId", "taskId"]) if (value[key] !== undefined && (typeof value[key] !== "string" || !SAFE_CASE_ID.test(value[key]))) return false;
-  if (value.rev !== undefined && (!Number.isSafeInteger(value.rev) || value.rev < 1)) return false;
+  const revisionMayBeZero = value.kind === "job.offer"
+    || value.kind === "attempt.event" && value.attemptEvent === "input_provide" && value.inputDeliveryMode === "native-confirmed";
+  if (value.rev !== undefined && (!Number.isSafeInteger(value.rev) || value.rev < (revisionMayBeZero ? 0 : 1))) return false;
   if (value.digest !== undefined && (typeof value.digest !== "string" || !SAFE_DIGEST.test(value.digest))) return false;
   if (value.jobIdInvalid !== undefined && value.jobIdInvalid !== true) return false;
+  if (value.inputDeliveryMode !== undefined && value.inputDeliveryMode !== "native-confirmed") return false;
+  if (value.attemptEvent !== undefined) {
+    if (value.kind !== "attempt.event" || value.attemptEvent !== "input_provide" || value.inputDeliveryMode !== "native-confirmed" || value.target !== "codex"
+      || typeof value.attemptId !== "string" || !SAFE_IDENTIFIER.test(value.attemptId)
+      || typeof value.jobId !== "string" || !SAFE_IDENTIFIER.test(value.jobId)
+      || !Number.isSafeInteger(value.epoch) || value.epoch < 1
+      || !Number.isSafeInteger(value.rev) || value.rev < 0
+      || !Number.isSafeInteger(value.generation) || value.generation < 1
+      || typeof value.nativeRunId !== "string" || !SAFE_IDENTIFIER.test(value.nativeRunId)
+      || typeof value.nativeMessageId !== "string" || !SAFE_IDENTIFIER.test(value.nativeMessageId)) return false;
+  }
   return true;
 }
 
@@ -217,9 +268,11 @@ function validRegistryBatch(batch) {
 function independentPendingPointer(value) {
   const jobSlot = value?.kind === "job.offer" && value.target === "codex" && value.executor === "codex"
     && typeof value.jobId === "string" && SAFE_IDENTIFIER.test(value.jobId);
+  const inputSlot = value?.kind === "attempt.event" && value.attemptEvent === "input_provide" && value.target === "codex"
+    && typeof value.jobId === "string" && SAFE_IDENTIFIER.test(value.jobId);
   const taskSlot = value?.target === "codex" && (value.kind === "chat.task.create" || value.kind === "chat.task.update")
     && typeof value.taskId === "string" && SAFE_CASE_ID.test(value.taskId);
-  return jobSlot || taskSlot;
+  return jobSlot || inputSlot || taskSlot;
 }
 
 function frozenRegistryBatchQueueIndex(batch, pending) {
@@ -302,7 +355,9 @@ function eventOnlyConversationGuidance(event, workspace, runtimePath, runtimeCre
 function eventPrompt(event, workspace = "default", runtimePath = "", conversationReplyPolicy = "proactive", runtimeCredentialFile = "") {
   if (!event || typeof event !== "object" || !Number.isSafeInteger(event.seq) || event.seq < 1 || typeof event.eventId !== "string" || !SAFE_IDENTIFIER.test(event.eventId) || typeof event.kind !== "string" || (!SAFE_EVENT_KINDS.has(event.kind) && !SAFE_CHAT_EVENT_KINDS.has(event.kind))) throw new Error("Council event is invalid");
   if (event.caseId !== undefined && (!SAFE_CASE_ID.test(String(event.caseId)))) throw new Error("Council event is invalid");
-  if (event.rev !== undefined && (!Number.isSafeInteger(event.rev) || event.rev < 1)) throw new Error("Council event is invalid");
+  const revisionMayBeZero = event.kind === "job.offer"
+    || event.kind === "attempt.event" && event.attemptEvent === "input_provide" && event.inputDeliveryMode === "native-confirmed";
+  if (event.rev !== undefined && (!Number.isSafeInteger(event.rev) || event.rev < (revisionMayBeZero ? 0 : 1))) throw new Error("Council event is invalid");
   if (event.digest !== undefined && (!SAFE_DIGEST.test(String(event.digest)))) throw new Error("Council event is invalid");
   if (event.conversationId !== undefined && !SAFE_CASE_ID.test(String(event.conversationId))) throw new Error("Council event is invalid");
   if (event.taskId !== undefined && !SAFE_CASE_ID.test(String(event.taskId))) throw new Error("Council event is invalid");
@@ -379,8 +434,14 @@ function pendingPointer(event, workspace, runtimePath, conversationReplyPolicy =
   if (event.target === "codex") pointer.target = "codex";
   if (event.executor === "codex") pointer.executor = "codex";
   for (const key of ["caseId", "conversationId", "taskId"]) if (typeof event[key] === "string" && SAFE_CASE_ID.test(event[key])) pointer[key] = event[key];
-  if (Number.isSafeInteger(event.rev) && event.rev > 0) pointer.rev = event.rev;
+  if (Number.isSafeInteger(event.rev) && (event.rev > 0 || event.rev === 0
+    && (event.kind === "job.offer" || event.kind === "attempt.event" && event.attemptEvent === "input_provide" && event.inputDeliveryMode === "native-confirmed"))) pointer.rev = event.rev;
   if (typeof event.digest === "string" && SAFE_DIGEST.test(event.digest)) pointer.digest = event.digest;
+  if (event.kind === "attempt.event" && event.attemptEvent === "input_provide" && event.inputDeliveryMode === "native-confirmed") {
+    for (const key of ["attemptEvent", "attemptId", "epoch", "generation", "nativeRunId", "nativeMessageId", "inputDeliveryMode"]) pointer[key] = event[key];
+    if (typeof event.jobId === "string" && SAFE_IDENTIFIER.test(event.jobId)) pointer.jobId = event.jobId;
+    pointer.rev = event.revision;
+  }
   if (event.kind === "registry.announce") {
     pointer.noticeKind = event.noticeKind;
     pointer.principal = event.principal;
@@ -396,7 +457,7 @@ function pendingPointer(event, workspace, runtimePath, conversationReplyPolicy =
 function jobWorkPrompt(event, workspace, runtimePath = "", runtimeCredentialFile = "", conversationReplyPolicy = "proactive") {
   if (event?.kind !== "job.offer" || typeof event.jobId !== "string" || !SAFE_IDENTIFIER.test(event.jobId)) throw new Error("Council job offer cannot be bound to an exact job");
   if (event.caseId !== undefined && !SAFE_CASE_ID.test(String(event.caseId))) throw new Error("Council job offer case id is invalid");
-  return `${eventPrompt(event, workspace, runtimePath, conversationReplyPolicy, runtimeCredentialFile)}\n\nThis verified event pointer is assigned to this dedicated owner-visible business work task. Read the complete current job and all current owner comments. Perform the actual authorized work in this Codex task and keep the owner conversation and progress here. When done or blocked, report the result and evidence back to the originating Council conversation/job. If any gate fails, do not claim or implement; report the precise blocker.`;
+  return `${eventPrompt(event, workspace, runtimePath, conversationReplyPolicy, runtimeCredentialFile)}\n\nThis verified event pointer is assigned to this dedicated owner-visible business work task. Read the complete current job and all current owner comments. Perform the actual authorized work in this Codex task and keep the owner conversation and progress here. When done or blocked, report the result and evidence back to the originating Council conversation/job. If any gate fails, do not claim or implement; report the precise blocker. If you claim this job from this exact Codex task and have its actual native App Server thread ID, you may opt into native-confirmed owner-input delivery by sending inputDeliveryMode: \"native-confirmed\" with job.claim and that exact nativeRunId. Leave the mode unset for provider-managed or other non-native execution; never use a guessed, copied, or arbitrary run ID to opt in.`;
 }
 
 function taskWorkPrompt(event, workspace, runtimePath, runtimeCredentialFile = "", conversationReplyPolicy = "proactive") {
@@ -475,6 +536,59 @@ async function registerCouncilPoll(options, event, delivery, config) {
   });
   if (!response.ok) throw new Error(`Council poll registration failed (${response.status})`);
   return { ok: true, status: "registered" };
+}
+
+async function councilRequest(options, route, { method = "GET", payload, requestId } = {}) {
+  const token = readBearerCredential({ credentialFile: options.credentialFile, tokenEnv: options.tokenEnv });
+  const url = new URL(route, options.councilUrl);
+  if (method === "GET" && payload) for (const [key, value] of Object.entries(payload)) url.searchParams.set(key, String(value));
+  const headers = { authorization: `Bearer ${token}`, "x-council-workspace": options.workspace };
+  if (method !== "GET") { headers["content-type"] = "application/json"; headers["x-request-id"] = requestId; }
+  const response = await fetch(url, { method, redirect: "error", headers,
+    ...(method === "GET" ? {} : { body: JSON.stringify(payload) }), signal: AbortSignal.timeout(15_000) });
+  const declared = Number(response.headers.get("content-length") ?? 0);
+  if (declared > 16_384) throw new Error("Council input response is too large");
+  const chunks = [];
+  let size = 0;
+  const reader = response.body?.getReader();
+  if (reader) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 16_384) { await reader.cancel(); throw new Error("Council input response is too large"); }
+      chunks.push(value);
+    }
+  }
+  const body = Buffer.concat(chunks).toString("utf8");
+  if (!response.ok) throw new Error(`Council input request failed (${response.status})`);
+  if (body.includes(token)) throw new Error("Council reflected the input credential");
+  try { return JSON.parse(body); } catch { throw new Error("Council returned invalid input JSON"); }
+}
+
+async function readPendingAttemptInput(options, event) {
+  const input = await councilRequest(options, "/api/attempt/input", { payload: { attemptId: event.attemptId } });
+  if (!input || input.inputDeliveryMode !== "native-confirmed" || input.jobId !== event.jobId || input.attemptId !== event.attemptId || input.epoch !== event.epoch
+    || input.revision !== event.rev || input.generation !== event.generation || input.nativeRunId !== event.nativeRunId
+    || input.nativeMessageId !== event.nativeMessageId || typeof input.answer !== "string" || !input.answer.trim()
+    || input.answer.length > 4_000) throw new Error("Council pending input no longer matches the exact event binding");
+  return input;
+}
+
+function attemptInputAdmissionRequestId(event) {
+  const identity = JSON.stringify({ workspace: event.workspace, jobId: event.jobId, attemptId: event.attemptId,
+    epoch: event.epoch, revision: event.rev, generation: event.generation, nativeRunId: event.nativeRunId, nativeMessageId: event.nativeMessageId });
+  return `council-input-admitted:${createHash("sha256").update(identity).digest("hex").slice(0, 48)}`;
+}
+
+async function acknowledgeAttemptInput(options, event, turn) {
+  if (turn?.sessionId !== event.nativeRunId || typeof turn?.turnId !== "string" || !SAFE_IDENTIFIER.test(turn.turnId)) {
+    throw new Error("Native input admission identity did not match the claimed run");
+  }
+  const payload = { attemptId: event.attemptId, event: "input_delivered", data: { jobId: event.jobId, epoch: event.epoch,
+    revision: event.rev, generation: event.generation, nativeRunId: event.nativeRunId,
+    nativeMessageId: event.nativeMessageId, nativeTurnId: turn.turnId } };
+  return councilRequest(options, "/api/attempt", { method: "POST", payload, requestId: attemptInputAdmissionRequestId({ ...event, workspace: options.workspace }) });
 }
 
 async function* sseEvents(response, signal) {
@@ -948,7 +1062,7 @@ async function reconcileCursor(options, cursor, config, turnRunner, onMarker = (
   return { currentCursor: marker.currentCursor, requestId: marker.requestId };
 }
 
-export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, executionRecoveryRunner = verifyCodexAppServerExecutionTerminal, executionRecoveryRetryMs = DEFAULT_EXECUTION_RECOVERY_RETRY_MS, reconcileRunner = reconcileCursor, readOnlyRuntimeRunner = runReadOnlyRuntimeReconcile, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, runtimeRenewalRunner = runRuntimeRenewal, nativeObserverFactory = createNativeObserver, observerCredentialLoader = loadObserverCredential, nativeObserverRequest, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
+export async function runRelay(config, { signal = new AbortController().signal, streamOpener = openStream, turnRunner = runCodexAppServerTurn, executionRecoveryRunner = verifyCodexAppServerExecutionTerminal, executionRecoveryRetryMs = DEFAULT_EXECUTION_RECOVERY_RETRY_MS, reconcileRunner = reconcileCursor, readOnlyRuntimeRunner = runReadOnlyRuntimeReconcile, notificationSender = sendWhatsAppNotification, pollSender = sendWhatsAppPoll, pollRegistrar = registerCouncilPoll, inputReader = readPendingAttemptInput, inputAcknowledger = acknowledgeAttemptInput, runtimeRenewalRunner = runRuntimeRenewal, nativeObserverFactory = createNativeObserver, observerCredentialLoader = loadObserverCredential, nativeObserverRequest, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), errorLogger = (line) => console.error(line) } = {}) {
   const options = relayConfig(config);
   if (!options) throw new Error("Council push is not configured");
   if (options.recoveryPolicy === "read-only" || options.conversationReplyPolicy === "event-only") readOnlyRuntimeCredential(options);
@@ -1176,7 +1290,8 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       if (activeSlots.size >= MAX_ACTIVE_DISPATCHES) return;
       if (!(state.pending ?? []).some((item) => item.eventId === queued.eventId)) continue;
       const event = queued;
-      const exactJobId = event.kind === "job.offer" && event.target === "codex" && event.executor === "codex" && typeof event.jobId === "string" && SAFE_IDENTIFIER.test(event.jobId) ? event.jobId : null;
+      const exactInput = event.kind === "attempt.event" && event.attemptEvent === "input_provide" && event.inputDeliveryMode === "native-confirmed" && event.target === "codex" && validPendingPointer(event);
+      const exactJobId = (event.kind === "job.offer" && event.target === "codex" && event.executor === "codex" && typeof event.jobId === "string" && SAFE_IDENTIFIER.test(event.jobId)) || exactInput ? event.jobId : null;
       const exactTaskId = event.target === "codex" && (event.kind === "chat.task.create" || event.kind === "chat.task.update") && typeof event.taskId === "string" && SAFE_CASE_ID.test(event.taskId) ? event.taskId : null;
       const inbox = state.inbox ?? { sessionId: options.sessionId || null };
       const slot = exactJobId ? (state.jobs?.[exactJobId] ?? {}) : exactTaskId ? (state.tasks?.[exactTaskId] ?? {}) : inbox;
@@ -1212,6 +1327,12 @@ export async function runRelay(config, { signal = new AbortController().signal, 
       const saveSlot = (execution, removePending = false) => {
         const previous = exactJobId ? (state.jobs?.[exactJobId] ?? {}) : exactTaskId ? (state.tasks?.[exactTaskId] ?? {}) : (state.inbox ?? { sessionId: options.sessionId || null });
         const updated = { ...previous };
+        if (exactJobId && event.kind === "job.offer" && event.jobId === exactJobId
+          && typeof event.caseId === "string" && SAFE_CASE_ID.test(event.caseId)
+          && Number.isSafeInteger(event.rev) && event.rev >= 0) {
+          updated.inputBinding = { workspace: options.workspace, jobId: exactJobId, caseId: event.caseId,
+            revision: event.rev, jobOfferEventId: event.eventId };
+        }
         if (execution) {
           updated.execution = { ...execution, eventId: event.eventId };
           if (execution.sessionId) updated.sessionId = execution.sessionId;
@@ -1251,16 +1372,27 @@ export async function runRelay(config, { signal = new AbortController().signal, 
         ? `Council job ${exactJobId}${event.caseId ? ` · ${event.caseId}` : ""}`
         : exactTaskId ? `Council task ${exactTaskId}`
         : "Agent Council Codex inbox";
-      const generatedPrompt = registryBatch ? registryBatchPrompt(registryBatch, options.workspace, options.runtimePath, options.conversationReplyPolicy, options.runtimeCredentialFile) : exactJobId ? jobWorkPrompt(event, options.workspace, options.runtimePath, options.runtimeCredentialFile, options.conversationReplyPolicy) : exactTaskId ? taskWorkPrompt(event, options.workspace, options.runtimePath, options.runtimeCredentialFile, options.conversationReplyPolicy) : eventPrompt(event, options.workspace, options.runtimePath, options.conversationReplyPolicy, options.runtimeCredentialFile);
-      const prompt = options.recoveryPolicy === "read-only" && options.conversationReplyPolicy !== "event-only"
+      const generatedPrompt = registryBatch ? registryBatchPrompt(registryBatch, options.workspace, options.runtimePath, options.conversationReplyPolicy, options.runtimeCredentialFile) : exactInput ? "Deliver one pending owner answer to its exact Codex run." : exactJobId ? jobWorkPrompt(event, options.workspace, options.runtimePath, options.runtimeCredentialFile, options.conversationReplyPolicy) : exactTaskId ? taskWorkPrompt(event, options.workspace, options.runtimePath, options.runtimeCredentialFile, options.conversationReplyPolicy) : eventPrompt(event, options.workspace, options.runtimePath, options.conversationReplyPolicy, options.runtimeCredentialFile);
+      const basePrompt = options.recoveryPolicy === "read-only" && options.conversationReplyPolicy !== "event-only"
         ? `${authenticatedCouncilAccess(options.workspace, options.runtimePath, options.runtimeCredentialFile, true)}\n${generatedPrompt}`
         : generatedPrompt;
-      const requestId = registryBatch ? registryBatchRequestId(options.workspace, registryBatch) : "council-event:" + event.eventId;
-      const runTurn = () => {
+      const requestId = exactInput ? event.nativeMessageId : registryBatch ? registryBatchRequestId(options.workspace, registryBatch) : "council-event:" + event.eventId;
+      const runTurn = async () => {
         if (options.conversationReplyPolicy === "event-only" || options.recoveryPolicy === "read-only") readOnlyRuntimeCredential(options);
+        let prompt = exactInput ? "" : basePrompt;
+        if (exactInput) {
+          state = recordNativeInputMode(options, state, event);
+          if (!inputRunHasJobBinding(state, event, options.workspace)) {
+            throw new Error("Pending owner input has no matching relay-owned job run binding");
+          }
+          const recoveringAcceptedTurn = ["turn-starting", "turn-start-uncertain"].includes(activeExecution?.stage)
+            && activeExecution?.sessionId === event.nativeRunId;
+          if (recoveringAcceptedTurn) prompt = "Recover the exact existing turn by its stable request ID; never start a replacement turn.";
+          else prompt = (await inputReader(options, event)).answer;
+        }
         return turnRunner({
         codexBinary: codexBinaryPath(config), cwd: options.cwd, prompt, requestId,
-        sessionId: slot.sessionId ?? (!exactJobId && !exactTaskId ? options.sessionId || null : null),
+        sessionId: exactInput ? event.nativeRunId : slot.sessionId ?? (!exactJobId && !exactTaskId ? options.sessionId || null : null),
         execution: activeExecution,
         title,
         turnTimeoutMs: 15 * 60 * 1000,
@@ -1275,12 +1407,18 @@ export async function runRelay(config, { signal = new AbortController().signal, 
           const current = exactJobId ? (state.jobs?.[exactJobId] ?? {}) : exactTaskId ? (state.tasks?.[exactTaskId] ?? {}) : (state.inbox ?? { sessionId: options.sessionId || null });
           saveSlot({ ...(current.execution ?? {}), stage: "turn-starting", sessionId, ...(turnId ? { turnId } : {}), uncertainUntil });
         },
-        onTurnStarted: commitAdmission,
+        onTurnStarted: async (turn) => { if (!exactInput) commitAdmission(turn); },
+        onTurnAdmitted: async (turn) => {
+          if (exactInput) await inputAcknowledger(options, { ...event, workspace: options.workspace }, turn);
+          if (!admitted) commitAdmission(turn);
+        },
         });
       };
       let retryDelay = 0;
-      const completion = Promise.resolve().then(runTurn).then(() => {
-        if (!admitted) commitAdmission();
+      const completion = Promise.resolve().then(runTurn).then(async (turn) => {
+        // App Server admission is acknowledged before turn completion, including
+        // recovery of an already admitted request by its stable client ID.
+        if (!admitted) commitAdmission(turn);
         saveSlot(null);
         pendingRetryMs = 1_000;
       }).catch((error) => {
