@@ -632,6 +632,71 @@ test("expired recipient response challenges advance as transport controls before
   assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 2);
 });
 
+test("connect capability publication advances passively before the next exact job offer is admitted", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-connect-capabilities-passive-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const credentialFile = path.join(directory, "codex-token");
+  const statePath = path.join(directory, "push-state.json");
+  fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+  fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+  const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile,
+    cwd: directory, statePath, workspace: "solar_ops" } };
+  const controller = new AbortController();
+  const capabilityNotice = { seq: 1, eventId: "connect-capabilities-put", op: "connect.capabilities.put", kind: "job.offer",
+    target: "codex", executor: "codex", jobId: "spoofed-capability-job", caseId: "case_spoofed" };
+  const jobOffer = { seq: 2, eventId: "job-after-capabilities", op: "job.offer", kind: "job.offer", target: "codex",
+    executor: "codex", jobId: "job_after_capabilities", caseId: "case_capabilities", rev: 0 };
+  const turns = [];
+  let stateAtAdmission;
+  const result = await runRelay(config, { signal: controller.signal,
+    streamOpener: async () => new Response([capabilityNotice, jobOffer].map((event) =>
+      `id: ${event.seq}\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`).join("")),
+    turnRunner: async (input) => {
+      turns.push(input);
+      assert.equal(input.requestId, "council-event:job-after-capabilities");
+      assert.equal(input.title, "Council job job_after_capabilities · case_capabilities");
+      await input.onTurnStarted({ sessionId: "job-capabilities-thread", turnId: "job-capabilities-turn" });
+      stateAtAdmission = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      controller.abort();
+    },
+    sleep: async () => { await waitFor(() => turns.length === 1); controller.abort(); }, errorLogger: () => {},
+  });
+  const stored = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(result.cursor, 2);
+  assert.equal(turns.length, 1, "the capability publication is passive; only the following exact job offer starts native work");
+  assert.deepEqual(stored.jobs.job_after_capabilities.inputBinding, {
+    workspace: "solar_ops", jobId: "job_after_capabilities", caseId: "case_capabilities", revision: 0, jobOfferEventId: "job-after-capabilities",
+  });
+  assert.equal(stored.jobs.spoofed_capability_job, undefined, "capability payload routing fields do not create a job pointer");
+  assert.equal(stateAtAdmission.jobs.job_after_capabilities.execution.turnId, "job-capabilities-turn", "the valid job reaches native turn admission");
+});
+
+test("known passive connect operation still rejects malformed sequence and event identity", async (t) => {
+  for (const [name, event] of [
+    ["sequence", { seq: 0, eventId: "connect-capabilities-seq", op: "connect.capabilities.put" }],
+    ["event identity", { seq: 1, eventId: "unsafe capabilities id", op: "connect.capabilities.put" }],
+  ]) await t.test(name, async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-connect-capabilities-invalid-"));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const credentialFile = path.join(directory, "codex-token");
+    const statePath = path.join(directory, "push-state.json");
+    fs.writeFileSync(credentialFile, "codex-token\n", { mode: 0o600 });
+    fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, cursor: 0, notified: [] }), { mode: 0o600 });
+    const config = { councilPush: { enabled: true, councilUrl: "https://council.example", codexCredentialFile: credentialFile,
+      cwd: directory, statePath, workspace: "solar_ops" } };
+    const controller = new AbortController();
+    let turnStarted = false;
+    const result = await runRelay(config, { signal: controller.signal,
+      streamOpener: async () => new Response(`id: 1\nevent: council.event\ndata: ${JSON.stringify(event)}\n\n`),
+      turnRunner: async () => { turnStarted = true; },
+      sleep: async () => controller.abort(), errorLogger: () => {},
+    });
+    assert.equal(turnStarted, false);
+    assert.equal(result.cursor, 0);
+    assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).cursor, 0);
+  });
+});
+
 test("malformed recipient response challenges fail closed without moving the durable cursor", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "council-response-invalid-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));

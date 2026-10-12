@@ -40,7 +40,7 @@ const SAFE_REGISTRY_NOTICE_KINDS = new Set([
   "membership-scope", "membership-pause", "membership-revoke",
 ]);
 const SAFE_PASSIVE_ONBOARDING_OPS = new Set([
-  "connect.profile.put", "connect.challenge.issue", "connect.challenge.answer",
+  "connect.capabilities.put", "connect.profile.put", "connect.challenge.issue", "connect.challenge.answer",
   "connect.verify", "connect.modes", "connect.restart", "connect.response.challenge",
 ]);
 const SAFE_CHAT_EVENT_KINDS = new Set([
