@@ -429,6 +429,7 @@ export async function runCodexAppServerTurn({
   onThreadReady = () => {},
   onTurnStarting = () => {},
   onTurnStarted = () => {},
+  onTurnAdmitted = () => {},
   spawnTask = spawn,
   rpcTimeoutMs = RPC_TIMEOUT_MS,
   turnTimeoutMs = TURN_TIMEOUT_MS,
@@ -460,6 +461,10 @@ export async function runCodexAppServerTurn({
       if (!thread || thread.id !== recoverySessionId) throw new Error("The Codex task could not be recovered");
       const recovered = findRequestTurn(thread, requestId, execution.turnId ?? null);
       if (recovered) {
+        const userMessage = (recovered.items ?? []).find((item) => item?.type === "userMessage" && item.clientId === requestId);
+        if (!userMessage) throw new CodexAttentionRequiredError("The saved Codex turn does not contain the exact admitted request. Open the task in Codex; no replacement was started.");
+        try { await onTurnAdmitted({ sessionId: recoverySessionId, turnId: recovered.id }); }
+        catch { throw new CodexTurnStartUncertainError(); }
         const result = turnResult(recovered);
         return { ...result, sessionId: recoverySessionId, title: thread.name ?? title, cwd: thread.cwd ?? cwd, recovered: true };
       }
@@ -565,6 +570,8 @@ export async function runCodexAppServerTurn({
     const turnId = startedTurn?.turn?.id;
     if (!turnId) throw new CodexTurnStartUncertainError("Codex returned no turn identifier, so the accepted request must be recovered before continuing.");
     try { await onTurnStarted({ sessionId: thread.id, turnId, title: thread.name ?? title, cwd: thread.cwd ?? cwd }); }
+    catch { throw new CodexTurnStartUncertainError(); }
+    try { await onTurnAdmitted({ sessionId: thread.id, turnId }); }
     catch { throw new CodexTurnStartUncertainError(); }
     let completed;
     try { completed = await connection.waitForTurn(thread.id, turnId, turnTimeoutMs); }
