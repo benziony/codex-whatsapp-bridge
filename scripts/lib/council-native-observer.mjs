@@ -177,6 +177,129 @@ export async function observeNativeTurn({ spawnImpl = spawn, codexBinary, cwd, t
   } finally { cleanup(); }
 }
 
+export async function observeNativeTurns({ spawnImpl = spawn, codexBinary, cwd, threadId, requests, timeoutMs = 15_000,
+  historyTimeoutMs = 60_000, pageLimit = 50, maxPages = 96 }) {
+  if (typeof spawnImpl !== "function" || typeof codexBinary !== "string" || !isAbsolute(cwd) || typeof threadId !== "string" || !threadId ||
+      !Array.isArray(requests) || requests.length < 1 || requests.length > 128 || requests.some((item) => !item || typeof item.requestId !== "string" ||
+        !item.requestId || typeof item.expectedText !== "string" || !item.expectedText || item.expectedText.length > 4096) ||
+      !Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000 || !Number.isFinite(historyTimeoutMs) || historyTimeoutMs < timeoutMs || historyTimeoutMs > 120_000 ||
+      !Number.isSafeInteger(pageLimit) || pageLimit < 1 || pageLimit > 100 || !Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 128) fail("Native observer history request is invalid");
+  if (new Set(requests.map((item) => item.requestId)).size !== requests.length) fail("Native observer request identity is ambiguous");
+  const deadline = Date.now() + historyTimeoutMs;
+  const remainingTimeout = () => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) fail("Native observer history time limit exceeded");
+    return Math.min(timeoutMs, remaining);
+  };
+  const child = spawnImpl(codexBinary, ["app-server", "--listen", "stdio://"], { cwd, shell: false, stdio: ["pipe", "pipe", "ignore"] });
+  if (!child?.stdout || !child?.stdin) fail("Native observer app-server did not start");
+  let buffer = "";
+  let nextId = 1;
+  let stopped = false;
+  const pending = new Map();
+  const cleanup = () => {
+    if (stopped) return;
+    stopped = true;
+    child.stdin.destroy?.(); child.stdout.destroy?.(); child.kill?.("SIGTERM");
+  };
+  const onData = (chunk) => {
+    buffer += String(chunk);
+    if (buffer.length > MAX_STATE_BYTES) { for (const p of pending.values()) p.reject(new Error("Native observer response is too large")); cleanup(); return; }
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline).trim(); buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      try { message = JSON.parse(line); } catch { for (const p of pending.values()) p.reject(new Error("Native observer returned invalid JSON-RPC")); cleanup(); return; }
+      if (message?.method !== undefined && message?.id === undefined) {
+        if (typeof message.method === "string" && (message.method.startsWith("tool/") || message.method === "item/commandExecution/requestApproval")) {
+          for (const p of pending.values()) p.reject(new Error("Native observer requested tool approval")); cleanup();
+        }
+        continue;
+      }
+      const waiter = pending.get(message.id);
+      if (waiter) { pending.delete(message.id); waiter.resolve(message); }
+    }
+  };
+  child.stdout.on("data", onData);
+  child.once?.("error", () => { for (const p of pending.values()) p.reject(new Error("Native observer app-server failed")); });
+  const rpc = (method, params, requestTimeoutMs = timeoutMs) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error("Native observer app-server timed out")); }, requestTimeoutMs);
+    pending.set(id, { resolve: (message) => { clearTimeout(timer); resolve(message); }, reject: (error) => { clearTimeout(timer); reject(error); } });
+    try { child.stdin.write(`${JSON.stringify({ id, method, params })}\n`); } catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
+  });
+  try {
+    const initialized = await rpc("initialize", { clientInfo: { name: "council-native-observer", version: "1" } }, remainingTimeout());
+    if (initialized?.error || !initialized || !Object.hasOwn(initialized, "result")) fail("Native observer initialization failed");
+    child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
+    const metadata = await rpc("thread/read", { threadId, includeTurns: false }, remainingTimeout());
+    if (metadata?.error || metadata?.result?.thread?.id !== threadId) fail("Native observer thread identity is invalid");
+    let cursor;
+    const seenCursors = new Set();
+    const turnMatches = new Map();
+    const turnStatuses = new Map();
+    let complete = false;
+    for (let page = 0; page < maxPages; page++) {
+      const response = await rpc("thread/turns/list", { threadId, limit: pageLimit, itemsView: "summary", sortDirection: "desc", ...(cursor ? { cursor } : {}) }, remainingTimeout());
+      if (response?.error || !Array.isArray(response?.result?.data)) fail("Native observer turn page is invalid");
+      for (const turn of response.result.data) {
+        if (!turn || typeof turn.id !== "string" || !turn.id || !["inProgress", "interrupted", "completed", "failed"].includes(turn.status) || !Array.isArray(turn.items)) fail("Native observer turn identity is invalid");
+        turnStatuses.set(turn.id, turn.status);
+        for (const entry of turn.items) {
+          if (entry?.type !== "userMessage" || typeof entry.clientId !== "string") continue;
+          if (requests.some((request) => request.requestId === entry.clientId)) {
+            const list = turnMatches.get(entry.clientId) ?? [];
+            list.push(turn.id); turnMatches.set(entry.clientId, list);
+          }
+        }
+      }
+      const next = response.result.nextCursor;
+      if (next === null || next === undefined) { complete = true; break; }
+      if (typeof next !== "string" || !next || seenCursors.has(next)) fail("Native observer turn cursor is invalid");
+      seenCursors.add(next); cursor = next;
+    }
+    if (!complete) fail("Native observer history page limit exceeded");
+    const found = new Map();
+    for (const request of requests) {
+      const turns = turnMatches.get(request.requestId) ?? [];
+      if (turns.length > 1) fail("Native admission turn identity is invalid");
+      if (!turns.length) continue;
+      const turnId = turns[0];
+      const items = [];
+      let itemCursor;
+      const itemCursors = new Set();
+      let itemsComplete = false;
+      for (let page = 0; page < maxPages; page++) {
+        const response = await rpc("thread/items/list", { threadId, turnId, limit: pageLimit, sortDirection: "asc", ...(itemCursor ? { cursor: itemCursor } : {}) }, remainingTimeout());
+        if (response?.error || !Array.isArray(response?.result?.data)) fail("Native observer item page is invalid");
+        for (const entry of response.result.data) {
+          if (entry?.turnId !== turnId || !entry.item || typeof entry.item.type !== "string") fail("Native observer item identity is invalid");
+          items.push(entry.item);
+        }
+        const next = response.result.nextCursor;
+        if (next === null || next === undefined) { itemsComplete = true; break; }
+        if (typeof next !== "string" || !next || itemCursors.has(next)) fail("Native observer item cursor is invalid");
+        itemCursors.add(next); itemCursor = next;
+      }
+      if (!itemsComplete) fail("Native observer item page limit exceeded");
+      const exactItems = items.filter((entry) => entry.type === "userMessage" && entry.clientId === request.requestId);
+      if (exactItems.length > 1) fail("Native admission turn identity is invalid");
+      const exactItem = exactItems[0];
+      if (!exactItem) continue;
+      const content = Array.isArray(exactItem.content) ? exactItem.content.filter((entry) => entry?.type === "text" && typeof entry.text === "string").map((entry) => entry.text).join("") : null;
+      if (content !== request.expectedText) continue;
+      const challengeLine = content.split("\n").find((line) => line.startsWith("Challenge: "));
+      let challenge;
+      try { challenge = JSON.parse(challengeLine.slice("Challenge: ".length)); } catch { fail("Native admission nonce is malformed"); }
+      if (!challenge || typeof challenge.challengeId !== "string" || !NONCE.test(challenge.nonce)) fail("Native admission nonce is malformed");
+      const turn = turnMatches.get(request.requestId);
+      found.set(request.requestId, { turnId, status: turnStatuses.get(turnId), nonce: challenge.nonce, observedAt: new Date().toISOString() });
+    }
+    return found;
+  } finally { cleanup(); }
+}
+
 export function createNativeObserver(config, options = {}, deps = {}) {
   validateObserverConfig(config);
   const scope = { agentId: config.agentId, workspace: options.workspace, runtimeId: config.runtimeId, nativeThreadId: config.nativeThreadId,
@@ -187,6 +310,8 @@ export function createNativeObserver(config, options = {}, deps = {}) {
   const random = deps.random ?? Math.random;
   const randomId = deps.randomId ?? (() => randomBytes(12).toString("hex"));
   const observerReader = deps.observerReader ?? observeNativeTurn;
+  const historyReader = deps.historyReader ?? observeNativeTurns;
+  const recoveredTurns = new Map();
   const canRunControl = deps.canRunControl ?? (() => true);
   let busy = false;
   let ticking = false;
@@ -204,7 +329,7 @@ export function createNativeObserver(config, options = {}, deps = {}) {
   const fences = () => ({ agent: scope.agentId, workspace: scope.workspace, runtimeId: scope.runtimeId, nativeThreadId: scope.nativeThreadId,
     profileRevision: scope.profileRevision, generation: scope.generation, grantId: config.grantId, grantRevision: config.grantRevision });
 
-  async function ensureState() {
+  async function ensureState({ allowOverLimit = false } = {}) {
     let state = await readObserverState(config.statePath);
     if (!state || JSON.stringify(state.fences) !== JSON.stringify(fences())) {
       state = { fences: fences(), seq: 0, pendingIssue: null, pendingEvents: [], rejectedPendingEvents: 0, skippedEvents: [], challenge: null, control: {}, proof: null, halted: null, nextAt: 0 };
@@ -220,7 +345,7 @@ export function createNativeObserver(config, options = {}, deps = {}) {
       state.skippedEvents.push({ eventId: control.eventId, challengeId: control.challengeId, seq: control.seq, at: new Date(clock()).toISOString(), reason: "expired-before-admission" });
     }
     state.skippedEvents = state.skippedEvents.slice(-64);
-    if (Object.keys(state.control).length > 64) {
+    if (Object.keys(state.control).length > 64 && !allowOverLimit) {
       for (const key of Object.keys(state.control)) {
         if (Object.keys(state.control).length <= 64) break;
         if (state.control[key]?.admission) delete state.control[key];
@@ -363,19 +488,34 @@ export function createNativeObserver(config, options = {}, deps = {}) {
   }
 
   async function findExisting(challengeId, control) {
+    const cached = recoveredTurns.get(control.requestId);
+    if (cached) { recoveredTurns.delete(control.requestId); return cached; }
     const expectedText = nativeControlPrompt({ challengeId, nonce: control.nonce });
+    if (!deps.observerReader) {
+      const visibilityDeadline = Date.now() + (deps.observerVisibilityTimeoutMs ?? 5_000);
+      while (true) {
+        const found = await historyReader({ threadId: config.nativeThreadId, requests: [{ requestId: control.requestId, expectedText }], timeoutMs: deps.observerTimeoutMs ?? 15_000,
+          historyTimeoutMs: deps.historyTimeoutMs ?? 60_000, pageLimit: deps.historyPageLimit ?? 50, maxPages: deps.historyMaxPages ?? 96,
+          spawnImpl: deps.spawnImpl, codexBinary: deps.codexBinary ?? "codex", cwd: deps.cwd ?? process.cwd() });
+        const result = found.get(control.requestId);
+        if (result) return result;
+        const delay = Math.min(deps.observerPollIntervalMs ?? 100, visibilityDeadline - Date.now());
+        if (delay <= 0) fail("Native admission turn has not appeared", "NATIVE_TURN_NOT_FOUND");
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
     return observerReader({ threadId: config.nativeThreadId, requestId: control.requestId, expectedText, timeoutMs: deps.observerTimeoutMs ?? 15_000,
       visibilityTimeoutMs: deps.observerVisibilityTimeoutMs ?? 5_000, visibilityPollIntervalMs: deps.observerPollIntervalMs ?? 100,
       spawnImpl: deps.spawnImpl, codexBinary: deps.codexBinary ?? "codex", cwd: deps.cwd ?? process.cwd() });
   }
 
-  async function processOne(challengeId) {
+  async function processOne(challengeId, { allowExpiredRecovery = false } = {}) {
     let state = await readObserverState(config.statePath);
     const control = state?.control?.[challengeId];
     if (!control || control.admission) return control ?? null;
     const expired = Date.parse(control.expiresAt) <= clock();
-    if (expired && !control.admitBody) return { ...control, expired: true };
-    if ((!control.admitBody && !canRunControl()) || busy) return control;
+    if (expired && !control.admitBody && (!control.uncertain || !allowExpiredRecovery)) return { ...control, expired: true };
+    if ((!control.admitBody && !control.uncertain && !canRunControl()) || busy) return control;
     busy = true;
     try {
       if (control.admitBody) {
@@ -401,7 +541,12 @@ export function createNativeObserver(config, options = {}, deps = {}) {
         let found;
         try { found = await findExisting(challengeId, control); }
         catch (error) { if (error?.code === "NATIVE_TURN_NOT_FOUND") return control; throw error; }
-        return admitObserved(challengeId, found);
+        try { return await admitObserved(challengeId, found); }
+        catch (error) {
+          if (!expired || (error?.code !== "NATIVE_PROOF_EXPIRED" && !/\((?:404|409)\)/.test(error?.message ?? ""))) throw error;
+          await markExpiredAdmission(challengeId);
+          return { ...control, expired: true };
+        }
       }
       await mutateState(async () => {
         state = await readObserverState(config.statePath);
@@ -462,12 +607,58 @@ export function createNativeObserver(config, options = {}, deps = {}) {
     } finally { busy = false; }
   }
 
+  async function markExpiredAdmission(challengeId) {
+    await mutateState(async () => {
+      const latest = await readObserverState(config.statePath);
+      const current = latest?.control?.[challengeId];
+      if (!current || current.admission) return;
+      latest.control[challengeId] = { ...current, admission: { status: "expired", at: new Date(clock()).toISOString() }, uncertain: false };
+      if (latest.challenge?.id === challengeId) latest.challenge = null;
+      latest.nextAt = 0;
+      await saveObserverState(config.statePath, latest);
+    });
+  }
+
+  async function recoverExpiredUncertain(state) {
+    if (Object.keys(state.control).length <= 64) return new Set();
+    const candidates = Object.entries(state.control).filter(([, control]) => (control?.uncertain || control?.admitBody) && !control.admission);
+    if (!candidates.length) return new Set();
+    const requests = candidates.map(([challengeId, control]) => ({ requestId: control.requestId,
+      expectedText: nativeControlPrompt({ challengeId, nonce: control.nonce }) }));
+    const matches = await historyReader({ threadId: config.nativeThreadId, requests, timeoutMs: deps.observerTimeoutMs ?? 15_000,
+      historyTimeoutMs: deps.historyTimeoutMs ?? 60_000, pageLimit: deps.historyPageLimit ?? 50, maxPages: deps.historyMaxPages ?? 96,
+      spawnImpl: deps.spawnImpl, codexBinary: deps.codexBinary ?? "codex", cwd: deps.cwd ?? process.cwd() });
+    for (const [challengeId, control] of candidates) {
+      const match = matches.get(control.requestId);
+      if (match) recoveredTurns.set(control.requestId, match);
+    }
+    const positivelyRecovered = [];
+    for (const [challengeId, control] of candidates) {
+      if (!recoveredTurns.has(control.requestId)) continue;
+      await processOne(challengeId, { allowExpiredRecovery: true });
+      positivelyRecovered.push(challengeId);
+    }
+    if (positivelyRecovered.length) await mutateState(async () => {
+      const latest = await readObserverState(config.statePath);
+      let changed = false;
+      for (const challengeId of positivelyRecovered) {
+        if (latest.control[challengeId]?.admission?.status !== "expired") continue;
+        delete latest.control[challengeId];
+        changed = true;
+      }
+      if (changed) await saveObserverState(config.statePath, latest);
+    });
+    return new Set(candidates.map(([challengeId]) => challengeId));
+  }
+
   async function tick({ force = false } = {}) {
     if (ticking || busy) return { busy: true };
     ticking = true;
     try {
-    let state = await mutateState(() => ensureState());
+    let state = await mutateState(() => ensureState({ allowOverLimit: true }));
     if (halted || state.halted) return { halted: true };
+    const historyChecked = await recoverExpiredUncertain(state);
+    state = await mutateState(() => ensureState());
     // A persisted admission is an idempotent proof readback, so recover it
     // before issuing a replacement challenge when its original nonce expires.
     for (const challengeId of Object.keys(state.control)) {
@@ -504,6 +695,7 @@ export function createNativeObserver(config, options = {}, deps = {}) {
     }
     if (result.issued && !result.promoted) return { issued: true };
     for (const challengeId of Object.keys(state.control)) {
+      if (historyChecked.has(challengeId)) continue;
       try { await processOne(challengeId); }
       catch (error) {
         if (!/\((401|403)\)/.test(error?.message ?? "")) throw error;

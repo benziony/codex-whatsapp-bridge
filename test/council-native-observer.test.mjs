@@ -5,7 +5,7 @@ import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { controlRequestId, createNativeObserver, loadObserverCredential, observeNativeTurn } from "../scripts/lib/council-native-observer.mjs";
+import { controlRequestId, createNativeObserver, loadObserverCredential, observeNativeTurn, observeNativeTurns } from "../scripts/lib/council-native-observer.mjs";
 
 const pause = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -38,12 +38,23 @@ function jsonRpcReader(recorded, methods) {
         let result;
         if (message.method === "initialize") result = {};
         else if (message.method === "thread/read") {
-          assert.deepEqual(message.params, { threadId: "thread-a", includeTurns: true });
+          assert.equal(message.params.threadId, "thread-a");
+          if (message.params.includeTurns) {
+            assert.deepEqual(message.params, { threadId: "thread-a", includeTurns: true });
+            const item = recorded.get(message.params.threadId);
+            result = { thread: { id: "thread-a", turns: item ? [{ id: item.turnId, status: "inProgress", items: [
+              { type: "userMessage", clientId: item.requestId, content: [{ type: "text", text: item.prompt }] },
+              { type: "agentMessage", text: "I saw the nonce." },
+            ] }] : [] } };
+          } else result = { thread: { id: "thread-a" } };
+        } else if (message.method === "thread/turns/list") {
           const item = recorded.get(message.params.threadId);
-          result = { thread: { id: "thread-a", turns: item ? [{ id: item.turnId, status: "inProgress", items: [
-            { type: "userMessage", clientId: item.requestId, content: [{ type: "text", text: item.prompt }] },
-            { type: "agentMessage", text: "I saw the nonce." },
-          ] }] : [] } };
+          result = { data: item ? [{ id: item.turnId, status: "inProgress", items: [{ type: "userMessage", clientId: item.requestId }] }] : [], nextCursor: null };
+        } else if (message.method === "thread/items/list") {
+          const item = recorded.get(message.params.threadId);
+          result = { data: item && item.turnId === message.params.turnId
+            ? [{ turnId: item.turnId, item: { type: "userMessage", clientId: item.requestId, content: [{ type: "text", text: item.prompt }] } }]
+            : [], nextCursor: null };
         } else throw new Error(`Unexpected native RPC method ${message.method}`);
         queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: message.id, result })}\n`));
       }
@@ -72,6 +83,108 @@ test("observer rejects missing or mismatched native turns without accepting agen
   await assert.rejects(observeNativeTurn({ spawnImpl: missing, codexBinary: "synthetic-codex", cwd: process.cwd(), threadId: "thread-a", requestId: "missing", expectedText, timeoutMs: 100 }), { code: "NATIVE_TURN_NOT_FOUND" });
   const wrong = jsonRpcReader(new Map([["thread-a", { turnId: "turn-b", requestId: "native-admit:wrong", prompt: "different" }]]), methods);
   await assert.rejects(observeNativeTurn({ spawnImpl: wrong, codexBinary: "synthetic-codex", cwd: process.cwd(), threadId: "thread-a", requestId: "native-admit:wrong", expectedText, timeoutMs: 100 }), /prompt did not match/);
+});
+
+test("native history reader pages turns and exact items, validating cursors and prompt before a positive result", async () => {
+  const calls = [];
+  const requestId = "native-admit:historic";
+  const expectedText = `Native admission control challenge.\nChallenge: ${JSON.stringify({ challengeId: "historic", nonce: "f".repeat(64) })}\nAcknowledge only.`;
+  const spawnImpl = (_binary, _args, _options) => {
+    const child = new EventEmitter(); child.stdout = new PassThrough(); child.stdin = new PassThrough(); child.kill = () => {};
+    child.stdin.on("data", (chunk) => {
+      for (const line of String(chunk).trim().split("\n")) {
+        if (!line) continue;
+        const message = JSON.parse(line); calls.push(message);
+        if (message.id === undefined) continue;
+        let result;
+        if (message.method === "initialize") result = {};
+        else if (message.method === "thread/read") result = { thread: { id: "thread-a" } };
+        else if (message.method === "thread/turns/list") {
+          result = message.params.cursor === undefined
+            ? { data: [{ id: "old-turn", status: "interrupted", items: [{ type: "userMessage", clientId: requestId }] }], nextCursor: "turn-page-2" }
+            : { data: [{ id: "later-turn", status: "completed", items: [] }], nextCursor: null };
+        } else if (message.method === "thread/items/list") {
+          assert.deepEqual(message.params, { threadId: "thread-a", turnId: "old-turn", limit: 50, sortDirection: "asc" });
+          result = { data: [{ turnId: "old-turn", item: { type: "userMessage", clientId: requestId, content: [{ type: "text", text: expectedText }] } }], nextCursor: null };
+        } else throw new Error(`Unexpected native RPC method ${message.method}`);
+        queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: message.id, result })}\n`));
+      }
+    });
+    return child;
+  };
+  const found = await observeNativeTurns({ spawnImpl, codexBinary: "synthetic-codex", cwd: process.cwd(), threadId: "thread-a",
+    requests: [{ requestId, expectedText }], timeoutMs: 100, historyTimeoutMs: 1_000 });
+  assert.equal(found.get(requestId).turnId, "old-turn");
+  assert.equal(found.get(requestId).status, "interrupted");
+  assert.deepEqual(calls.filter((call) => call.method).map((call) => call.method), ["initialize", "initialized", "thread/read", "thread/turns/list", "thread/turns/list", "thread/items/list"]);
+});
+
+test("over-limit recovery admits only exact historic receipts before enforcing the control cap", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  const now = Date.parse("2026-10-12T12:00:00Z");
+  const challengeId = "new-challenge";
+  const newNonce = "e".repeat(64);
+  const newRequestId = controlRequestId(challengeId);
+  let historyCalls = 0, challengeCalls = 0, admitCalls = 0, starts = 0;
+  const matches = new Map();
+  const exactPrompts = new Map();
+  const controls = {};
+  for (let index = 1; index <= 65; index++) {
+    const id = `old-challenge-${index}`;
+    const nonce = String(index).padStart(64, "a");
+    const requestId = controlRequestId(id);
+    controls[id] = { challengeId: id, nonce, eventId: `event-${index}`, seq: index, expiresAt: new Date(now - 60_000).toISOString(), requestId,
+      delivered: true, uncertain: true, stage: "native-start-pending" };
+    if (index <= 6) {
+      const expectedText = `Native admission control challenge.\nChallenge: ${JSON.stringify({ challengeId: id, nonce })}\nAcknowledge only.`;
+      exactPrompts.set(requestId, expectedText);
+      matches.set(requestId, { turnId: `historic-turn-${index}`, status: "interrupted", nonce, observedAt: new Date(now - 120_000).toISOString() });
+    }
+  }
+  const state = { fences: { agent: "codex", workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a", profileRevision: 4,
+    generation: 3, grantId: "grant-a", grantRevision: 2 }, seq: 0, pendingIssue: null, pendingEvents: [], rejectedPendingEvents: 0,
+    skippedEvents: [], challenge: null, control: controls, proof: null, halted: null, nextAt: 0 };
+  fs.writeFileSync(f.statePath, JSON.stringify(state), { mode: 0o600 }); fs.chmodSync(f.statePath, 0o600);
+  const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
+    request: async (operation, body) => {
+      if (operation === "challenge") { challengeCalls++; return { id: challengeId, expiresAt: new Date(now + 90_000).toISOString(), runtimeId: "runtime-a", profileRevision: 4, generation: 3, grantRevision: 2 }; }
+      admitCalls++;
+      if (body.id.startsWith("old-challenge-")) throw new Error("old receipt (404)");
+      return { mode: "native-wake", kind: "native-admission", expiresAt: new Date(now + 24 * 60 * 60_000).toISOString(), generation: 3, profileRevision: 4, grantRevision: 2 };
+    },
+    historyReader: async ({ requests }) => {
+      historyCalls++;
+      if (requests.length === 65) {
+        for (const [requestId, expectedText] of exactPrompts) assert.equal(requests.find((request) => request.requestId === requestId)?.expectedText, expectedText);
+        return matches;
+      }
+      assert.equal(requests.length, 1, "later ticks may inspect the fresh challenge only, never scan old ambiguous records individually");
+      assert.equal(requests[0].requestId, newRequestId);
+      assert.equal(requests[0].expectedText, `Native admission control challenge.\nChallenge: ${JSON.stringify({ challengeId, nonce: newNonce })}\nAcknowledge only.`);
+      return new Map([[newRequestId, { turnId: "new-live-turn", status: "completed", nonce: newNonce, observedAt: new Date(now).toISOString() }]]);
+    },
+    turnRunner: async (args) => { starts++; await args.onTurnStarting({ sessionId: args.sessionId }); await args.onTurnStarted({ sessionId: args.sessionId, turnId: "new-live-turn" }); },
+    clock: () => now, random: () => 0, randomId: () => "bounded-recovery",
+  });
+  await observer.tick();
+  const recovered = JSON.parse(fs.readFileSync(f.statePath, "utf8"));
+  assert.equal(historyCalls, 1, "all candidates are reconciled in one bounded history pass");
+  assert.equal(admitCalls, 6, "only six exact positive matches use existing expired-receipt handling");
+  assert.equal(starts, 0, "history reconciliation never replays native turns");
+  assert.equal(challengeCalls, 1, "new control issuance resumes only after the strict cap has cleared");
+  assert.equal(Object.keys(recovered.control).length, 59);
+  assert.equal(Object.values(recovered.control).filter((control) => control.uncertain && !control.admission).length, 59);
+  assert.equal(Object.values(recovered.control).filter((control) => control.admission?.status === "expired").length, 0,
+    "positively reconciled expired receipts are retired so unknown records retain room under the existing cap");
+  await observer.acceptEvent({ op: "connect.native.challenge", kind: "native-admission-control", seq: 66, eventId: "new-live-event", challengeId,
+    nonce: newNonce, workspace: "default", runtimeId: "runtime-a", nativeThreadId: "thread-a", profileRevision: 4, generation: 3, grantRevision: 2,
+    expiresAt: new Date(now + 90_000).toISOString(), recipients: ["codex"] });
+  await observer.tick();
+  const afterSecondTick = JSON.parse(fs.readFileSync(f.statePath, "utf8"));
+  assert.equal(historyCalls, 2, "the second tick does not repeat the old 59-record reconciliation");
+  assert.equal(starts, 1, "a current live challenge is admitted while the old unknown records remain");
+  assert.equal(afterSecondTick.control[challengeId].admission.status, "verified");
+  assert.equal(Object.values(afterSecondTick.control).filter((control) => control.uncertain && !control.admission).length, 59);
 });
 
 test("authentic expired and superseded native controls are durably skipped while malformed or wrong-recipient events fail closed", async (t) => {
@@ -150,7 +263,7 @@ test("native turn start waits for delayed user-message visibility in the read-on
   const expectedText = `Native admission control challenge.\nChallenge: ${JSON.stringify({ challengeId: "visibility-challenge", nonce })}\nAcknowledge only.`;
   const binary = path.join(f.directory, "synthetic-delayed-native-reader.mjs");
   const readCountFile = path.join(f.directory, "thread-read-count");
-  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');let result={};if(m.method==='thread/read'){const reads=(fs.existsSync(${JSON.stringify(readCountFile)})?Number(fs.readFileSync(${JSON.stringify(readCountFile)},'utf8')):0)+1;fs.writeFileSync(${JSON.stringify(readCountFile)},String(reads));const items=reads>=4?[{type:'userMessage',clientId:${JSON.stringify(requestId)},content:[{type:'text',text:${JSON.stringify(expectedText)}}]}]:[];result={thread:{id:'thread-a',turns:[{id:'visibility-turn',status:'interrupted',items}]}}}process.stdout.write(JSON.stringify({id:m.id,result})+'\\n')});\n`, { mode: 0o700 });
+  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read','thread/turns/list','thread/items/list'].includes(m.method))throw Error('Unexpected native mutation');let result={};if(m.method==='thread/read')result={thread:{id:'thread-a'}};if(m.method==='thread/turns/list'){const reads=(fs.existsSync(${JSON.stringify(readCountFile)})?Number(fs.readFileSync(${JSON.stringify(readCountFile)},'utf8')):0)+1;fs.writeFileSync(${JSON.stringify(readCountFile)},String(reads));result={data:[{id:'visibility-turn',status:'interrupted',items:reads>=4?[{type:'userMessage',clientId:${JSON.stringify(requestId)}}]:[]}],nextCursor:null}}if(m.method==='thread/items/list')result={data:[{turnId:'visibility-turn',item:{type:'userMessage',clientId:${JSON.stringify(requestId)},content:[{type:'text',text:${JSON.stringify(expectedText)}}]}}],nextCursor:null};process.stdout.write(JSON.stringify({id:m.id,result})+'\\n')});\n`, { mode: 0o700 });
   let startCount = 0;
   let runnerCompleted = false;
   const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
@@ -185,7 +298,7 @@ test("native user-message visibility timeout stays uncertain without interruptin
   let now = Date.parse("2026-10-01T12:00:00Z");
   const requestId = controlRequestId("visibility-timeout-challenge");
   const binary = path.join(f.directory, "synthetic-empty-native-reader.mjs");
-  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');const result=m.method==='initialize'?{}:{thread:{id:'thread-a',turns:[{id:'timeout-turn',status:'interrupted',items:[]}]}};process.stdout.write(JSON.stringify({id:m.id,result})+'\\n')});\n`, { mode: 0o700 });
+  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read','thread/turns/list','thread/items/list'].includes(m.method))throw Error('Unexpected native mutation');const result=m.method==='initialize'?{}:m.method==='thread/read'?{thread:{id:'thread-a'}}:{data:[{id:'timeout-turn',status:'interrupted',items:[]}],nextCursor:null};process.stdout.write(JSON.stringify({id:m.id,result})+'\\n')});\n`, { mode: 0o700 });
   let startCount = 0;
   let runnerCompleted = false;
   const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
@@ -222,7 +335,7 @@ test("a thread/read that crosses the visibility deadline is an uncertain absence
   let now = Date.parse("2026-10-01T12:00:00Z");
   const binary = path.join(f.directory, "synthetic-slow-empty-native-reader.mjs");
   const readCountFile = path.join(f.directory, "slow-thread-read-count");
-  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read'].includes(m.method))throw Error('Unexpected native mutation');if(m.method==='initialize'){process.stdout.write(JSON.stringify({id:m.id,result:{}})+'\\n');return}const reads=(fs.existsSync(${JSON.stringify(readCountFile)})?Number(fs.readFileSync(${JSON.stringify(readCountFile)},'utf8')):0)+1;fs.writeFileSync(${JSON.stringify(readCountFile)},String(reads));setTimeout(()=>process.stdout.write(JSON.stringify({id:m.id,result:{thread:{id:'thread-a',turns:[{id:'slow-timeout-turn',status:'interrupted',items:[]}]}}})+'\\n'),12)});\n`, { mode: 0o700 });
+  fs.writeFileSync(binary, `#!/usr/bin/env node\nimport fs from 'node:fs';\nimport readline from 'node:readline';\nreadline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;if(!['initialize','thread/read','thread/turns/list','thread/items/list'].includes(m.method))throw Error('Unexpected native mutation');if(m.method==='initialize'){process.stdout.write(JSON.stringify({id:m.id,result:{}})+'\\n');return}if(m.method==='thread/read'){process.stdout.write(JSON.stringify({id:m.id,result:{thread:{id:'thread-a'}}})+'\\n');return}const reads=(fs.existsSync(${JSON.stringify(readCountFile)})?Number(fs.readFileSync(${JSON.stringify(readCountFile)},'utf8')):0)+1;fs.writeFileSync(${JSON.stringify(readCountFile)},String(reads));setTimeout(()=>process.stdout.write(JSON.stringify({id:m.id,result:{data:[{id:'slow-timeout-turn',status:'interrupted',items:[]}],nextCursor:null}})+'\\n'),12)});\n`, { mode: 0o700 });
   let startCount = 0;
   let runnerCompleted = false;
   const observer = createNativeObserver(f.config, { workspace: "default", councilUrl: "https://council.test" }, {
