@@ -58,6 +58,57 @@ def council_config():
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_suggestion_poll_votes_are_forwarded_only_for_authorized_chat(self):
+        calls = []
+        original_config = plugin._read_config
+        original_broker = plugin._broker
+        try:
+            plugin._read_config = config
+
+            async def broker(command, payload, _config):
+                calls.append((command, payload))
+                status = "unknown" if payload["pollMessageId"] == "WA.unknown" else "ignored" if payload["pollMessageId"] == "WA.unowned" else "queued"
+                return {"status": status}
+
+            plugin._broker = broker
+            metadata = {"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.suggestion-1", "selectedOptions": ["Add a calendar link"]}}}
+            handled = await plugin._admit(event(metadata=metadata))
+            unrelated = await plugin._admit(event(chat="999-999@g.us", metadata=metadata))
+            unauthorized = await plugin._admit(event(sender="16661234567@s.whatsapp.net", metadata=metadata))
+            malformed_identity = await plugin._admit(event(message="bad id?", metadata=metadata))
+            unknown = await plugin._admit(event(metadata={"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.unknown", "selectedOptions": ["Dismiss"]}}}))
+            deselection = await plugin._admit(event(metadata={"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.unowned", "selectedOptions": []}}}))
+        finally:
+            plugin._read_config = original_config
+            plugin._broker = original_broker
+        self.assertIs(handled, True)
+        self.assertIs(unrelated, False)
+        self.assertIn("not allowed", unauthorized)
+        self.assertIn("identity", malformed_identity)
+        self.assertIs(unknown, False)
+        self.assertIs(deselection, False)
+        self.assertEqual(calls, [
+            ("suggestion-poll-vote", {"pollMessageId": "WA.suggestion-1", "selectedOptions": ["Add a calendar link"], "chatId": "123-456@g.us", "senderId": "15551234567@s.whatsapp.net", "messageId": "m1"}),
+            ("suggestion-poll-vote", {"pollMessageId": "WA.unknown", "selectedOptions": ["Dismiss"], "chatId": "123-456@g.us", "senderId": "15551234567@s.whatsapp.net", "messageId": "m1"}),
+            ("suggestion-poll-vote", {"pollMessageId": "WA.unowned", "selectedOptions": [], "chatId": "123-456@g.us", "senderId": "15551234567@s.whatsapp.net", "messageId": "m1"}),
+        ])
+
+    async def test_empty_council_poll_selection_is_rejected_before_broker(self):
+        original_config = plugin._read_config
+        original_broker = plugin._broker
+        try:
+            plugin._read_config = council_config
+
+            async def broker(*_args):
+                raise AssertionError("empty Council poll must not reach Council")
+
+            plugin._broker = broker
+            result = await plugin._admit(event(chat="789-012@g.us", metadata={"whatsapp_native_type": "pollUpdateMessage", "whatsapp_native": {"pollUpdate": {"pollId": "WA.poll-1", "selectedOptions": []}}}))
+        finally:
+            plugin._read_config = original_config
+            plugin._broker = original_broker
+        self.assertIn("could not be identified", result)
+
     async def test_council_poll_vote_is_owner_chat_only_and_brokers_exact_poll(self):
         calls = []
         original_config = plugin._read_config

@@ -40,7 +40,7 @@ test("completed turn work log and final are sent in order then removed while eve
   const finished = broker.finishNotification({ routeId: created.route.id, notificationDeliveryId: created.notificationDeliveryId, sent: true, messageIds: ["WA.a", "WA.b"] });
   assert.equal(finished.status, "sent");
   const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(state.schemaVersion, 4);
+  assert.equal(state.schemaVersion, 5);
   assert.equal(state.routes[0].finalText, undefined);
   assert.equal(state.routes[0].activityText, undefined);
   assert.equal(state.routes[0].messageDigests.length, 2);

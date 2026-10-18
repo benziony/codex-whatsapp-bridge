@@ -70,7 +70,9 @@ def _message_id(value: object) -> str | None:
     return result if _MESSAGE_ID.fullmatch(result) else None
 
 
-def _native_poll_vote(event: Any) -> tuple[str, list[str]] | None:
+def _native_poll_vote(
+    event: Any, *, allowed_options: set[str] | None = None
+) -> tuple[str, list[str]] | None:
     metadata = getattr(event, "metadata", None)
     if not isinstance(metadata, dict):
         return None
@@ -80,11 +82,19 @@ def _native_poll_vote(event: Any) -> tuple[str, list[str]] | None:
     # top-level aliases for older adapter builds while they are being retired.
     source = update if isinstance(update, dict) else metadata
     poll_message_id = _message_id(source.get("pollId") or source.get("pollMessageId") or source.get("poll_message_id"))
-    selected = source.get("selectedOptions") or source.get("selected_options")
+    selected = (
+        source.get("selectedOptions")
+        if "selectedOptions" in source
+        else source.get("selected_options")
+    )
     if not poll_message_id or not isinstance(selected, list):
         return None
     selected_options = [str(value).strip() for value in selected]
-    if len(selected_options) != 1 or selected_options[0] not in {"Approve", "Reject"}:
+    if any(not option for option in selected_options):
+        return None
+    if allowed_options is not None and (
+        len(selected_options) != 1 or selected_options[0] not in allowed_options
+    ):
         return None
     return poll_message_id, selected_options
 
@@ -342,23 +352,47 @@ async def _admit(event: Any) -> bool | str:
         # Poll votes are intercepted only in the exact configured Council chat
         # and only from the configured owner sender. Everything else must fall
         # through to Hermes' native poll aggregation.
-        if council_context is None:
+        if council_context is not None:
+            sender_id, chat_id, message_id = council_context
+            if not message_id:
+                return "This Council poll vote has no valid message identity."
+            vote = _native_poll_vote(event, allowed_options={"Approve", "Reject"})
+            if vote is None:
+                return "This Council poll vote could not be identified. No decision was recorded."
+            poll_message_id, selected_options = vote
+            try:
+                result = await _broker("council-poll-vote", {"pollMessageId": poll_message_id, "selectedOptions": selected_options, "chatId": chat_id, "senderId": sender_id, "messageId": message_id}, config)
+            except Exception:
+                return "Council poll outcome could not be verified. Check Council status before retrying."
+            if result.get("status") == "unclaimed":
+                return False
+            acknowledgement = result.get("acknowledgement")
+            return acknowledgement[:500] if isinstance(acknowledgement, str) and acknowledgement.strip() else "Council poll vote was not recorded."
+
+        whatsapp = config.get("whatsapp") if config else None
+        configured_chat = _normalize_jid(whatsapp.get("chatId"), group=True) if isinstance(whatsapp, dict) else None
+        event_chat = _normalize_jid(getattr(event.source, "chat_id", None), group=True)
+        if not configured_chat or event_chat != configured_chat:
             return False
-        sender_id, chat_id, message_id = council_context
+        context = _authorized(event, config)
+        if context is None:
+            return "This WhatsApp sender is not allowed to vote in the configured Codex chat."
+        sender_id, chat_id, message_id = context
         if not message_id:
-            return "This Council poll vote has no valid message identity."
+            return "This Codex poll vote has no valid message identity."
         vote = _native_poll_vote(event)
         if vote is None:
-            return "This Council poll vote could not be identified. No decision was recorded."
+            return "This Codex poll vote could not be identified. No suggestion was changed."
         poll_message_id, selected_options = vote
         try:
-            result = await _broker("council-poll-vote", {"pollMessageId": poll_message_id, "selectedOptions": selected_options, "chatId": chat_id, "senderId": sender_id, "messageId": message_id}, config)
+            result = await _broker("suggestion-poll-vote", {"pollMessageId": poll_message_id, "selectedOptions": selected_options, "chatId": chat_id, "senderId": sender_id, "messageId": message_id}, config)
         except Exception:
-            return "Council poll outcome could not be verified. Check Council status before retrying."
-        if result.get("status") == "unclaimed":
+            return "Codex suggestion vote could not be verified. Check Codex status before retrying."
+        if result.get("status") in {"queued", "duplicate", "dismissed"}:
+            return True
+        if result.get("status") in {"unknown", "ignored", "unclaimed"}:
             return False
-        acknowledgement = result.get("acknowledgement")
-        return acknowledgement[:500] if isinstance(acknowledgement, str) and acknowledgement.strip() else "Council poll vote was not recorded."
+        return "Codex suggestion vote was not recorded."
     if council_context is not None:
         sender_id, chat_id, message_id = council_context
         if not message_id:

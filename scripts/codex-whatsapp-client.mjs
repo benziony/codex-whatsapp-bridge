@@ -28,6 +28,7 @@ import {
   validateAttachmentRecords,
   verifyMaterializedAttachment,
 } from "./lib/attachments.mjs";
+import { resolveStopBinding } from "./lib/prediction-bindings.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const installedConfig = readConfig({ required: false });
@@ -323,7 +324,7 @@ export function normalizeStopHookPayload(payload) {
   };
 }
 
-export function turnFromStopPayload(payload, transcriptReader = readTail, sessionFinder = persistedCodexSessionExists) {
+export function turnFromStopPayload(payload, transcriptReader = readTail, sessionFinder = persistedCodexSessionExists, { allowInternal = false } = {}) {
   const normalized = normalizeStopHookPayload(payload);
   if (normalized.stopHookActive === true) return { status: "ignored-recursive" };
   if (![normalized.sessionId, normalized.turnId].every((value) => typeof value === "string" && value)) return { status: "invalid-payload" };
@@ -339,7 +340,7 @@ export function turnFromStopPayload(payload, transcriptReader = readTail, sessio
     ? normalized.lastAssistantMessage
     : persistedFinal;
   if (!finalText.trim()) return { status: "no-assistant-message" };
-  if (isInternalSelectionEnvelope(finalText) && !sessionFinder(normalized.sessionId)) return { status: "ignored-internal" };
+  if (!allowInternal && isInternalSelectionEnvelope(finalText) && !sessionFinder(normalized.sessionId)) return { status: "ignored-internal" };
   return {
     status: "ready",
     sessionId: normalized.sessionId,
@@ -558,7 +559,51 @@ function recordStopHookStatus(status) {
   try { withStateLock((state) => { state.lastStopHook = { at: new Date().toISOString(), status }; }); } catch { /* diagnostics never block Codex */ }
 }
 
+function composerSuggestion(finalText) {
+  const parsed = parseJson(String(finalText ?? "").trim());
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== "object" || Array.isArray(parsed.value) ||
+      !Object.hasOwn(parsed.value, "suggestion")) return { status: "not-suggestion" };
+  if (parsed.value.suggestion === null) return { status: "abstained" };
+  if (typeof parsed.value.suggestion !== "string") return { status: "malformed" };
+  const text = parsed.value.suggestion.trim();
+  return text ? { status: "suggestion", text } : { status: "abstained" };
+}
+
+function deliverBoundComposerSuggestion({ binding, sessionId, turnId, finalText, originHost }) {
+  const parsed = composerSuggestion(finalText);
+  if (binding?.status !== "bound") return { status: "not-bound" };
+  if (parsed.status !== "suggestion") return { status: parsed.status };
+  const result = broker("create-suggestion", {
+    originHost,
+    sessionId: binding.sourceThreadId,
+    turnId: binding.sourceTurnId,
+    predictionSessionId: sessionId,
+    predictionTurnId: turnId,
+    suggestionText: parsed.text,
+  });
+  return { status: result.status ?? "suggestion-created" };
+}
+
 async function stopHook(payload) {
+  const normalized = normalizeStopHookPayload(payload);
+  let binding = { status: "unconfigured" };
+  if (typeof normalized.sessionId === "string" && typeof normalized.turnId === "string") {
+    binding = resolveStopBinding({ threadId: normalized.sessionId, turnId: normalized.turnId });
+  }
+  const suggestionTurn = binding.status === "bound" ? turnFromStopPayload(payload, readTail, persistedCodexSessionExists, { allowInternal: true }) : null;
+  const rawFinal = suggestionTurn?.status === "ready" ? suggestionTurn.finalText : (typeof normalized.lastAssistantMessage === "string" ? normalized.lastAssistantMessage : "");
+  if (["pending", "ambiguous"].includes(binding.status)) {
+    recordStopHookStatus(`prediction-${binding.status}`);
+    return;
+  }
+  if (binding.status === "bound") {
+    if (suggestionTurn?.status !== "ready") { recordStopHookStatus(suggestionTurn?.status ?? "no-assistant-message"); return; }
+    try {
+      const suggestion = deliverBoundComposerSuggestion({ binding, sessionId: normalized.sessionId, turnId: normalized.turnId, finalText: rawFinal, originHost: hostId() });
+      recordStopHookStatus(suggestion.status);
+    } catch { recordStopHookStatus("broker-error"); }
+    return;
+  }
   const turn = turnFromStopPayload(payload);
   if (turn.status !== "ready") { recordStopHookStatus(turn.status); return; }
   try {
@@ -939,17 +984,18 @@ function launchDeliveryWorker() {
 async function deliver() {
   const lockToken = acquireDeliveryLock();
   if (!lockToken) return;
+  let delivery = null;
+  let responseRouteStored = false;
+  let retainMaterialized = false;
   try {
   try { broker("retry-notification", { originHost: hostId() }); } catch { /* bounded retry later */ }
   try { broker("retry-receipt", { originHost: hostId() }, 30_000); } catch { /* accepted receipts retry later */ }
   let claimed;
   try { claimed = broker("claim", { originHost: hostId() }); } catch { return; }
-  const delivery = deliveryFromClaim(claimed);
+  delivery = deliveryFromClaim(claimed);
   if (!delivery) return;
   const originHost = hostId();
-  let responseRouteStored = false;
   let materialized = [];
-  let retainMaterialized = false;
   try {
     materialized = materializeDeliveryAttachments(delivery);
     const prompt = resumePrompt(delivery, materialized);
@@ -1062,7 +1108,7 @@ async function deliver() {
     } catch { /* stale claim is recovered after the bounded worker window */ }
   }
   } finally {
-    if (!retainMaterialized && !responseRouteStored && !executionState(delivery?.requestId)?.stage) {
+    if (delivery && !retainMaterialized && !responseRouteStored && !executionState(delivery.requestId)?.stage) {
       try { removeMaterializedAttachments(delivery.requestId); } catch { /* only task-owned staged copies */ }
     }
     try { if (fs.readFileSync(deliveryLockPath, "utf8") === lockToken) fs.unlinkSync(deliveryLockPath); } catch { /* stale lock is recovered after the bounded worker window */ }
@@ -1079,6 +1125,7 @@ export function routineFlushIfDue({ nowMs = Date.now(), flush, config } = {}) {
 
 async function poll() {
   withStateLock((state) => pruneClientState(state));
+  try { broker("retry-notification", { originHost: hostId() }); } catch { /* durable outbound retries resume on the next poll */ }
   try {
     routineFlushIfDue({ flush: ({ date }) => broker("flush-routine", { date, host: hostId() }) });
   } catch { /* digest flush retries on next poll */ }

@@ -7,7 +7,7 @@ import {
   validateAttachmentRecords,
 } from "./attachments.mjs";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const CLAIM_LEASE_MS = 85 * 60 * 1_000;
 const RETRY_DELAY_MS = 60_000;
@@ -19,6 +19,7 @@ const RECEIPT_TIMEOUT_MS = 10_000;
 const MAX_FINAL_LENGTH = 48_000;
 const MAX_ACTIVITY_LENGTH = 3_900;
 const MAX_REPLY_LENGTH = 8_000;
+const MAX_COMPOSED_REPLY_LENGTH = MAX_REPLY_LENGTH * 2 + 2;
 const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$/;
 
@@ -95,19 +96,41 @@ function validateRoute(route) {
   if (!Number.isInteger(route.notification.attempts) || route.notification.attempts < 0 || route.notification.attempts > MAX_SEND_ATTEMPTS) throw new Error("Stored notification attempts are invalid");
   if (route.finalText !== undefined) text(route.finalText, "stored finalText", MAX_FINAL_LENGTH, true);
   if (route.activityText !== undefined) text(route.activityText, "stored activityText", MAX_ACTIVITY_LENGTH, true);
+  if (route.kind === "suggestion") {
+    text(route.suggestionText, "stored suggestionText", MAX_REPLY_LENGTH, true);
+    text(route.predictionSessionId, "stored predictionSessionId", 128);
+    text(route.predictionTurnId, "stored predictionTurnId", 128);
+    if (!jid(route.suggestionChatId)) throw new Error("Stored suggestion chat is invalid");
+    if (!Array.isArray(route.suggestionMessageDigests) || route.suggestionMessageDigests.length === 0) {
+      if (!new Set(["ready", "sending", "failed", "uncertain", "exhausted"]).has(route.notification.status)) throw new Error("Stored suggestion message IDs are invalid");
+    }
+    (route.suggestionMessageDigests ?? []).forEach((item) => storedDigest(item, "stored suggestion message digest"));
+    if (!route.suggestionPoll || !new Set(["ready", "sending", "failed", "uncertain", "sent", "exhausted"]).has(route.suggestionPoll.status)) throw new Error("Stored suggestion poll is invalid");
+    if (!Number.isInteger(route.suggestionPoll.attempts) || route.suggestionPoll.attempts < 0 || route.suggestionPoll.attempts > MAX_SEND_ATTEMPTS) throw new Error("Stored suggestion poll attempts are invalid");
+    if (route.suggestionPoll.status === "sending") {
+      text(route.suggestionPoll.deliveryId, "stored suggestion poll deliveryId", 64);
+      time(route.suggestionPoll.leaseExpiresAt, "stored suggestion poll lease", 0);
+      if (route.suggestionPoll.sendIntent !== true) throw new Error("Stored suggestion poll intent is invalid");
+    }
+    if (route.suggestionPoll.status === "sent") storedDigest(route.suggestionPoll.messageIdDigest, "stored suggestion poll message digest");
+    if (route.consumedAt !== undefined) time(route.consumedAt, "stored suggestion consumedAt", 0);
+    if (route.consumedMessageDigest !== undefined) storedDigest(route.consumedMessageDigest, "stored suggestion consumed message digest");
+  } else if (route.suggestionText !== undefined || route.predictionSessionId !== undefined || route.predictionTurnId !== undefined || route.suggestionPoll !== undefined) {
+    throw new Error("Stored suggestion route is invalid");
+  }
   if (route.messageDigests !== undefined) {
     if (!Array.isArray(route.messageDigests) || route.messageDigests.length === 0) throw new Error("Stored route message digests are invalid");
     route.messageDigests.forEach((item) => storedDigest(item, "stored message digest"));
   }
   if (new Set(["sent", "partial"]).has(route.notification.status)) {
-    if (route.finalText !== undefined || route.activityText !== undefined || route.messageDigests === undefined) throw new Error("Stored sent route is invalid");
+    if ((route.finalText !== undefined && route.kind !== "suggestion") || route.activityText !== undefined || route.messageDigests === undefined) throw new Error("Stored sent route is invalid");
   }
   if (route.notification.status === "sending") {
     text(route.notification.deliveryId, "stored notification deliveryId", 64);
     time(route.notification.leaseExpiresAt, "stored notification lease", 0);
   }
-  if (new Set(["ready", "sending", "failed", "uncertain"]).has(route.notification.status) && route.finalText === undefined && route.digestIdentity === undefined) throw new Error("Stored pending route is invalid");
-  if (new Set(["partial", "exhausted"]).has(route.notification.status) && (route.finalText !== undefined || route.activityText !== undefined)) throw new Error("Stored terminal route is invalid");
+  if (new Set(["ready", "sending", "failed", "uncertain"]).has(route.notification.status) && route.finalText === undefined && route.digestIdentity === undefined && !(route.kind === "suggestion" && route.suggestionText !== undefined)) throw new Error("Stored pending route is invalid");
+  if (new Set(["partial", "exhausted"]).has(route.notification.status) && (route.finalText !== undefined && route.kind !== "suggestion" || route.activityText !== undefined)) throw new Error("Stored terminal route is invalid");
   if (route.digestIdentity !== undefined || route.informational === true) {
     if (route.informational !== true || !/^routine-digest-global-\d{4}-\d{2}-\d{2}$/.test(route.digestIdentity) ||
         route.id !== route.digestIdentity || route.turnId !== route.id || route.id !== `routine-digest-global-${route.digestDate}` ||
@@ -144,6 +167,7 @@ function validateReply(reply) {
   if (reply.kind === "quoted") text(reply.turnId, "stored turnId", 128);
   else if (reply.turnId !== undefined) throw new Error("Stored new-task reply turn is invalid");
   if (!Number.isSafeInteger(reply.sequence) || reply.sequence < 1) throw new Error("Stored reply sequence is invalid");
+  if (reply.consumedMessageDigest !== undefined) storedDigest(reply.consumedMessageDigest, "stored consumed message digest");
   storedDigest(reply.inboundMessageDigest, "stored inbound message digest");
   if (reply.acceptedAt !== undefined) time(reply.acceptedAt, "stored acceptedAt", 0);
   if (reply.receiptSentAt !== undefined) time(reply.receiptSentAt, "stored receiptSentAt", 0);
@@ -178,7 +202,7 @@ function validateReply(reply) {
       }
     }
   } else {
-    if (typeof reply.body !== "string" || reply.body.length > MAX_REPLY_LENGTH || CONTROL.test(reply.body)) throw new Error("Stored reply body is invalid");
+    if (typeof reply.body !== "string" || reply.body.length > MAX_COMPOSED_REPLY_LENGTH || CONTROL.test(reply.body)) throw new Error("Stored reply body is invalid");
     const attachments = validateAttachmentRecords(reply.attachments ?? []);
     if (!reply.body.trim() && attachments.length === 0) throw new Error("Stored reply has no input");
   }
@@ -239,7 +263,12 @@ export class CodexApprovalStore {
     if (!fs.existsSync(this.filePath)) {
       return { schemaVersion: SCHEMA_VERSION, routes: [], replies: [], nextSequence: 1, routineQueue: [] };
     }
-    return validateState(JSON.parse(fs.readFileSync(this.filePath, "utf8")));
+    const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
+    if (parsed?.schemaVersion === 4) {
+      parsed.schemaVersion = SCHEMA_VERSION;
+    }
+    delete parsed.sourceTurns;
+    return validateState(parsed);
   }
 
   save(state) {
@@ -339,6 +368,20 @@ function routeSummary(route) {
     messageCount: route.messageDigests?.length ?? 0,
     ...(route.informational ? { informational: true } : {}),
   };
+}
+
+function hasSourceRoute(state, originHost, sessionId, turnId) {
+  return state.routes.some((route) => route.kind !== "suggestion" && route.informational !== true && route.digestIdentity === undefined &&
+    route.originHost === originHost && route.sessionId === sessionId && route.turnId === turnId);
+}
+
+function reserveSuggestionPoll(route, now) {
+  const poll = route.suggestionPoll;
+  if (poll.status === "sent" || poll.status === "exhausted" || poll.attempts >= MAX_SEND_ATTEMPTS ||
+      poll.status === "sending" && poll.leaseExpiresAt > now) return null;
+  const deliveryId = crypto.randomUUID();
+  route.suggestionPoll = { status: "sending", deliveryId, claimedAt: now, leaseExpiresAt: now + NOTIFICATION_LEASE_MS, attempts: poll.attempts + 1, sendIntent: true };
+  return deliveryId;
 }
 
 function replySummary(reply) {
@@ -526,6 +569,76 @@ export class CodexWhatsAppBroker {
     });
   }
 
+  createSuggestion(input) {
+    const now = this.now();
+    const originHost = host(input?.originHost);
+    const sessionId = text(input?.sessionId, "sessionId", 128);
+    const turnId = text(input?.turnId, "turnId", 128);
+    const predictionSessionId = text(input?.predictionSessionId, "predictionSessionId", 128);
+    const predictionTurnId = text(input?.predictionTurnId, "predictionTurnId", 128);
+    const suggestionText = text(input?.suggestionText, "suggestionText", MAX_REPLY_LENGTH, true);
+    const chatId = jid(this.notificationTarget);
+    if (!chatId) return { ok: true, status: "unavailable" };
+    return this.transact(now, (state) => {
+      if (!hasSourceRoute(state, originHost, sessionId, turnId)) return { ok: true, status: "stale-source" };
+      const existing = state.routes.find((route) => route.kind === "suggestion" && route.originHost === originHost && route.sessionId === sessionId && route.turnId === turnId && route.predictionSessionId === predictionSessionId && route.predictionTurnId === predictionTurnId);
+      if (existing) {
+        if (existing.suggestionText !== suggestionText) return { ok: false, status: "prediction-conflict" };
+        if (existing.notification.status === "sending" && existing.notification.leaseExpiresAt <= now && existing.notification.sendIntent) {
+          existing.notification = { status: "uncertain", uncertainAt: now, attempts: existing.notification.attempts };
+          delete existing.finalText;
+          return { ok: false, status: "notification-uncertain", route: routeSummary(existing) };
+        }
+        const notificationDeliveryId = reserve(existing, now);
+        const pollDeliveryId = existing.notification.status === "sent" ? reserveSuggestionPoll(existing, now) : null;
+        return { ok: true, status: existing.consumedAt ? "consumed" : existing.notification.status, created: false, route: routeSummary(existing),
+          ...(notificationDeliveryId ? { phase: "notification", notificationDeliveryId, notification: outboundNotification(existing, chatId) } : {}),
+          ...(pollDeliveryId ? { phase: "poll", pollDeliveryId, poll: this.suggestionPollPayload(existing) } : {}) };
+      }
+      const prefix = "Codex composer suggestion\n\nReply to this message to send the exact suggestion with your additions appended, or choose Send suggestion or Dismiss in the poll below.\n\n";
+      const route = { id: crypto.randomUUID(), kind: "suggestion", originHost, sessionId, turnId, predictionSessionId, predictionTurnId, suggestionText, suggestionChatId: chatId,
+        finalText: `${prefix}${suggestionText}`, createdAt: now, expiresAt: now + ROUTE_TTL_MS,
+        notification: { status: "ready", attempts: 0 }, suggestionPoll: { status: "ready", attempts: 0 } };
+      const notificationDeliveryId = reserve(route, now);
+      state.routes.push(route);
+      return { ok: true, status: "sending", created: true, route: routeSummary(route), phase: "notification", notificationDeliveryId, notification: outboundNotification(route, chatId) };
+    });
+  }
+
+  suggestionPollPayload(route) {
+    return { target: route.suggestionChatId, context: "Codex composer suggestion. Quoting the suggestion message sends it with your added text.",
+      question: "Use this exact Codex suggestion?", options: ["Send suggestion", "Dismiss"], selectableCount: 1, deliveryKey: route.id };
+  }
+
+  beginSuggestionPoll(input) {
+    const now = this.now();
+    return this.transact(now, (state) => {
+      const route = state.routes.find((item) => item.id === input?.routeId && item.kind === "suggestion");
+      if (!route || route.notification.status !== "sent" || route.suggestionPoll.status !== "sending" || route.suggestionPoll.deliveryId !== input?.pollDeliveryId || route.suggestionPoll.leaseExpiresAt <= now) throw new Error("Suggestion poll lease is stale");
+      return { ok: true, status: "send-intent", route: routeSummary(route), poll: this.suggestionPollPayload(route) };
+    });
+  }
+
+  finishSuggestionPoll(input) {
+    const now = this.now();
+    const messageIds = Array.isArray(input?.messageIds) ? [...new Set(input.messageIds.map((item) => validMessageId(item)))] : [];
+    const pollMessageId = input?.pollMessageId ? validMessageId(input.pollMessageId, "pollMessageId") : null;
+    return this.transact(now, (state) => {
+      const route = state.routes.find((item) => item.id === input?.routeId && item.kind === "suggestion");
+      if (!route || route.suggestionPoll.status !== "sending" || route.suggestionPoll.deliveryId !== input?.pollDeliveryId) return { ok: true, status: "stale" };
+      if (input?.sent === true && pollMessageId && messageIds.includes(pollMessageId)) {
+        route.suggestionPoll = { status: "sent", sentAt: now, attempts: route.suggestionPoll.attempts, messageIdDigest: digest(pollMessageId) };
+        route.messageDigests = [...new Set([...(route.messageDigests ?? []), ...messageIds.map(digest)])];
+        return { ok: true, status: "sent", route: routeSummary(route) };
+      }
+      const uncertain = input?.uncertain === true;
+      route.suggestionPoll = uncertain || route.suggestionPoll.attempts >= MAX_SEND_ATTEMPTS
+        ? { status: "uncertain", uncertainAt: now, attempts: route.suggestionPoll.attempts }
+        : { status: "failed", failedAt: now, attempts: route.suggestionPoll.attempts };
+      return { ok: false, status: route.suggestionPoll.status, route: routeSummary(route) };
+    });
+  }
+
   beginNotificationDelivery(input = {}) {
     const now = this.now();
     return this.transact(now, (state) => {
@@ -604,16 +717,48 @@ export class CodexWhatsAppBroker {
     const originHost = optional(input.originHost, "originHost", 128)?.toLowerCase() ?? null;
     return this.transact(now, (state) => {
       for (const item of state.routes) {
-        if (!item.digestIdentity && item.finalText && item.notification.status === "sending" && item.notification.leaseExpiresAt <= now) {
+        if (item.kind === "suggestion" && item.notification.status === "sending" && item.notification.leaseExpiresAt <= now) {
+          if (item.notification.sendIntent) {
+            item.notification = { status: "uncertain", uncertainAt: now, attempts: item.notification.attempts };
+            delete item.finalText;
+          } else item.notification = { status: "ready", attempts: Math.max(0, item.notification.attempts - 1) };
+        }
+        if (item.kind !== "suggestion" && !item.digestIdentity && item.finalText && item.notification.status === "sending" && item.notification.leaseExpiresAt <= now) {
           item.notification = { status: "exhausted", exhaustedAt: now, attempts: item.notification.attempts };
           delete item.finalText;
           delete item.activityText;
         }
       }
-      const route = state.routes.filter((item) => !item.digestIdentity && item.finalText && (!originHost || item.originHost === originHost) && item.notification.status === "failed" && item.notification.attempts < MAX_SEND_ATTEMPTS && item.notification.failedAt + RETRY_DELAY_MS <= now).sort((a, b) => a.createdAt - b.createdAt)[0];
-      if (!route) return { ok: true, status: "empty" };
-      const notificationDeliveryId = reserve(route, now);
-      return notificationDeliveryId ? { ok: true, status: "sending", route: routeSummary(route), notificationDeliveryId, notification: outboundNotification(route, this.notificationTarget) } : { ok: true, status: "empty" };
+      const route = state.routes.filter((item) => item.kind !== "suggestion" && !item.digestIdentity && item.finalText && (!originHost || item.originHost === originHost) && item.notification.status === "failed" && item.notification.attempts < MAX_SEND_ATTEMPTS && item.notification.failedAt + RETRY_DELAY_MS <= now).sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (route) {
+        const notificationDeliveryId = reserve(route, now);
+        if (notificationDeliveryId) return { ok: true, status: "sending", route: routeSummary(route), notificationDeliveryId, notification: outboundNotification(route, this.notificationTarget) };
+      }
+      const suggestions = state.routes.filter((item) => item.kind === "suggestion" && (!originHost || item.originHost === originHost)).sort((a, b) => a.createdAt - b.createdAt);
+      for (const suggestion of suggestions) {
+        const sourceExists = hasSourceRoute(state, suggestion.originHost, suggestion.sessionId, suggestion.turnId);
+        if (!sourceExists && ["ready", "failed"].includes(suggestion.notification.status)) {
+          suggestion.notification = { status: "exhausted", exhaustedAt: now, attempts: suggestion.notification.attempts };
+          delete suggestion.finalText;
+        }
+        if (!sourceExists && suggestion.notification.status === "sent" && suggestion.suggestionPoll.status !== "sent") {
+          suggestion.suggestionPoll = { status: "exhausted", exhaustedAt: now, attempts: suggestion.suggestionPoll.attempts };
+        }
+        if (sourceExists && suggestion.finalText && ["ready", "failed"].includes(suggestion.notification.status) &&
+            suggestion.notification.attempts < MAX_SEND_ATTEMPTS && (suggestion.notification.status === "ready" || suggestion.notification.failedAt + RETRY_DELAY_MS <= now)) {
+          const notificationDeliveryId = reserve(suggestion, now);
+          if (notificationDeliveryId) return { ok: true, status: "sending-suggestion", phase: "suggestion-notification", route: routeSummary(suggestion), notificationDeliveryId, notification: outboundNotification(suggestion, suggestion.suggestionChatId) };
+        }
+      }
+      for (const suggestion of suggestions) {
+        if (suggestion.notification.status !== "sent" || suggestion.consumedAt || !hasSourceRoute(state, suggestion.originHost, suggestion.sessionId, suggestion.turnId)) continue;
+        const poll = suggestion.suggestionPoll;
+        const retryable = poll.status === "ready" || poll.status === "uncertain" || poll.status === "sending" && poll.leaseExpiresAt <= now || poll.status === "failed" && poll.failedAt + RETRY_DELAY_MS <= now;
+        if (!retryable) continue;
+        const pollDeliveryId = reserveSuggestionPoll(suggestion, now);
+        if (pollDeliveryId) return { ok: true, status: "sending-suggestion-poll", phase: "suggestion-poll", route: routeSummary(suggestion), pollDeliveryId, poll: this.suggestionPollPayload(suggestion) };
+      }
+      return { ok: true, status: "empty" };
     });
   }
 
@@ -636,15 +781,21 @@ export class CodexWhatsAppBroker {
       }
       if (input?.sent === true && messageIds.length > 0) {
         route.messageDigests = [...new Set([...(route.messageDigests ?? []), ...messageIds.map(digest)])];
+        if (route.kind === "suggestion") route.suggestionMessageDigests = [...new Set([...(route.suggestionMessageDigests ?? []), ...messageIds.map(digest)])];
         const status = input?.partial === true ? "partial" : "sent";
         route.notification = { status, sentAt: now, attempts: route.notification.attempts };
-        delete route.finalText;
+        if (route.kind !== "suggestion") delete route.finalText;
         delete route.activityText;
         return { ok: true, status, route: routeSummary(route) };
       }
+      if (route.kind === "suggestion" && input?.uncertain === true) {
+        route.notification = { status: "uncertain", uncertainAt: now, attempts: route.notification.attempts };
+        delete route.finalText;
+        return { ok: false, status: "notification-uncertain", route: routeSummary(route) };
+      }
       if (input?.uncertain === true || route.notification.attempts >= MAX_SEND_ATTEMPTS) {
         route.notification = { status: "exhausted", exhaustedAt: now, attempts: route.notification.attempts };
-        delete route.finalText;
+        if (route.kind !== "suggestion") delete route.finalText;
         delete route.activityText;
       } else {
         route.notification = { status: "failed", failedAt: now, attempts: route.notification.attempts };
@@ -669,10 +820,17 @@ export class CodexWhatsAppBroker {
     const admission = this.transact(now, (state) => {
       const duplicate = state.replies.find((reply) => reply.inboundMessageDigest === inboundMessageDigest);
       if (duplicate) return { result: { ok: true, status: "duplicate", reply: replySummary(duplicate), acknowledgement: "That reply was already queued for Codex." } };
+      const suggestionRoutes = state.routes.filter((route) => route.kind === "suggestion" && route.suggestionChatId === jid(chatId) && route.suggestionMessageDigests?.includes(quotedDigest));
+      if (suggestionRoutes.length) {
+        const route = suggestionRoutes[0];
+        if (suggestionRoutes.length !== 1 || route.notification.status !== "sent" || route.consumedAt || !hasSourceRoute(state, route.originHost, route.sessionId, route.turnId)) return { result: { ok: true, status: "stale", acknowledgement: "That suggestion is no longer available. Reply in Codex instead." } };
+        return { routeId: route.id, suggestion: true };
+      }
       const digestRoutes = state.routes.filter((route) => route.digestIdentity && (route.id === route.digestIdentity) && route.messageDigests?.includes(quotedDigest));
       if (digestRoutes.length) return { result: { ok: false, status: "digest-quote-rejected", acknowledgement: "That reply quoted the daily digest. Send a fresh message describing the task instead." } };
       const candidates = state.routes.filter((route) => route.messageDigests?.includes(quotedDigest));
       if (candidates.length !== 1) return { result: { ok: true, status: "stale", acknowledgement: "That quoted Codex turn is unknown or expired. Reply in Codex instead." } };
+      if (candidates[0].kind === "suggestion") return { result: { ok: true, status: "stale", acknowledgement: "Quote the suggestion message to use it. Reply in Codex instead." } };
       return { routeId: candidates[0].id };
     });
     if (admission.result) return admission.result;
@@ -684,7 +842,10 @@ export class CodexWhatsAppBroker {
       if (duplicate) return { stored: false, result: { ok: true, status: "duplicate", reply: replySummary(duplicate), acknowledgement: "That reply was already queued for Codex." } };
       const route = state.routes.find((candidate) => candidate.id === admission.routeId && candidate.messageDigests?.includes(quotedDigest));
       if (!route) return { stored: false, result: { ok: true, status: "stale", acknowledgement: "That quoted Codex turn is unknown or expired. Reply in Codex instead." } };
-      const reply = { id: crypto.randomUUID(), kind: "quoted", sequence: state.nextSequence++, routeId: route.id, originHost: route.originHost, sessionId: route.sessionId, turnId: route.turnId, inboundMessageDigest, body, ...(staged.length ? { attachments: staged } : {}), receipt: receiptTarget(chatId, senderId, messageId), status: "queued", receivedAt: now, expiresAt: route.expiresAt };
+      const isSuggestion = admission.suggestion === true;
+      if (isSuggestion && (route.kind !== "suggestion" || route.notification.status !== "sent" || route.consumedAt || !hasSourceRoute(state, route.originHost, route.sessionId, route.turnId) || !route.suggestionMessageDigests?.includes(quotedDigest))) return { stored: false, result: { ok: true, status: "stale", acknowledgement: "That suggestion is no longer available. Reply in Codex instead." } };
+      const reply = { id: crypto.randomUUID(), kind: "quoted", sequence: state.nextSequence++, routeId: route.id, originHost: route.originHost, sessionId: route.sessionId, turnId: route.turnId, inboundMessageDigest, body: isSuggestion ? `${route.suggestionText}\n\n${body}` : body, ...(staged.length ? { attachments: staged } : {}), receipt: receiptTarget(chatId, senderId, messageId), status: "queued", receivedAt: now, expiresAt: route.expiresAt };
+      if (isSuggestion) { route.consumedAt = now; route.consumedMessageDigest = inboundMessageDigest; }
       state.replies.push(reply);
       return { stored: true, result: { ok: true, status: "queued", reply: replySummary(reply), acknowledgement: "Reply queued for Codex." } };
       });
@@ -696,6 +857,36 @@ export class CodexWhatsAppBroker {
       try { this.attachmentStore.remove(staged); } catch { /* orphan sweep is the final cleanup boundary */ }
       throw error;
     }
+  }
+
+  suggestionPollVote(input) {
+    const now = this.now();
+    const chatId = optional(input?.chatId, "chatId", 192);
+    const senderId = optional(input?.senderId, "senderId", 192);
+    const messageId = optional(input?.messageId, "messageId", 256);
+    const pollMessageId = optional(input?.pollMessageId, "pollMessageId", 256);
+    const selectedOptions = input?.selectedOptions;
+    if (!chatId || !senderId || !messageId || !pollMessageId || !Array.isArray(selectedOptions) || selectedOptions.length !== 1 || !allowed(senderId, this.allowedSenders) || !allowed(chatId, this.allowedChats) || !MESSAGE_ID.test(messageId) || !MESSAGE_ID.test(pollMessageId)) return { ok: true, status: "ignored" };
+    const inboundMessageDigest = digest(messageId);
+    const pollMessageDigest = digest(pollMessageId);
+    const option = selectedOptions[0];
+    if (!new Set(["Send suggestion", "Dismiss"]).has(option)) return { ok: true, status: "ignored" };
+    return this.transact(now, (state) => {
+      const duplicate = state.replies.find((reply) => reply.inboundMessageDigest === inboundMessageDigest);
+      if (duplicate) return { ok: true, status: "duplicate", reply: replySummary(duplicate) };
+      const route = state.routes.find((item) => item.kind === "suggestion" && item.suggestionChatId === jid(chatId) && item.suggestionPoll.status === "sent" && item.suggestionPoll.messageIdDigest === pollMessageDigest);
+      if (!route) return { ok: true, status: "ignored" };
+      if (route.consumedAt) return { ok: true, status: route.consumedMessageDigest === inboundMessageDigest ? "duplicate" : "ignored" };
+      route.consumedAt = now;
+      route.consumedMessageDigest = inboundMessageDigest;
+      if (!hasSourceRoute(state, route.originHost, route.sessionId, route.turnId)) return { ok: true, status: "stale" };
+      if (option === "Dismiss") return { ok: true, status: "dismissed" };
+      const reply = { id: crypto.randomUUID(), kind: "quoted", sequence: state.nextSequence++, routeId: route.id, originHost: route.originHost,
+        sessionId: route.sessionId, turnId: route.turnId, inboundMessageDigest,
+        body: route.suggestionText, receipt: receiptTarget(chatId, senderId, messageId), status: "queued", receivedAt: now, expiresAt: route.expiresAt };
+      state.replies.push(reply);
+      return { ok: true, status: "queued", reply: replySummary(reply), acknowledgement: "Suggestion queued for Codex." };
+    });
   }
 
   ingestNewTask(input) {
@@ -925,7 +1116,7 @@ export class CodexWhatsAppBroker {
       for (const reply of state.replies) {
         if (reply.status === "failed" && reply.failureNotification?.status === "sending" && reply.failureNotification.leaseExpiresAt <= now) reply.failureNotification = { status: "exhausted", exhaustedAt: now, attempts: reply.failureNotification.attempts };
       }
-      const reply = state.replies.filter((item) => item.status === "failed" && (!originHost || item.originHost === originHost) && item.failureNotification?.status === "failed" && item.failureNotification.attempts < MAX_SEND_ATTEMPTS && item.failureNotification.failedAt + RETRY_DELAY_MS <= now).sort((a, b) => a.sequence - b.sequence)[0];
+      const reply = state.replies.filter((item) => item.status === "failed" && (!originHost || item.originHost === originHost) && item.failureNotification?.attempts < MAX_SEND_ATTEMPTS && (item.failureNotification?.status === "ready" || item.failureNotification?.status === "failed" && item.failureNotification.failedAt + RETRY_DELAY_MS <= now)).sort((a, b) => a.sequence - b.sequence)[0];
       if (!reply) return { ok: true, status: "empty" };
       const notificationDeliveryId = reserveFailure(reply, now);
       return { ok: true, status: "sending-failure", reply: replySummary(reply), notificationDeliveryId, notification: { target: this.notificationTarget, text: reply.failureReason, deliveryKey: reply.id } };
