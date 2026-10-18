@@ -51,6 +51,10 @@ submissions share one atomic consumption record; use either the poll or a quote
 for a given suggestion. Approving first and then quoting it does not create a
 second submission.
 
+The suggestion and any added text together must fit the existing 8,000-character
+reply limit, including the separating blank line. An oversized addition is
+rejected visibly without consuming the suggestion.
+
 The broker requires the exact original host, chat and source-turn record. It
 rejects changed text under the same prediction identity, unauthorized votes
 and quotes of partially delivered suggestions. Accepted-turn
@@ -90,8 +94,22 @@ exec '/absolute/path/to/node' '/absolute/bridge/scripts/codex-prediction-proxy.m
 The real child's `CODEX_CLI_PATH` is reset to the bundled executable to avoid
 recursive helper interception. Non-app-server invocations delegate unchanged.
 Activation requires a separately approved app launch-environment change and
-restart. Rollback restores the prior environment and restarts the app using its
-original executable; the existing bridge can continue ordinary turn mirroring.
+restart. A conditional `CODEX_SHELL=1` stanza in the user's shell startup file
+can select the private launcher for the next normal desktop launch. Installing
+that stanza does not replace the running app's already loaded environment.
+
+The broker retains schema 4 so old Stop hooks from in-flight turns can finish
+after a rolling update. Compatibility covers their ordinary source creation
+and status operations; it does not make old poll clients or ingress handlers
+safe consumers of suggestion messages. Update those services and the external
+plugin before enabling prediction capture. Historical-broker tests exercise
+all suggestion states, expiry, exact-source retries and one-time consumption.
+
+To disable capture, restore the prior launch environment and restart the app
+using its original executable. Retain the upgraded broker, plugin and polling
+clients while any suggestion messages or queued replies remain. A full runtime
+rollback needs ingress fencing and reconciliation; do not restore an old state
+snapshot after external sends or native admissions.
 
 ## Remaining release boundaries
 
@@ -114,7 +132,8 @@ Local deterministic tests cover the actual Stop CLI, real broker process and
 loopback WhatsApp transport, exact source identities, native poll approval,
 quoted additions after source advancement, desktop-owned native queue delivery,
 ordinary JSON answers, abstention, persistence, authorization,
-one-time consumption, uncertain sends, migration and native submission recovery.
+one-time consumption, uncertain sends, rolling compatibility and native
+submission recovery.
 The proxy fixture checks the full desktop argument shape, exact protocol bytes,
 pre-forward metadata persistence and connection-scoped request-ID reuse.
 

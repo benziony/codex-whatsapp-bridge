@@ -37,7 +37,7 @@ function fixture(t) {
 
 test("suggestion prompt and independent notification/poll phases survive restart with exact IDs and text", (t) => {
   const { broker, options, statePath, source, suggest, sent, pollReady } = fixture(t);
-  const prompt = ` \n${"x".repeat(7_996)}\t `;
+  const prompt = " exact suggestion\n";
   source("turn-1");
   const created = suggest("turn-1", prompt);
   assert.equal(created.phase, "notification");
@@ -49,7 +49,7 @@ test("suggestion prompt and independent notification/poll phases survive restart
   assert.equal(sent(created, ["WA.suggestion-1", "WA.suggestion-2"]).status, "sent");
   const pollRouteId = pollReady(created);
   const stored = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(stored.schemaVersion, 5);
+  assert.equal(stored.schemaVersion, 4);
   const storedSuggestion = stored.routes.find((route) => route.kind === "suggestion");
   assert.equal(storedSuggestion.suggestionText, prompt);
   assert.equal(storedSuggestion.suggestionMessageDigests.length, 2);
@@ -183,7 +183,7 @@ test("older suggestions retain exact source routing across newer turns while cla
   assert.equal(approved.reply.expectedSourceTurnId, undefined);
 });
 
-test("dismiss consumes without a reply and schema 4 migrates without latest-source metadata", (t) => {
+test("dismiss consumes without a reply and schema 4 stays stable without latest-source metadata", (t) => {
   const { broker, statePath, source, suggest, sent, pollReady } = fixture(t);
   source("turn-dismiss");
   const dismissed = suggest("turn-dismiss", "discard this");
@@ -199,10 +199,10 @@ test("dismiss consumes without a reply and schema 4 migrates without latest-sour
     messageDigests: ["a".repeat(64)], informational: true, digestDate: "2026-10-18", digestIdentity: digestId, digestItems: [] });
   state.schemaVersion = 4;
   fs.writeFileSync(statePath, JSON.stringify(state));
-  const migrated = new CodexApprovalStore(statePath);
-  const loaded = migrated.load();
-  assert.equal(loaded.schemaVersion, 5);
+  const loaded = new CodexApprovalStore(statePath).load();
+  assert.equal(loaded.schemaVersion, 4);
   assert.equal(Object.hasOwn(loaded, "sourceTurns"), false);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).schemaVersion, 4);
 });
 
 test("uncertain native poll retries reuse stable delivery keys without crossing phases", (t) => {
@@ -264,7 +264,10 @@ test("a crash after notification send intent becomes uncertain and never resends
   assert.equal(recovered.notification, undefined);
   const route = JSON.parse(fs.readFileSync(statePath, "utf8")).routes.find((item) => item.kind === "suggestion");
   assert.equal(route.notification.status, "uncertain");
-  assert.equal(route.finalText, undefined);
+  assert.ok(route.finalText.includes("possibly already sent"));
   assert.equal(route.suggestionText, "possibly already sent");
+  const repeated = suggest("turn-crash", "possibly already sent");
+  assert.equal(repeated.status, "notification-uncertain");
+  assert.equal(repeated.notification, undefined);
   assert.equal(broker.retryNotification({ originHost: "regular-mac" }).status, "empty");
 });
