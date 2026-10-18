@@ -3,6 +3,7 @@
 import {
   CodexWhatsAppBroker,
   sendWhatsAppNotification,
+  sendWhatsAppPoll,
   sendWhatsAppReaction,
 } from "./lib/bridge-state.mjs";
 import { processCouncilApproval, processCouncilPollVote, recoverCouncilApproval } from "./lib/council-approvals.mjs";
@@ -73,12 +74,56 @@ function brokerFromEnvironment() {
 }
 
 async function execute(broker, command, payload, bridgeUrl) {
+  if (command === "create-suggestion") {
+    let result = broker.createSuggestion(payload);
+    if (!result.notification && !result.poll) return result;
+    if (result.notification) {
+      broker.beginNotificationDelivery({ routeId: result.route.id, notificationDeliveryId: result.notificationDeliveryId });
+      let sent = false, uncertain = false, messageIds = [], partial = false;
+      try {
+        const delivery = await sendWhatsAppNotification(result.notification, { bridgeUrl });
+        sent = true; messageIds = delivery.messageIds; partial = delivery.status === "partial";
+      } catch (error) { uncertain = error?.deliveryUncertain === true; messageIds = Array.isArray(error?.messageIds) ? error.messageIds : []; }
+      const recorded = broker.finishNotification({ routeId: result.route.id, notificationDeliveryId: result.notificationDeliveryId, sent, messageIds, partial, uncertain });
+      result.route = recorded.route ?? result.route;
+      result.status = recorded.status;
+      delete result.notification; delete result.notificationDeliveryId; delete result.phase;
+      if (!sent || recorded.status !== "sent") return result;
+      result = broker.createSuggestion(payload);
+    }
+    if (result.poll) {
+      const poll = broker.beginSuggestionPoll({ routeId: result.route.id, pollDeliveryId: result.pollDeliveryId });
+      let sent = false, uncertain = false, pollMessageId, messageIds = [];
+      try {
+        const delivery = await sendWhatsAppPoll(poll.poll, { bridgeUrl });
+        sent = true; pollMessageId = delivery.pollMessageId; messageIds = delivery.messageIds;
+      } catch (error) { uncertain = error?.deliveryUncertain === true; }
+      const recorded = broker.finishSuggestionPoll({ routeId: result.route.id, pollDeliveryId: result.pollDeliveryId, sent, pollMessageId, messageIds, uncertain });
+      result.route = recorded.route ?? result.route;
+      result.status = recorded.status;
+      delete result.poll; delete result.pollDeliveryId; delete result.phase;
+    }
+    return result;
+  }
   if (command === "create" || command === "retry-notification" || command === "flush-routine") {
     let result =
       command === "create" ? broker.create(payload) : command === "flush-routine" ? broker.flushRoutineDigest() : broker.retryNotification(payload);
-    if (command === "retry-notification" && !result.notification) result = broker.retryFailureNotification(payload);
+    if (command === "retry-notification" && !result.notification && !result.poll) result = broker.retryFailureNotification(payload);
+    if (result.poll) {
+      const poll = broker.beginSuggestionPoll({ routeId: result.route.id, pollDeliveryId: result.pollDeliveryId });
+      let sent = false, uncertain = false, pollMessageId, messageIds = [];
+      try {
+        const delivery = await sendWhatsAppPoll(poll.poll, { bridgeUrl });
+        sent = true; pollMessageId = delivery.pollMessageId; messageIds = delivery.messageIds;
+      } catch (error) { uncertain = error?.deliveryUncertain === true; }
+      const recorded = broker.finishSuggestionPoll({ routeId: result.route.id, pollDeliveryId: result.pollDeliveryId, sent, pollMessageId, messageIds, uncertain });
+      result.status = recorded.status;
+      result.route = recorded.route ?? result.route;
+      delete result.poll; delete result.pollDeliveryId; delete result.phase;
+      return result;
+    }
     if (!result.notification) return result;
-    if (result.route?.informational) broker.beginNotificationDelivery({ routeId: result.route.id, notificationDeliveryId: result.notificationDeliveryId });
+    if (result.route?.informational || result.phase === "suggestion-notification") broker.beginNotificationDelivery({ routeId: result.route.id, notificationDeliveryId: result.notificationDeliveryId });
     let sent = false;
     let messageIds = [];
     let partial = false;
@@ -109,6 +154,7 @@ async function execute(broker, command, payload, bridgeUrl) {
   }
   if (command === "begin-notification-delivery") return broker.beginNotificationDelivery(payload);
   if (command === "ingest") return broker.ingest(payload);
+  if (command === "suggestion-poll-vote") return broker.suggestionPollVote(payload);
   if (command === "ingest-new-task") return broker.ingestNewTask(payload);
   if (command === "council-approval") {
     const result = await processCouncilApproval(payload.text, readConfig({ required: true }), {
