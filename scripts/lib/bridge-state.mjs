@@ -7,7 +7,7 @@ import {
   validateAttachmentRecords,
 } from "./attachments.mjs";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 4;
 const ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const CLAIM_LEASE_MS = 85 * 60 * 1_000;
 const RETRY_DELAY_MS = 60_000;
@@ -19,7 +19,6 @@ const RECEIPT_TIMEOUT_MS = 10_000;
 const MAX_FINAL_LENGTH = 48_000;
 const MAX_ACTIVITY_LENGTH = 3_900;
 const MAX_REPLY_LENGTH = 8_000;
-const MAX_COMPOSED_REPLY_LENGTH = MAX_REPLY_LENGTH * 2 + 2;
 const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$/;
 
@@ -123,14 +122,14 @@ function validateRoute(route) {
     route.messageDigests.forEach((item) => storedDigest(item, "stored message digest"));
   }
   if (new Set(["sent", "partial"]).has(route.notification.status)) {
-    if ((route.finalText !== undefined && route.kind !== "suggestion") || route.activityText !== undefined || route.messageDigests === undefined) throw new Error("Stored sent route is invalid");
+    if (route.finalText !== undefined || route.activityText !== undefined || route.messageDigests === undefined) throw new Error("Stored sent route is invalid");
   }
   if (route.notification.status === "sending") {
     text(route.notification.deliveryId, "stored notification deliveryId", 64);
     time(route.notification.leaseExpiresAt, "stored notification lease", 0);
   }
-  if (new Set(["ready", "sending", "failed", "uncertain"]).has(route.notification.status) && route.finalText === undefined && route.digestIdentity === undefined && !(route.kind === "suggestion" && route.suggestionText !== undefined)) throw new Error("Stored pending route is invalid");
-  if (new Set(["partial", "exhausted"]).has(route.notification.status) && (route.finalText !== undefined && route.kind !== "suggestion" || route.activityText !== undefined)) throw new Error("Stored terminal route is invalid");
+  if (new Set(["ready", "sending", "failed", "uncertain"]).has(route.notification.status) && route.finalText === undefined && route.digestIdentity === undefined) throw new Error("Stored pending route is invalid");
+  if (new Set(["partial", "exhausted"]).has(route.notification.status) && (route.finalText !== undefined || route.activityText !== undefined)) throw new Error("Stored terminal route is invalid");
   if (route.digestIdentity !== undefined || route.informational === true) {
     if (route.informational !== true || !/^routine-digest-global-\d{4}-\d{2}-\d{2}$/.test(route.digestIdentity) ||
         route.id !== route.digestIdentity || route.turnId !== route.id || route.id !== `routine-digest-global-${route.digestDate}` ||
@@ -202,7 +201,7 @@ function validateReply(reply) {
       }
     }
   } else {
-    if (typeof reply.body !== "string" || reply.body.length > MAX_COMPOSED_REPLY_LENGTH || CONTROL.test(reply.body)) throw new Error("Stored reply body is invalid");
+    if (typeof reply.body !== "string" || reply.body.length > MAX_REPLY_LENGTH || CONTROL.test(reply.body)) throw new Error("Stored reply body is invalid");
     const attachments = validateAttachmentRecords(reply.attachments ?? []);
     if (!reply.body.trim() && attachments.length === 0) throw new Error("Stored reply has no input");
   }
@@ -264,9 +263,6 @@ export class CodexApprovalStore {
       return { schemaVersion: SCHEMA_VERSION, routes: [], replies: [], nextSequence: 1, routineQueue: [] };
     }
     const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
-    if (parsed?.schemaVersion === 4) {
-      parsed.schemaVersion = SCHEMA_VERSION;
-    }
     delete parsed.sourceTurns;
     return validateState(parsed);
   }
@@ -580,15 +576,17 @@ export class CodexWhatsAppBroker {
     const chatId = jid(this.notificationTarget);
     if (!chatId) return { ok: true, status: "unavailable" };
     return this.transact(now, (state) => {
-      if (!hasSourceRoute(state, originHost, sessionId, turnId)) return { ok: true, status: "stale-source" };
+      const sourceRoute = state.routes.find((route) => route.kind !== "suggestion" && route.informational !== true && route.digestIdentity === undefined &&
+        route.originHost === originHost && route.sessionId === sessionId && route.turnId === turnId);
+      if (!sourceRoute || sourceRoute.expiresAt <= now) return { ok: true, status: "stale-source" };
       const existing = state.routes.find((route) => route.kind === "suggestion" && route.originHost === originHost && route.sessionId === sessionId && route.turnId === turnId && route.predictionSessionId === predictionSessionId && route.predictionTurnId === predictionTurnId);
       if (existing) {
         if (existing.suggestionText !== suggestionText) return { ok: false, status: "prediction-conflict" };
         if (existing.notification.status === "sending" && existing.notification.leaseExpiresAt <= now && existing.notification.sendIntent) {
           existing.notification = { status: "uncertain", uncertainAt: now, attempts: existing.notification.attempts };
-          delete existing.finalText;
           return { ok: false, status: "notification-uncertain", route: routeSummary(existing) };
         }
+        if (existing.notification.status === "uncertain") return { ok: false, status: "notification-uncertain", route: routeSummary(existing) };
         const notificationDeliveryId = reserve(existing, now);
         const pollDeliveryId = existing.notification.status === "sent" ? reserveSuggestionPoll(existing, now) : null;
         return { ok: true, status: existing.consumedAt ? "consumed" : existing.notification.status, created: false, route: routeSummary(existing),
@@ -597,7 +595,7 @@ export class CodexWhatsAppBroker {
       }
       const prefix = "Codex composer suggestion\n\nReply to this message to send the exact suggestion with your additions appended, or choose Send suggestion or Dismiss in the poll below.\n\n";
       const route = { id: crypto.randomUUID(), kind: "suggestion", originHost, sessionId, turnId, predictionSessionId, predictionTurnId, suggestionText, suggestionChatId: chatId,
-        finalText: `${prefix}${suggestionText}`, createdAt: now, expiresAt: now + ROUTE_TTL_MS,
+        finalText: `${prefix}${suggestionText}`, createdAt: now, expiresAt: sourceRoute.expiresAt,
         notification: { status: "ready", attempts: 0 }, suggestionPoll: { status: "ready", attempts: 0 } };
       const notificationDeliveryId = reserve(route, now);
       state.routes.push(route);
@@ -720,7 +718,6 @@ export class CodexWhatsAppBroker {
         if (item.kind === "suggestion" && item.notification.status === "sending" && item.notification.leaseExpiresAt <= now) {
           if (item.notification.sendIntent) {
             item.notification = { status: "uncertain", uncertainAt: now, attempts: item.notification.attempts };
-            delete item.finalText;
           } else item.notification = { status: "ready", attempts: Math.max(0, item.notification.attempts - 1) };
         }
         if (item.kind !== "suggestion" && !item.digestIdentity && item.finalText && item.notification.status === "sending" && item.notification.leaseExpiresAt <= now) {
@@ -784,18 +781,17 @@ export class CodexWhatsAppBroker {
         if (route.kind === "suggestion") route.suggestionMessageDigests = [...new Set([...(route.suggestionMessageDigests ?? []), ...messageIds.map(digest)])];
         const status = input?.partial === true ? "partial" : "sent";
         route.notification = { status, sentAt: now, attempts: route.notification.attempts };
-        if (route.kind !== "suggestion") delete route.finalText;
+        delete route.finalText;
         delete route.activityText;
         return { ok: true, status, route: routeSummary(route) };
       }
       if (route.kind === "suggestion" && input?.uncertain === true) {
         route.notification = { status: "uncertain", uncertainAt: now, attempts: route.notification.attempts };
-        delete route.finalText;
         return { ok: false, status: "notification-uncertain", route: routeSummary(route) };
       }
       if (input?.uncertain === true || route.notification.attempts >= MAX_SEND_ATTEMPTS) {
         route.notification = { status: "exhausted", exhaustedAt: now, attempts: route.notification.attempts };
-        if (route.kind !== "suggestion") delete route.finalText;
+        delete route.finalText;
         delete route.activityText;
       } else {
         route.notification = { status: "failed", failedAt: now, attempts: route.notification.attempts };
@@ -824,6 +820,7 @@ export class CodexWhatsAppBroker {
       if (suggestionRoutes.length) {
         const route = suggestionRoutes[0];
         if (suggestionRoutes.length !== 1 || route.notification.status !== "sent" || route.consumedAt || !hasSourceRoute(state, route.originHost, route.sessionId, route.turnId)) return { result: { ok: true, status: "stale", acknowledgement: "That suggestion is no longer available. Reply in Codex instead." } };
+        if (route.suggestionText.length + 2 + body.length > MAX_REPLY_LENGTH) return { result: { ok: true, status: "suggestion-reply-too-long", acknowledgement: "That suggestion plus your additions exceeds the 8,000-character reply limit. Send the suggestion without additions or shorten your reply." } };
         return { routeId: route.id, suggestion: true };
       }
       const digestRoutes = state.routes.filter((route) => route.digestIdentity && (route.id === route.digestIdentity) && route.messageDigests?.includes(quotedDigest));
