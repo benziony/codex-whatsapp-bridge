@@ -39,6 +39,29 @@ function restorePollIdsFromLedger() {
 }
 function persistPollLedger() { saved = [...pollLedger.values()].map((item) => ({ ...item })); }
 function prunePollLedger() {}
+function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
+  const chatId = normalizeWhatsAppId(key?.remoteJid || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.remoteJid || '');
+  const senderId = normalizeWhatsAppId(
+    key?.participant
+    || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.participant
+    || chatId
+  );
+  const pollId = key?.id
+    || update?.pollUpdates?.[0]?.pollCreationMessageKey?.id
+    || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.id
+    || '';
+  if (!pollId || !recentlySentIds.has(pollId)) return;
+  messageQueue.push({ chatId, senderId, pollId, selectedOptions, aggregation });
+}
+  sock.ev.on('messages.update', async (updates) => {
+    for (const { key, update } of updates || []) {
+      if (!update?.pollUpdates) continue;
+      const pollUpdates = update.pollUpdates;
+      const aggregation = aggregatePollVotes(pollUpdates);
+      const selectedOptions = aggregation.map((item) => item.name);
+      enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+    }
+  });
 app.post('/send', async (req, res) => {
   if (!sock || connectionState !== 'connected') return res.status(503).json({ error: 'Not connected' });
   const { chatId, message, replyTo } = req.body;
@@ -127,10 +150,14 @@ function harness(source, stored = [], send = async (_, payload) => ({ key: { id:
   const routes = new Map();
   const seen = [];
   const cached = [];
+  const messageQueue = [];
+  const events = new Map();
   const sandbox = { app: { post: (route, fn) => routes.set(route, fn), get: (route, fn) => routes.set(route, fn) },
-    saved: stored, sock: { sendMessage: send }, connectionState: 'connected', SEND_READ_RECEIPTS: false,
+    saved: stored, sock: { sendMessage: send, user: { id: 'owner@s.whatsapp.net' }, ev: { on: (name, fn) => events.set(name, fn) } }, connectionState: 'connected', SEND_READ_RECEIPTS: false,
     createHash, Date, Map, Set, String, Number, console,
-    recentlySentIds: { remember: (id) => seen.push(id) },
+    recentlySentIds: { remember: (id) => seen.push(id), has: (id) => id === 'poll-id' },
+    normalizeWhatsAppId: (id) => id, messageQueue,
+    aggregatePollVotes: (updates) => updates.flatMap((item) => (item.vote?.selectedOptions ?? []).map((name) => ({ name }))),
     enqueueSend: (fn) => Promise.resolve().then(fn), setTimeout, clearTimeout,
     rememberSentMessage: (result, payload) => cached.push({ result, payload }), trackSentMessageId: () => {},
     formatOutgoingMessage: (value) => value,
@@ -151,7 +178,9 @@ function harness(source, stored = [], send = async (_, payload) => ({ key: { id:
     routes.get('/health')({}, { json: (result) => { value = JSON.parse(JSON.stringify(result)); } });
     return value;
   };
-  return { request, sendText, saved: () => sandbox.saved, restore: () => vm.runInContext('restorePollIdsFromLedger()', ctx), seen, cached, health };
+  const enqueueVote = (key, update, selectedOptions = ['Approve']) => vm.runInContext('enqueuePollUpdateEvent', ctx)({ key, update, selectedOptions, aggregation: [] });
+  const updateVotes = (updates) => events.get('messages.update')(updates);
+  return { request, sendText, enqueueVote, updateVotes, messageQueue, saved: () => sandbox.saved, restore: () => vm.runInContext('restorePollIdsFromLedger()', ctx), seen, cached, health };
 }
 
 test('guarded transform is idempotent and rejects drift or partial upgrade', () => {
@@ -208,6 +237,36 @@ test('opt-in long text stays one message and rejects oversized or malformed requ
   const ordinary = await h.sendText({ chatId: 'fixture-chat', message: 'b'.repeat(8000) });
   assert.equal(ordinary.status, 200);
   assert.deepEqual(ordinary.value.messageIds, ['text-2', 'text-3']);
+});
+
+test('native update batch keeps each vote with its actual voter and selection', async () => {
+  const input = [{
+    key: { id: 'poll-id', remoteJid: 'group@g.us', participant: 'bot@s.whatsapp.net' },
+    update: { pollUpdates: [
+      { pollUpdateMessageKey: { participant: 'owner@s.whatsapp.net' }, vote: { selectedOptions: ['Approve'] } },
+      { pollUpdateMessageKey: { participant: 'other@s.whatsapp.net' }, vote: { selectedOptions: ['Reject'] } },
+    ] },
+  }];
+  const before = harness(seam);
+  await before.updateVotes(input);
+  assert.equal(before.messageQueue.length, 1);
+  assert.equal(before.messageQueue[0].senderId, 'bot@s.whatsapp.net');
+  const after = harness(upgradeHermesPollLayout(seam).source);
+  await after.updateVotes(input);
+  assert.deepEqual(after.messageQueue.map((event) => [event.senderId, ...event.selectedOptions]), [
+    ['owner@s.whatsapp.net', 'Approve'],
+    ['other@s.whatsapp.net', 'Reject'],
+  ]);
+  assert.equal(after.health().pollVoterIdentity, true);
+});
+
+test('native vote requires a voter key; own fromMe key resolves only to socket identity', () => {
+  const h = harness(upgradeHermesPollLayout(seam).source);
+  const pollKey = { id: 'poll-id', remoteJid: 'group@g.us', participant: 'bot@s.whatsapp.net' };
+  h.enqueueVote(pollKey, { pollUpdates: [{ pollUpdateMessageKey: {}, vote: { selectedOptions: ['Approve'] } }] });
+  h.enqueueVote(pollKey, { pollUpdates: [{ pollUpdateMessageKey: { fromMe: true }, vote: { selectedOptions: ['Approve'] } }] });
+  h.enqueueVote({ ...pollKey, id: 'foreign' }, { pollUpdates: [{ pollUpdateMessageKey: { participant: 'owner@s.whatsapp.net' }, vote: { selectedOptions: ['Approve'] } }] });
+  assert.deepEqual(h.messageQueue.map((event) => event.senderId), ['owner@s.whatsapp.net']);
 });
 
 test('uncertain compact send does not resend; late completion caches creation and persists one poll', async () => {
