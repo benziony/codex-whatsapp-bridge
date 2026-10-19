@@ -65,6 +65,8 @@ For the native vote identity repair, the same guarded upgrader accepts the
 recognized compact seam and adds `poll-voter-identity-v1` plus
 `pollVoterIdentity: true` in `/health`. It reads the voter from each poll update
 key, processes batched updates one voter at a time, and drops votes without a
-usable voter identity. A creation-message participant cannot authorize a vote.
+usable voter identity. Direct-message votes may use the vote key's user
+`remoteJid` when `participant` is absent; a group `remoteJid` never identifies
+its voter. A creation-message participant cannot authorize a vote.
 The repair needs a fresh Hermes bridge process and health readback before vote
 delivery is considered fixed.

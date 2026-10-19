@@ -260,13 +260,14 @@ test('native update batch keeps each vote with its actual voter and selection', 
   assert.equal(after.health().pollVoterIdentity, true);
 });
 
-test('native vote requires a voter key; own fromMe key resolves only to socket identity', () => {
+test('native vote accepts direct-message remote voter, rejects group without participant, and resolves own fromMe identity', () => {
   const h = harness(upgradeHermesPollLayout(seam).source);
   const pollKey = { id: 'poll-id', remoteJid: 'group@g.us', participant: 'bot@s.whatsapp.net' };
-  h.enqueueVote(pollKey, { pollUpdates: [{ pollUpdateMessageKey: {}, vote: { selectedOptions: ['Approve'] } }] });
-  h.enqueueVote(pollKey, { pollUpdates: [{ pollUpdateMessageKey: { fromMe: true }, vote: { selectedOptions: ['Approve'] } }] });
+  h.enqueueVote(pollKey, { pollUpdates: [{ pollUpdateMessageKey: { remoteJid: 'group@g.us' }, vote: { selectedOptions: ['Approve'] } }] });
+  h.enqueueVote({ ...pollKey, remoteJid: 'direct@s.whatsapp.net' }, { pollUpdates: [{ pollUpdateMessageKey: { remoteJid: 'direct@s.whatsapp.net', fromMe: false }, vote: { selectedOptions: ['Approve'] } }] });
+  h.enqueueVote(pollKey, { pollUpdates: [{ pollUpdateMessageKey: { fromMe: true, participant: 'wrong@s.whatsapp.net' }, vote: { selectedOptions: ['Approve'] } }] });
   h.enqueueVote({ ...pollKey, id: 'foreign' }, { pollUpdates: [{ pollUpdateMessageKey: { participant: 'owner@s.whatsapp.net' }, vote: { selectedOptions: ['Approve'] } }] });
-  assert.deepEqual(h.messageQueue.map((event) => event.senderId), ['owner@s.whatsapp.net']);
+  assert.deepEqual(h.messageQueue.map((event) => event.senderId), ['direct@s.whatsapp.net', 'owner@s.whatsapp.net']);
 });
 
 test('uncertain compact send does not resend; late completion caches creation and persists one poll', async () => {
