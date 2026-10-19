@@ -409,6 +409,26 @@ test("WhatsApp sender requires all confirmed chunk IDs", async () => {
   );
 });
 
+test("bounded compact suggestion opts into one exact WhatsApp text message", async () => {
+  const calls = [];
+  const exact = "🟢".repeat(4_000);
+  const deliveryKey = "11111111-1111-4111-8111-111111111111";
+  const sent = await sendWhatsAppNotification({ target: chat, messages: [exact], deliveryKey, singleMessage: true }, {
+    bridgeUrl: "http://127.0.0.1:4567", fetchImpl: async (_url, options) => {
+      calls.push(JSON.parse(options.body));
+      return { ok: true, async json() { return { messageIds: ["WA.exact"] }; } };
+    },
+  });
+  assert.deepEqual(calls, [{ chatId: chat, message: exact, deliveryKey, deliveryOffset: 0, singleMessage: true }]);
+  assert.deepEqual(sent.messageIds, ["WA.exact"]);
+  await assert.rejects(() => sendWhatsAppNotification({ target: chat, messages: [exact + "X"], deliveryKey, singleMessage: true }, { bridgeUrl: "http://127.0.0.1:4567" }), /Single-message notification/);
+  await assert.rejects(() => sendWhatsAppNotification({ target: chat, messages: ["one", "two"], deliveryKey, singleMessage: true }, { bridgeUrl: "http://127.0.0.1:4567" }), /Single-message notification/);
+  const split = await sendWhatsAppNotification({ target: chat, messages: [exact], deliveryKey, singleMessage: true }, {
+    bridgeUrl: "http://127.0.0.1:4567", fetchImpl: async () => ({ ok: true, async json() { return { messageIds: ["WA.first", "WA.second"] }; } }),
+  });
+  assert.equal(split.status, "partial");
+});
+
 test("native WhatsApp polls use a bounded context and deterministic delivery key", async () => {
   const calls = [];
   const sent = await sendWhatsAppPoll({ target: chat, context: "Council approval available\nCase: case_a rev 2", question: "Approve this exact Council revision?", options: ["Approve", "Reject"], selectableCount: 1, deliveryKey: "11111111-1111-4111-8111-111111111111" }, {
@@ -417,6 +437,13 @@ test("native WhatsApp polls use a bounded context and deterministic delivery key
   });
   assert.deepEqual(sent, { ok: true, status: "sent", pollMessageId: "WA.poll-1", messageIds: ["WA.context-1", "WA.poll-1"] });
   assert.deepEqual(calls[0], { url: "http://127.0.0.1:4567/send-poll", body: { chatId: chat, context: "Council approval available\nCase: case_a rev 2", question: "Approve this exact Council revision?", options: ["Approve", "Reject"], selectableCount: 1, deliveryKey: "11111111-1111-4111-8111-111111111111" } });
+  await sendWhatsAppPoll({ target: chat, context: null, question: "Send this suggestion?", options: ["Send suggestion", "Dismiss"], deliveryKey: "11111111-1111-4111-8111-111111111111" }, {
+    bridgeUrl: "http://127.0.0.1:4567", fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), body: JSON.parse(options.body) });
+      return { ok: true, async json() { return { pollMessageId: "WA.poll-2", messageIds: ["WA.poll-2"] }; } };
+    },
+  });
+  assert.deepEqual(calls[1].body, { chatId: chat, context: null, question: "Send this suggestion?", options: ["Send suggestion", "Dismiss"], selectableCount: 1, deliveryKey: "11111111-1111-4111-8111-111111111111" });
 });
 
 test("WhatsApp reactions use the loopback bridge and require explicit confirmation", async () => {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,7 +23,25 @@ function fixture(t) {
   const options = { statePath, allowedSenders: [sender], allowedChats: [chat], notificationTarget: chat, now: () => clock.now };
   const broker = new CodexWhatsAppBroker(options);
   const source = (turnId, createdAt = undefined) => broker.create({ originHost: "regular-mac", sessionId: sourceSession, turnId, finalText: `Source ${turnId}`, ...(createdAt === undefined ? {} : { createdAt }) });
-  const suggest = (turnId, suggestionText = "  exact suggestion\n") => broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId, predictionSessionId: predictionSession, predictionTurnId: `prediction-${turnId}`, suggestionText });
+  // Characterize pre-upgrade routes after they have already been persisted; the new
+  // compact layout has separate coverage below.
+  const legacySuggestion = (input) => {
+    const result = broker.createSuggestion(input);
+    if (!result.created) return result;
+    const state = broker.store.load();
+    const route = state.routes.find((item) => item.id === result.route.id);
+    delete route.suggestionLayout;
+    const prefix = "Codex composer suggestion\n\nReply to this message to send the exact suggestion with your additions appended, or choose Send suggestion or Dismiss in the poll below.\n\n";
+    const preview = route.suggestionText.length > 900 ? `${route.suggestionText.slice(0, 900)}… [preview truncated]` : route.suggestionText;
+    route.suggestionPollContext = `Codex composer suggestion preview:\n${preview}\n\nQuoting the suggestion message sends the exact suggestion with your added text.`;
+    route.finalText = `${prefix}${route.suggestionText}`;
+    route.notification = { status: "sending", deliveryId: crypto.randomUUID(), claimedAt: clock.now, leaseExpiresAt: clock.now + 16 * 60_000, attempts: 1 };
+    route.suggestionPoll = { status: "ready", attempts: 0 };
+    broker.store.save(state);
+    return { ...result, status: "sending", phase: "notification", notificationDeliveryId: route.notification.deliveryId,
+      notification: { target: chat, messages: [route.finalText], deliveryKey: route.id, deliveryOffset: 0 } };
+  };
+  const suggest = (turnId, suggestionText = "  exact suggestion\n") => legacySuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId, predictionSessionId: predictionSession, predictionTurnId: `prediction-${turnId}`, suggestionText });
   const sent = (result, ids) => broker.finishNotification({ routeId: result.route.id, notificationDeliveryId: result.notificationDeliveryId, sent: true, messageIds: ids });
   const pollReady = (result, messageId = "WA.poll") => {
     const suggestionText = broker.store.load().routes.find((route) => route.id === result.route.id).suggestionText;
@@ -32,7 +51,7 @@ function fixture(t) {
     assert.equal(broker.finishSuggestionPoll({ routeId: reserved.route.id, pollDeliveryId: reserved.pollDeliveryId, sent: true, pollMessageId: messageId, messageIds: ["WA.poll-context", messageId] }).status, "sent");
     return reserved.route.id;
   };
-  return { broker, options, statePath, clock, source, suggest, sent, pollReady };
+  return { broker, options, statePath, clock, source, suggest, legacySuggestion, sent, pollReady };
 }
 
 test("suggestion prompt and independent notification/poll phases survive restart with exact IDs and text", (t) => {
@@ -93,11 +112,11 @@ test("existing suggestion routes keep their original poll context across upgrade
 });
 
 test("source turns are scoped to the original Codex session inside one shared WhatsApp group", (t) => {
-  const { broker, options } = fixture(t);
+  const { broker, options, legacySuggestion } = fixture(t);
   const otherSession = "33333333-3333-4333-8333-333333333333";
   const firstSource = broker.create({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-chat-a", finalText: "A" });
   const secondSource = broker.create({ originHost: "regular-mac", sessionId: otherSession, turnId: "turn-chat-b", finalText: "B" });
-  const mkSuggestion = (sessionId, turnId, predictionTurnId, suggestionText) => broker.createSuggestion({ originHost: "regular-mac", sessionId, turnId, predictionSessionId: predictionSession, predictionTurnId, suggestionText });
+  const mkSuggestion = (sessionId, turnId, predictionTurnId, suggestionText) => legacySuggestion({ originHost: "regular-mac", sessionId, turnId, predictionSessionId: predictionSession, predictionTurnId, suggestionText });
   const first = mkSuggestion(sourceSession, firstSource.route.turnId, "prediction-a", "suggestion A");
   const second = mkSuggestion(otherSession, secondSource.route.turnId, "prediction-b", "suggestion B");
   assert.equal(first.status, "sending");
@@ -155,7 +174,7 @@ test("quote wins the same one-time race and preserves attachments through sugges
 });
 
 test("older suggestions retain exact source routing across newer turns while claims remain recoverable", (t) => {
-  const { broker, source, suggest, sent, statePath, clock } = fixture(t);
+  const { broker, source, suggest, legacySuggestion, sent, statePath, clock } = fixture(t);
   assert.equal(suggest("no-source-record", "must not infer a source").status, "stale-source");
   source("turn-old");
   const old = suggest("turn-old", "old prompt");
@@ -175,7 +194,7 @@ test("older suggestions retain exact source routing across newer turns while cla
   assert.equal(retriedPoll.route.turnId, "turn-old");
   broker.beginSuggestionPoll({ routeId: retriedPoll.route.id, pollDeliveryId: retriedPoll.pollDeliveryId });
   broker.finishSuggestionPoll({ routeId: retriedPoll.route.id, pollDeliveryId: retriedPoll.pollDeliveryId, sent: true, pollMessageId: "WA.old-poll", messageIds: ["WA.old-poll"] });
-  const late = broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-old", predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-old-late", suggestionText: "late old prompt" });
+  const late = legacySuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-old", predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-old-late", suggestionText: "late old prompt" });
   assert.equal(late.status, "sending");
   broker.beginNotificationDelivery({ routeId: late.route.id, notificationDeliveryId: late.notificationDeliveryId });
   sent(late, ["WA.late-old-suggestion"]);
@@ -298,4 +317,52 @@ test("a crash after notification send intent becomes uncertain and never resends
   assert.equal(repeated.status, "notification-uncertain");
   assert.equal(repeated.notification, undefined);
   assert.equal(broker.retryNotification({ originHost: "regular-mac" }).status, "empty");
+});
+
+test("compact suggestion layout uses one poll at 255 units and exact text plus poll at 256", (t) => {
+  const { broker, options, source, statePath } = fixture(t);
+  for (const [turnId, exact, expectedPhase] of [
+    ["turn-short", `  ${"🟢".repeat(125)}\n \t`, "poll"],
+    ["turn-long", `  ${"🟢".repeat(125)}\n \tX`, "notification"],
+  ]) {
+    source(turnId);
+    const created = broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId,
+      predictionSessionId: predictionSession, predictionTurnId: `prediction-${turnId}`, suggestionText: exact });
+    assert.equal(created.phase, expectedPhase);
+    assert.equal(created.route.notificationStatus, expectedPhase === "poll" ? "ready" : "sending");
+    const saved = JSON.parse(fs.readFileSync(statePath, "utf8")).routes.find((route) => route.id === created.route.id);
+    assert.equal(saved.suggestionText, exact);
+    assert.equal(exact.length, expectedPhase === "poll" ? 255 : 256);
+    assert.equal(saved.finalText, exact);
+    assert.equal(saved.suggestionLayout, expectedPhase === "poll" ? "compact-short-v1" : "compact-long-v1");
+    assert.equal(new CodexApprovalStore(statePath).load().schemaVersion, 4);
+    if (expectedPhase === "notification") {
+      assert.deepEqual(created.notification.messages, [exact]);
+      assert.equal(created.notification.singleMessage, true);
+      broker.finishNotification({ routeId: created.route.id, notificationDeliveryId: created.notificationDeliveryId,
+        sent: true, messageIds: [`WA.text-${turnId}`] });
+    } else {
+      assert.equal(broker.retryNotification({ originHost: "regular-mac" }).status, "empty");
+    }
+    const reserved = expectedPhase === "poll" ? created : broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId,
+      predictionSessionId: predictionSession, predictionTurnId: `prediction-${turnId}`, suggestionText: exact });
+    assert.equal(reserved.phase, "poll");
+    assert.equal(reserved.poll.context, null);
+    assert.equal(reserved.poll.question, expectedPhase === "poll" ? exact : "Send this suggestion?");
+    assert.deepEqual(reserved.poll.options, ["Send suggestion", "Dismiss"]);
+    broker.beginSuggestionPoll({ routeId: reserved.route.id, pollDeliveryId: reserved.pollDeliveryId });
+    const pollId = `WA.poll-${turnId}`;
+    broker.finishSuggestionPoll({ routeId: reserved.route.id, pollDeliveryId: reserved.pollDeliveryId,
+      sent: true, pollMessageId: pollId, messageIds: [pollId] });
+    const restarted = new CodexWhatsAppBroker(options);
+    assert.equal(restarted.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId,
+      predictionSessionId: predictionSession, predictionTurnId: `prediction-${turnId}`, suggestionText: exact }).phase, undefined);
+    const quoteId = expectedPhase === "poll" ? pollId : `WA.text-${turnId}`;
+    assert.equal(restarted.ingest({ chatId: chat, senderId: otherSender, messageId: `IN.unauth-${turnId}`, quotedMessageId: quoteId, text: "extra" }).status, "ignored");
+    assert.equal(restarted.ingest({ chatId: chat, senderId: sender, messageId: `IN.quote-${turnId}`, quotedMessageId: quoteId, text: "  added 🟡 " }).status, "queued");
+    const claim = restarted.claim({ originHost: "regular-mac" });
+    assert.equal(claim.reply.body, `${exact}\n\n  added 🟡 `);
+    restarted.complete({ originHost: "regular-mac", deliveryId: claim.deliveryId });
+    assert.equal(restarted.ingest({ chatId: chat, senderId: sender, messageId: `IN.repeat-${turnId}`, quotedMessageId: pollId, text: "again" }).status, "stale");
+  }
 });

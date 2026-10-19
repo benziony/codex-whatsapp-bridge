@@ -78,7 +78,7 @@ test("poll retries definite suggestion and native-poll failures without replayin
   ledger.finalizeByRequest({ requestId: "source-turn", threadId: prediction, turnId: "prediction-turn" });
 
   await f.broker("create", { originHost: "fixture-host", sessionId: source, turnId: "source-turn", finalText: "Source answer" });
-  await f.stop(prediction, "prediction-turn", JSON.stringify({ suggestion: "Send exactly once" }));
+  await f.stop(prediction, "prediction-turn", JSON.stringify({ suggestion: "Send exactly once " + "x".repeat(256) }));
   assert.equal(f.calls.length, 2);
   assert.equal(f.calls[1].url, "/send");
   const initial = f.state().routes.find((item) => item.kind === "suggestion");
