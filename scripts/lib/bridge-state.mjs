@@ -97,6 +97,7 @@ function validateRoute(route) {
   if (route.activityText !== undefined) text(route.activityText, "stored activityText", MAX_ACTIVITY_LENGTH, true);
   if (route.kind === "suggestion") {
     text(route.suggestionText, "stored suggestionText", MAX_REPLY_LENGTH, true);
+    if (route.suggestionPollContext !== undefined) text(route.suggestionPollContext, "stored suggestionPollContext", 1_200, true);
     text(route.predictionSessionId, "stored predictionSessionId", 128);
     text(route.predictionTurnId, "stored predictionTurnId", 128);
     if (!jid(route.suggestionChatId)) throw new Error("Stored suggestion chat is invalid");
@@ -594,8 +595,11 @@ export class CodexWhatsAppBroker {
           ...(pollDeliveryId ? { phase: "poll", pollDeliveryId, poll: this.suggestionPollPayload(existing) } : {}) };
       }
       const prefix = "Codex composer suggestion\n\nReply to this message to send the exact suggestion with your additions appended, or choose Send suggestion or Dismiss in the poll below.\n\n";
+      const previewLimit = 900;
+      const preview = suggestionText.length > previewLimit ? `${suggestionText.slice(0, previewLimit)}… [preview truncated]` : suggestionText;
+      const suggestionPollContext = `Codex composer suggestion preview:\n${preview}\n\nQuoting the suggestion message sends the exact suggestion with your added text.`;
       const route = { id: crypto.randomUUID(), kind: "suggestion", originHost, sessionId, turnId, predictionSessionId, predictionTurnId, suggestionText, suggestionChatId: chatId,
-        finalText: `${prefix}${suggestionText}`, createdAt: now, expiresAt: sourceRoute.expiresAt,
+        suggestionPollContext, finalText: `${prefix}${suggestionText}`, createdAt: now, expiresAt: sourceRoute.expiresAt,
         notification: { status: "ready", attempts: 0 }, suggestionPoll: { status: "ready", attempts: 0 } };
       const notificationDeliveryId = reserve(route, now);
       state.routes.push(route);
@@ -604,7 +608,7 @@ export class CodexWhatsAppBroker {
   }
 
   suggestionPollPayload(route) {
-    return { target: route.suggestionChatId, context: "Codex composer suggestion. Quoting the suggestion message sends it with your added text.",
+    return { target: route.suggestionChatId, context: route.suggestionPollContext ?? "Codex composer suggestion. Quoting the suggestion message sends it with your added text.",
       question: "Use this exact Codex suggestion?", options: ["Send suggestion", "Dismiss"], selectableCount: 1, deliveryKey: route.id };
   }
 
@@ -1207,78 +1211,53 @@ export async function sendWhatsAppNotification(notification, { bridgeUrl, fetchI
   const url = new URL(text(bridgeUrl, "WhatsApp bridge URL", 512));
   if (url.protocol !== "http:" || !new Set(["127.0.0.1", "localhost", "[::1]"]).has(url.hostname)) throw new Error("WhatsApp bridge URL must use loopback HTTP");
   url.pathname = "/send";
-  let response;
-  const validateGroups = (value) => {
-    if (!Array.isArray(value) || value.length !== messages.length || value.some((group) => !Array.isArray(group))) return null;
-    return value.map((group) => [...new Set(group.map((item) => validMessageId(item)))]);
-  };
-  try {
-    const body = messages.length === 1
-      ? { chatId: target, message: messages[0], deliveryKey, deliveryOffset }
-      : { chatId: target, messages, deliveryKey, deliveryOffset };
-    response = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
-  } catch (cause) {
-    const error = new Error("WhatsApp notification delivery is uncertain", { cause });
-    error.deliveryUncertain = true;
-    throw error;
-  }
-  if (!response?.ok) {
-    let failure;
-    try { failure = await response.json(); } catch { /* an HTTP rejection before delivery is retryable */ }
-    let groups = null;
-    try { groups = validateGroups(failure?.messageIdGroups); }
-    catch (cause) {
-      const error = new Error("WhatsApp bridge returned inconsistent message groups", { cause });
+  const confirmed = [];
+  const signal = AbortSignal.timeout(timeoutMs);
+  for (let index = 0; index < messages.length; index += 1) {
+    let response;
+    try {
+      response = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chatId: target, message: messages[index], deliveryKey, deliveryOffset: deliveryOffset + new Set(confirmed).size }), signal });
+    } catch (cause) {
+      const error = new Error("WhatsApp notification delivery is uncertain", { cause });
       error.deliveryUncertain = true;
+      if (index > 0) error.activityMessageIds = [...confirmed];
       throw error;
     }
-    if (
-      messages.length === 2 &&
-      failure?.failedMessageIndex === 1 &&
-      failure?.failedUncertain !== true &&
-      groups && groups[1].length === 0
-    ) {
-      const error = new Error("WhatsApp bridge rejected the final notification message");
-      error.activityMessageIds = groups[0];
+    let payload;
+    try { payload = await response?.json(); } catch (cause) {
+      const error = new Error(response?.ok ? "WhatsApp bridge returned an invalid notification result" : "WhatsApp bridge rejected the notification", { cause });
+      if (response?.ok || ![400, 503].includes(response?.status)) error.deliveryUncertain = true;
+      if (index > 0) error.activityMessageIds = [...confirmed];
       throw error;
     }
-    if (Array.isArray(failure?.messageIds) && failure.messageIds.length > 0) {
-      let messageIds;
-      try { messageIds = [...new Set(failure.messageIds.map((item) => validMessageId(item)))]; }
-      catch (cause) {
-        const error = new Error("WhatsApp bridge returned inconsistent partial message IDs", { cause });
-        error.deliveryUncertain = true;
-        throw error;
-      }
-      return { ok: true, status: "partial", messageIds };
+    let ids = [];
+    try {
+      if (Array.isArray(payload?.messageIds)) ids = [...new Set(payload.messageIds.map((item) => validMessageId(item)))];
+      if (payload?.messageId && !ids.includes(validMessageId(payload.messageId))) throw new Error("inconsistent message IDs");
+    } catch (cause) {
+      const error = new Error("WhatsApp bridge returned inconsistent message IDs", { cause });
+      error.deliveryUncertain = true;
+      if (index > 0) error.activityMessageIds = [...confirmed];
+      throw error;
     }
-    throw new Error("WhatsApp bridge rejected the notification");
-  }
-  let payload;
-  try { payload = await response.json(); } catch (cause) {
-    const error = new Error("WhatsApp bridge returned an invalid notification result", { cause });
-    error.deliveryUncertain = true;
-    throw error;
-  }
-  if (!Array.isArray(payload?.messageIds) || payload.messageIds.length === 0) {
-    const error = new Error("WhatsApp bridge did not confirm message IDs");
-    error.deliveryUncertain = true;
-    throw error;
-  }
-  let messageIds;
-  try {
-    messageIds = [...new Set(payload.messageIds.map((item) => validMessageId(item)))];
-    const groups = validateGroups(payload.messageIdGroups);
-    if (messages.length === 2 && (!groups || groups[1].length === 0)) throw new Error("final message was not confirmed");
-    if (payload.messageId && !messageIds.includes(validMessageId(payload.messageId))) {
-      throw new Error("inconsistent message IDs");
+    if (!response?.ok) {
+      if (ids.length) confirmed.push(...ids);
+      if (ids.length && index === messages.length - 1) return { ok: true, status: "partial", messageIds: [...new Set(confirmed)] };
+      const error = new Error("WhatsApp bridge rejected the notification");
+      if (index > 0 || (messages.length > 1 && ids.length > 0)) error.activityMessageIds = [...new Set(confirmed)];
+      else if (ids.length > 0) return { ok: true, status: "partial", messageIds: [...new Set(confirmed)] };
+      if (![400, 503].includes(response?.status)) error.deliveryUncertain = true;
+      throw error;
     }
-  } catch (cause) {
-    const error = new Error("WhatsApp bridge returned inconsistent message IDs", { cause });
-    error.deliveryUncertain = true;
-    throw error;
+    if (ids.length === 0) {
+      const error = new Error("WhatsApp bridge did not confirm message IDs");
+      error.deliveryUncertain = true;
+      if (index > 0) error.activityMessageIds = [...confirmed];
+      throw error;
+    }
+    confirmed.push(...ids);
   }
-  return { ok: true, status: "sent", messageIds };
+  return { ok: true, status: "sent", messageIds: [...new Set(confirmed)] };
 }
 
 export async function sendWhatsAppPoll(poll, { bridgeUrl, fetchImpl = globalThis.fetch, timeoutMs = NOTIFICATION_TIMEOUT_MS } = {}) {

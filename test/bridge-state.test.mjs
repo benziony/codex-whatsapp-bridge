@@ -439,11 +439,14 @@ test("WhatsApp reactions use the loopback bridge and require explicit confirmati
   );
 });
 
-test("WhatsApp sender preserves work-log then final message boundaries", async () => {
+test("stock /send contract delivers work log then final as separate messages and advances by confirmed chunk IDs", async () => {
   const calls = [];
+  let timeoutSignal;
   const fetchImpl = async (url, options) => {
+    timeoutSignal ??= options.signal;
+    assert.equal(options.signal, timeoutSignal);
     calls.push({ url: String(url), body: JSON.parse(options.body) });
-    return { ok: true, async json() { return { messageId: "WA.final", messageIds: ["WA.log", "WA.final"], messageIdGroups: [["WA.log"], ["WA.final"]] }; } };
+    return { ok: true, async json() { return { messageId: calls.length === 1 ? "WA.log-2" : "WA.final", messageIds: calls.length === 1 ? ["WA.log-1", "WA.log-2"] : ["WA.final"] }; } };
   };
   const sent = await sendWhatsAppNotification({
     target: chat,
@@ -451,38 +454,115 @@ test("WhatsApp sender preserves work-log then final message boundaries", async (
     deliveryKey: "11111111-1111-4111-8111-111111111111",
     deliveryOffset: 0,
   }, { bridgeUrl: "http://127.0.0.1:4567", fetchImpl });
-  assert.deepEqual(sent.messageIds, ["WA.log", "WA.final"]);
-  assert.deepEqual(calls[0].body, {
-    chatId: chat,
-    messages: ["labeled work log", "labeled final"],
-    deliveryKey: "11111111-1111-4111-8111-111111111111",
-    deliveryOffset: 0,
-  });
+  assert.deepEqual(sent.messageIds, ["WA.log-1", "WA.log-2", "WA.final"]);
+  assert.deepEqual(calls.map(({ body }) => body), [
+    { chatId: chat, message: "labeled work log", deliveryKey: "11111111-1111-4111-8111-111111111111", deliveryOffset: 0 },
+    { chatId: chat, message: "labeled final", deliveryKey: "11111111-1111-4111-8111-111111111111", deliveryOffset: 2 },
+  ]);
 });
 
-test("a confirmed work log is not resent when the final message is retryable", async () => {
+test("activity and final sends share one total delivery deadline", async () => {
+  let calls = 0;
+  let signal;
+  await assert.rejects(() => sendWhatsAppNotification({ target: chat, messages: ["activity", "final"], deliveryKey: "11111111-1111-4111-8111-111111111111" }, {
+    bridgeUrl: "http://127.0.0.1:4567",
+    timeoutMs: 10,
+    fetchImpl: async (_url, options) => {
+      calls += 1;
+      signal ??= options.signal;
+      assert.equal(options.signal, signal);
+      if (calls === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return { ok: true, async json() { return { messageIds: ["WA.activity"] }; } };
+      }
+      assert.equal(options.signal.aborted, true);
+      throw new Error("request aborted by shared deadline");
+    },
+  }), (error) => error.deliveryUncertain === true && error.activityMessageIds?.[0] === "WA.activity");
+  assert.equal(calls, 2);
+});
+
+test("a confirmed work log is retained when the final message is rejected, then retry sends only the final", async (t) => {
+  const { broker, clock } = fixture(t);
+  const created = broker.create({ originHost: "regular-mac", sessionId: "11111111-1111-4111-8111-111111111111", turnId: "turn-adapter-retry", activityText: "work log", finalText: "final answer" });
+  const calls = [];
   await assert.rejects(
-    () => sendWhatsAppNotification({
-      target: chat,
-      messages: ["labeled work log", "labeled final"],
-      deliveryKey: "11111111-1111-4111-8111-111111111111",
-    }, {
+    async () => {
+      try {
+        await sendWhatsAppNotification(created.notification, {
       bridgeUrl: "http://127.0.0.1:4567",
-      fetchImpl: async () => ({
-        ok: false,
-        async json() {
-          return {
-            error: "final rejected",
-            messageIds: ["WA.log"],
-            messageIdGroups: [["WA.log"], []],
-            failedMessageIndex: 1,
-            failedUncertain: false,
-          };
-        },
-      }),
-    }),
+          fetchImpl: async (url, options) => {
+            calls.push({ url: String(url), body: JSON.parse(options.body) });
+            return calls.length === 1
+              ? { ok: true, async json() { return { messageId: "WA.log", messageIds: ["WA.log"] }; } }
+              : { ok: false, status: 400, async json() { return { error: "final rejected" }; } };
+          },
+        });
+      } catch (error) {
+        broker.finishNotification({ routeId: created.route.id, notificationDeliveryId: created.notificationDeliveryId, sent: false, activityMessageIds: error.activityMessageIds, uncertain: error.deliveryUncertain });
+        throw error;
+      }
+    },
     (error) => error.deliveryUncertain !== true && error.activityMessageIds?.[0] === "WA.log",
   );
+  assert.equal(broker.ingest({ chatId: chat, senderId: sender, messageId: "IN.adapter-log", quotedMessageId: "WA.log", text: "continue" }).status, "queued");
+  clock.now += 60_001;
+  const retry = broker.retryNotification({ originHost: "regular-mac" });
+  assert.deepEqual(retry.notification.messages, ["final answer"]);
+  assert.equal(retry.notification.deliveryOffset, 1);
+  assert.equal(calls.length, 2);
+  const finalCalls = [];
+  await sendWhatsAppNotification(retry.notification, { bridgeUrl: "http://127.0.0.1:4567", fetchImpl: async (_url, options) => { finalCalls.push(JSON.parse(options.body)); return { ok: true, async json() { return { messageId: "WA.final", messageIds: ["WA.final"] }; } }; } });
+  assert.deepEqual(finalCalls, [{ chatId: chat, message: "final answer", deliveryKey: created.route.id, deliveryOffset: 1 }]);
+});
+
+test("a partial activity response cannot complete the notification without its final", async () => {
+  let calls = 0;
+  await assert.rejects(() => sendWhatsAppNotification({ target: chat, messages: ["work log", "final"], deliveryKey: "11111111-1111-4111-8111-111111111111" }, {
+    bridgeUrl: "http://127.0.0.1:4567",
+    fetchImpl: async () => { calls += 1; return { ok: false, status: 503, async json() { return { messageIds: ["WA.activity-chunk"] }; } }; },
+  }), (error) => error.deliveryUncertain !== true && error.activityMessageIds?.[0] === "WA.activity-chunk");
+  assert.equal(calls, 1);
+});
+
+test("confirmed final chunks are recorded as partial delivery and never replayed", async () => {
+  let calls = 0;
+  const sent = await sendWhatsAppNotification({ target: chat, messages: ["work log", "long final"], deliveryKey: "11111111-1111-4111-8111-111111111111" }, {
+    bridgeUrl: "http://127.0.0.1:4567",
+    fetchImpl: async () => {
+      calls += 1;
+      return calls === 1
+        ? { ok: true, async json() { return { messageIds: ["WA.activity"] }; } }
+        : { ok: false, status: 500, async json() { return { messageIds: ["WA.final-chunk-1"] }; } };
+    },
+  });
+  assert.deepEqual(sent, { ok: true, status: "partial", messageIds: ["WA.activity", "WA.final-chunk-1"] });
+  assert.equal(calls, 2);
+});
+
+test("an unparseable unknown server rejection is fenced as uncertain", async () => {
+  await assert.rejects(() => sendWhatsAppNotification({ target: chat, text: "one message", deliveryKey: "11111111-1111-4111-8111-111111111111" }, {
+    bridgeUrl: "http://127.0.0.1:4567",
+    fetchImpl: async () => ({ ok: false, status: 500, async json() { throw new Error("invalid JSON"); } }),
+  }), (error) => error.deliveryUncertain === true);
+});
+
+test("an uncertain final send keeps confirmed activity IDs fenced from replay", async (t) => {
+  const { broker } = fixture(t);
+  const created = broker.create({ originHost: "regular-mac", sessionId: "11111111-1111-4111-8111-111111111111", turnId: "turn-adapter-uncertain", activityText: "work log", finalText: "final answer" });
+  let calls = 0;
+  await assert.rejects(() => sendWhatsAppNotification(created.notification, {
+    bridgeUrl: "http://127.0.0.1:4567",
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) return { ok: true, async json() { return { messageId: "WA.log", messageIds: ["WA.log"] }; } };
+      return { ok: false, status: 500, async json() { return { error: "bridge failure" }; } };
+    },
+  }), (error) => error.deliveryUncertain === true && error.activityMessageIds?.[0] === "WA.log");
+  const result = broker.finishNotification({ routeId: created.route.id, notificationDeliveryId: created.notificationDeliveryId, sent: false, activityMessageIds: ["WA.log"], uncertain: true });
+  assert.equal(result.status, "notification-exhausted");
+  assert.equal(result.route.messageCount, 1);
+  assert.equal(broker.retryNotification({ originHost: "regular-mac" }).status, "empty");
 });
 
 test("broker retains only the failed final after a confirmed work log", async (t) => {
