@@ -1,6 +1,7 @@
 // Exact, fail-closed upgrade of the generic Hermes poll seam. This module has
 // no filesystem or runtime side effects.
 export const COMPACT_POLLS_MARKER = 'compact-polls-v1';
+export const POLL_VOTER_IDENTITY_MARKER = 'poll-voter-identity-v1';
 
 const changes = [
   [
@@ -49,6 +50,29 @@ const changes = [
   ],
 ];
 
+const voterIdentityChanges = [
+  [
+    "const CODEX_WHATSAPP_BRIDGE_CAPABILITIES = 'native-polls-ledger-v1 compact-polls-v1';",
+    "const CODEX_WHATSAPP_BRIDGE_CAPABILITIES = 'native-polls-ledger-v1 compact-polls-v1 poll-voter-identity-v1';",
+  ],
+  [
+    "  const chatId = normalizeWhatsAppId(key?.remoteJid || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.remoteJid || '');\n  const senderId = normalizeWhatsAppId(\n    key?.participant\n    || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.participant\n    || chatId\n  );\n  const pollId = key?.id\n    || update?.pollUpdates?.[0]?.pollCreationMessageKey?.id\n    || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.id\n    || '';",
+    "  const pollUpdates = update?.pollUpdates;\n  // One event must describe one voter's selected options. Mixed batches are\n  // ambiguous and must not be assigned to the first voter.\n  if (!Array.isArray(pollUpdates) || pollUpdates.length !== 1) return;\n  const voterKey = pollUpdates[0]?.pollUpdateMessageKey;\n  const chatId = normalizeWhatsAppId(key?.remoteJid || voterKey?.remoteJid || '');\n  const senderId = normalizeWhatsAppId(voterKey?.fromMe === true ? sock?.user?.id : (voterKey?.participant || voterKey?.remoteJid || ''));\n  // A group remoteJid identifies the chat, not its voter. Only user JIDs\n  // from the vote key (or the linked account for fromMe) may be admitted.\n  if (!chatId || !/@(?:s\\.whatsapp\\.net|lid)$/.test(senderId)) return;\n  const pollId = key?.id || pollUpdates[0]?.pollCreationMessageKey?.id || '';",
+  ],
+  [
+    "  sock.ev.on('messages.update', async (updates) => {\n    for (const { key, update } of updates || []) {\n      if (!update?.pollUpdates) continue;",
+    "  sock.ev.on('messages.update', async (updates) => {\n    for (const { key, update: combinedUpdate } of updates || []) {\n      if (!Array.isArray(combinedUpdate?.pollUpdates)) continue;\n      for (const voteUpdate of combinedUpdate.pollUpdates) {\n        const update = { ...combinedUpdate, pollUpdates: [voteUpdate] };",
+  ],
+  [
+    "      enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });\n    }\n  });",
+    "      enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });\n      }\n    }\n  });",
+  ],
+  [
+    "    compactPolls: true,\n  });\n});",
+    "    compactPolls: true,\n    pollVoterIdentity: true,\n  });\n});",
+  ],
+];
+
 function occurrences(source, snippet) {
   return source.split(snippet).length - 1;
 }
@@ -58,14 +82,30 @@ export function upgradeHermesPollLayout(source) {
     throw new Error('Unrecognized Hermes poll seam');
   }
   const patched = source.includes(COMPACT_POLLS_MARKER);
+  const voterPatched = source.includes(POLL_VOTER_IDENTITY_MARKER);
+  if (voterPatched && !patched) throw new Error('Hermes voter identity marker without compact poll seam');
+  let baseSource = source;
+  if (voterPatched) {
+    for (const [before, after] of voterIdentityChanges) {
+      if (occurrences(baseSource, after) !== 1 || (!after.includes(before) && occurrences(baseSource, before) !== 0)) {
+        throw new Error('Hermes poll voter identity seam differs from the reviewed layout or is partially patched');
+      }
+      baseSource = baseSource.replace(after, before);
+    }
+  }
   for (const [before, after] of changes) {
     const oppositeOverlaps = patched && after.includes(before);
-    if (occurrences(source, patched ? after : before) !== 1 || (!oppositeOverlaps && occurrences(source, patched ? before : after) !== 0)) {
+    if (occurrences(baseSource, patched ? after : before) !== 1 || (!oppositeOverlaps && occurrences(baseSource, patched ? before : after) !== 0)) {
       throw new Error('Hermes poll seam differs from the reviewed layout or is partially patched');
     }
   }
-  if (patched) return { source, status: 'already-patched' };
-  let result = source;
-  for (const [before, after] of changes) result = result.replace(before, after);
-  return { source: result, status: 'upgrade-available' };
+  let result = baseSource;
+  if (!patched) for (const [before, after] of changes) result = result.replace(before, after);
+  for (const [index, [before, after]] of voterIdentityChanges.entries()) {
+    if (occurrences(result, before) !== 1 || occurrences(result, after) !== 0) {
+      throw new Error(`Hermes poll voter identity seam differs from the reviewed layout or is partially patched at anchor ${index}`);
+    }
+  }
+  for (const [before, after] of voterIdentityChanges) result = result.replace(before, after);
+  return { source: voterPatched ? source : result, status: voterPatched ? 'already-patched' : 'upgrade-available' };
 }

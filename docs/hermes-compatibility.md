@@ -60,3 +60,13 @@ gateway must be restarted and its fresh health response checked before a
 caller sends compact polls. Unknown or partially modified source is refused;
 restore the reported backup only after checking its hash and the intended
 active source. This upgrade does not modify the bundled WhatsApp adapter.
+
+For the native vote identity repair, the same guarded upgrader accepts the
+recognized compact seam and adds `poll-voter-identity-v1` plus
+`pollVoterIdentity: true` in `/health`. It reads the voter from each poll update
+key, processes batched updates one voter at a time, and drops votes without a
+usable voter identity. Direct-message votes may use the vote key's user
+`remoteJid` when `participant` is absent; a group `remoteJid` never identifies
+its voter. A creation-message participant cannot authorize a vote.
+The repair needs a fresh Hermes bridge process and health readback before vote
+delivery is considered fixed.
