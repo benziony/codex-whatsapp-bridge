@@ -29,7 +29,9 @@ function makeSuggestion(broker, turnId, suggestionText) {
   assert.equal(source.status, "sending");
   const suggestion = broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId,
     predictionSessionId: predictionSession, predictionTurnId: `prediction-${turnId}`, suggestionText });
-  broker.finishNotification({ routeId: suggestion.route.id, notificationDeliveryId: suggestion.notificationDeliveryId,
+  if (suggestion.phase === "poll") broker.finishSuggestionPoll({ routeId: suggestion.route.id, pollDeliveryId: suggestion.pollDeliveryId,
+    sent: true, pollMessageId: `WA.${turnId}`, messageIds: [`WA.${turnId}`] });
+  else broker.finishNotification({ routeId: suggestion.route.id, notificationDeliveryId: suggestion.notificationDeliveryId,
     sent: true, messageIds: [`WA.${turnId}`] });
   return suggestion;
 }
@@ -56,23 +58,24 @@ test("schema 4 remains unchanged as suggestion metadata advances through sent an
 test("uncertain suggestion keeps old-hook-readable payload and duplicate Stop cannot resend", (t) => {
   const { broker, statePath, clock } = fixture(t);
   const source = broker.create({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-uncertain", finalText: "Source answer" });
+  const body = "possibly sent ".repeat(22);
   const suggestion = broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-uncertain",
-    predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-uncertain", suggestionText: "possibly sent" });
+    predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-uncertain", suggestionText: body });
   broker.beginNotificationDelivery({ routeId: suggestion.route.id, notificationDeliveryId: suggestion.notificationDeliveryId });
   clock.now += 17 * 60 * 1000;
 
   const uncertain = broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-uncertain",
-    predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-uncertain", suggestionText: "possibly sent" });
+    predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-uncertain", suggestionText: body });
   assert.equal(uncertain.status, "notification-uncertain");
   const persisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
   const route = persisted.routes.find((item) => item.id === suggestion.route.id);
   assert.equal(persisted.schemaVersion, 4);
   assert.equal(route.notification.status, "uncertain");
   assert.ok(route.finalText.includes("possibly sent"));
-  assert.equal(route.suggestionText, "possibly sent");
+  assert.equal(route.suggestionText, body);
 
   const duplicate = broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-uncertain",
-    predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-uncertain", suggestionText: "possibly sent" });
+    predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-uncertain", suggestionText: body });
   assert.equal(duplicate.status, "notification-uncertain");
   assert.equal(duplicate.notification, undefined);
   assert.equal(broker.retryNotification({ originHost: "regular-mac" }).status, "empty");

@@ -97,6 +97,9 @@ function validateRoute(route) {
   if (route.activityText !== undefined) text(route.activityText, "stored activityText", MAX_ACTIVITY_LENGTH, true);
   if (route.kind === "suggestion") {
     text(route.suggestionText, "stored suggestionText", MAX_REPLY_LENGTH, true);
+    if (route.suggestionLayout !== undefined && !new Set(["compact-short-v1", "compact-long-v1"]).has(route.suggestionLayout)) throw new Error("Stored suggestion layout is invalid");
+    if (route.suggestionLayout === "compact-short-v1" && (route.suggestionText.length > 255 || !new Set(["ready", "sent", "exhausted"]).has(route.notification.status) || route.notification.attempts !== 0)) throw new Error("Stored compact suggestion is invalid");
+    if (route.suggestionLayout === "compact-long-v1" && route.suggestionText.length <= 255) throw new Error("Stored compact suggestion is invalid");
     if (route.suggestionPollContext !== undefined) text(route.suggestionPollContext, "stored suggestionPollContext", 1_200, true);
     text(route.predictionSessionId, "stored predictionSessionId", 128);
     text(route.predictionTurnId, "stored predictionTurnId", 128);
@@ -424,6 +427,7 @@ function outboundNotification(route, target) {
     messages: [...(route.activityText ? [route.activityText] : []), route.finalText],
     deliveryKey: route.id,
     deliveryOffset: route.activityText ? 0 : (route.messageDigests?.length ?? 0),
+    ...(route.suggestionLayout === "compact-long-v1" ? { singleMessage: true } : {}),
   };
 }
 
@@ -588,26 +592,31 @@ export class CodexWhatsAppBroker {
           return { ok: false, status: "notification-uncertain", route: routeSummary(existing) };
         }
         if (existing.notification.status === "uncertain") return { ok: false, status: "notification-uncertain", route: routeSummary(existing) };
-        const notificationDeliveryId = reserve(existing, now);
-        const pollDeliveryId = existing.notification.status === "sent" ? reserveSuggestionPoll(existing, now) : null;
+        const notificationDeliveryId = existing.suggestionLayout === "compact-short-v1" ? null : reserve(existing, now);
+        const pollDeliveryId = (existing.notification.status === "sent" || existing.suggestionLayout === "compact-short-v1" && existing.notification.status === "ready") ? reserveSuggestionPoll(existing, now) : null;
         return { ok: true, status: existing.consumedAt ? "consumed" : existing.notification.status, created: false, route: routeSummary(existing),
           ...(notificationDeliveryId ? { phase: "notification", notificationDeliveryId, notification: outboundNotification(existing, chatId) } : {}),
           ...(pollDeliveryId ? { phase: "poll", pollDeliveryId, poll: this.suggestionPollPayload(existing) } : {}) };
       }
-      const prefix = "Codex composer suggestion\n\nReply to this message to send the exact suggestion with your additions appended, or choose Send suggestion or Dismiss in the poll below.\n\n";
-      const previewLimit = 900;
-      const preview = suggestionText.length > previewLimit ? `${suggestionText.slice(0, previewLimit)}… [preview truncated]` : suggestionText;
-      const suggestionPollContext = `Codex composer suggestion preview:\n${preview}\n\nQuoting the suggestion message sends the exact suggestion with your added text.`;
+      const compactShort = suggestionText.length <= 255;
       const route = { id: crypto.randomUUID(), kind: "suggestion", originHost, sessionId, turnId, predictionSessionId, predictionTurnId, suggestionText, suggestionChatId: chatId,
-        suggestionPollContext, finalText: `${prefix}${suggestionText}`, createdAt: now, expiresAt: sourceRoute.expiresAt,
+        suggestionLayout: compactShort ? "compact-short-v1" : "compact-long-v1",
+        finalText: suggestionText, createdAt: now, expiresAt: sourceRoute.expiresAt,
         notification: { status: "ready", attempts: 0 }, suggestionPoll: { status: "ready", attempts: 0 } };
-      const notificationDeliveryId = reserve(route, now);
+      const notificationDeliveryId = compactShort ? null : reserve(route, now);
+      const pollDeliveryId = compactShort ? reserveSuggestionPoll(route, now) : null;
       state.routes.push(route);
-      return { ok: true, status: "sending", created: true, route: routeSummary(route), phase: "notification", notificationDeliveryId, notification: outboundNotification(route, chatId) };
+      return compactShort
+        ? { ok: true, status: "ready", created: true, route: routeSummary(route), phase: "poll", pollDeliveryId, poll: this.suggestionPollPayload(route) }
+        : { ok: true, status: "sending", created: true, route: routeSummary(route), phase: "notification", notificationDeliveryId, notification: outboundNotification(route, chatId) };
     });
   }
 
   suggestionPollPayload(route) {
+    if (route.suggestionLayout === "compact-short-v1") return { target: route.suggestionChatId, context: null,
+      question: route.suggestionText, options: ["Send suggestion", "Dismiss"], selectableCount: 1, deliveryKey: route.id };
+    if (route.suggestionLayout === "compact-long-v1") return { target: route.suggestionChatId, context: null,
+      question: "Send this suggestion?", options: ["Send suggestion", "Dismiss"], selectableCount: 1, deliveryKey: route.id };
     return { target: route.suggestionChatId, context: route.suggestionPollContext ?? "Codex composer suggestion. Quoting the suggestion message sends it with your added text.",
       question: "Use this exact Codex suggestion?", options: ["Send suggestion", "Dismiss"], selectableCount: 1, deliveryKey: route.id };
   }
@@ -616,7 +625,7 @@ export class CodexWhatsAppBroker {
     const now = this.now();
     return this.transact(now, (state) => {
       const route = state.routes.find((item) => item.id === input?.routeId && item.kind === "suggestion");
-      if (!route || route.notification.status !== "sent" || route.suggestionPoll.status !== "sending" || route.suggestionPoll.deliveryId !== input?.pollDeliveryId || route.suggestionPoll.leaseExpiresAt <= now) throw new Error("Suggestion poll lease is stale");
+      if (!route || !(route.notification.status === "sent" || route.suggestionLayout === "compact-short-v1" && route.notification.status === "ready") || route.suggestionPoll.status !== "sending" || route.suggestionPoll.deliveryId !== input?.pollDeliveryId || route.suggestionPoll.leaseExpiresAt <= now) throw new Error("Suggestion poll lease is stale");
       return { ok: true, status: "send-intent", route: routeSummary(route), poll: this.suggestionPollPayload(route) };
     });
   }
@@ -631,6 +640,13 @@ export class CodexWhatsAppBroker {
       if (input?.sent === true && pollMessageId && messageIds.includes(pollMessageId)) {
         route.suggestionPoll = { status: "sent", sentAt: now, attempts: route.suggestionPoll.attempts, messageIdDigest: digest(pollMessageId) };
         route.messageDigests = [...new Set([...(route.messageDigests ?? []), ...messageIds.map(digest)])];
+        if (route.suggestionLayout?.startsWith("compact-")) {
+          route.suggestionMessageDigests = [...new Set([...(route.suggestionMessageDigests ?? []), digest(pollMessageId)])];
+        }
+        if (route.suggestionLayout === "compact-short-v1") {
+          route.notification = { status: "sent", sentAt: now, attempts: 0 };
+          delete route.finalText;
+        }
         return { ok: true, status: "sent", route: routeSummary(route) };
       }
       const uncertain = input?.uncertain === true;
@@ -745,14 +761,14 @@ export class CodexWhatsAppBroker {
         if (!sourceExists && suggestion.notification.status === "sent" && suggestion.suggestionPoll.status !== "sent") {
           suggestion.suggestionPoll = { status: "exhausted", exhaustedAt: now, attempts: suggestion.suggestionPoll.attempts };
         }
-        if (sourceExists && suggestion.finalText && ["ready", "failed"].includes(suggestion.notification.status) &&
+        if (sourceExists && suggestion.suggestionLayout !== "compact-short-v1" && suggestion.finalText && ["ready", "failed"].includes(suggestion.notification.status) &&
             suggestion.notification.attempts < MAX_SEND_ATTEMPTS && (suggestion.notification.status === "ready" || suggestion.notification.failedAt + RETRY_DELAY_MS <= now)) {
           const notificationDeliveryId = reserve(suggestion, now);
           if (notificationDeliveryId) return { ok: true, status: "sending-suggestion", phase: "suggestion-notification", route: routeSummary(suggestion), notificationDeliveryId, notification: outboundNotification(suggestion, suggestion.suggestionChatId) };
         }
       }
       for (const suggestion of suggestions) {
-        if (suggestion.notification.status !== "sent" || suggestion.consumedAt || !hasSourceRoute(state, suggestion.originHost, suggestion.sessionId, suggestion.turnId)) continue;
+        if (!(suggestion.notification.status === "sent" || suggestion.suggestionLayout === "compact-short-v1" && suggestion.notification.status === "ready") || suggestion.consumedAt || !hasSourceRoute(state, suggestion.originHost, suggestion.sessionId, suggestion.turnId)) continue;
         const poll = suggestion.suggestionPoll;
         const retryable = poll.status === "ready" || poll.status === "uncertain" || poll.status === "sending" && poll.leaseExpiresAt <= now || poll.status === "failed" && poll.failedAt + RETRY_DELAY_MS <= now;
         if (!retryable) continue;
@@ -1205,6 +1221,8 @@ export async function sendWhatsAppNotification(notification, { bridgeUrl, fetchI
     ? notification.messages.map((item, index) => text(item, `notification message ${index + 1}`, MAX_FINAL_LENGTH, true))
     : [text(notification.text, "notification text", MAX_FINAL_LENGTH, true)];
   if (messages.length < 1 || messages.length > 2) throw new Error("Notification messages are invalid");
+  const singleMessage = notification.singleMessage === true;
+  if (notification.singleMessage !== undefined && notification.singleMessage !== true || singleMessage && (messages.length !== 1 || messages[0].length > MAX_REPLY_LENGTH)) throw new Error("Single-message notification is invalid");
   const deliveryKey = text(notification.deliveryKey, "notification delivery key", 64);
   const deliveryOffset = notification.deliveryOffset ?? 0;
   if (!Number.isSafeInteger(deliveryOffset) || deliveryOffset < 0 || deliveryOffset > 1_000) throw new Error("Notification delivery offset is invalid");
@@ -1216,7 +1234,7 @@ export async function sendWhatsAppNotification(notification, { bridgeUrl, fetchI
   for (let index = 0; index < messages.length; index += 1) {
     let response;
     try {
-      response = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chatId: target, message: messages[index], deliveryKey, deliveryOffset: deliveryOffset + new Set(confirmed).size }), signal });
+      response = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chatId: target, message: messages[index], deliveryKey, deliveryOffset: deliveryOffset + new Set(confirmed).size, ...(singleMessage ? { singleMessage: true } : {}) }), signal });
     } catch (cause) {
       const error = new Error("WhatsApp notification delivery is uncertain", { cause });
       error.deliveryUncertain = true;
@@ -1255,6 +1273,7 @@ export async function sendWhatsAppNotification(notification, { bridgeUrl, fetchI
       if (index > 0) error.activityMessageIds = [...confirmed];
       throw error;
     }
+    if (singleMessage && ids.length !== 1) return { ok: true, status: "partial", messageIds: ids };
     confirmed.push(...ids);
   }
   return { ok: true, status: "sent", messageIds: [...new Set(confirmed)] };
@@ -1264,7 +1283,7 @@ export async function sendWhatsAppPoll(poll, { bridgeUrl, fetchImpl = globalThis
   if (!poll || typeof poll !== "object") throw new Error("Poll is invalid");
   const target = text(poll.target, "poll target", 192);
   const question = text(poll.question, "poll question", 500, true);
-  const context = text(poll.context, "poll context", 1_200, true);
+  const context = poll.context === null ? null : text(poll.context, "poll context", 1_200, true);
   const options = Array.isArray(poll.options) ? poll.options.map((item, index) => text(item, `poll option ${index + 1}`, 100)) : [];
   if (options.length < 2 || options.length > 12 || new Set(options).size !== options.length) throw new Error("Poll options are invalid");
   const selectableCount = poll.selectableCount ?? 1;

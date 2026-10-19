@@ -90,28 +90,35 @@ for await(const line of readline.createInterface({input:process.stdin})) {
 
 for (const desktopOwned of [false, true]) test(`actual third-message approval and quoted additions survive source advancement (desktop owned: ${desktopOwned})`, async t => {
   const f = await fixture(t, { desktopOwned });
-  for (const mode of ['approve', 'quote']) {
+  for (const mode of ['approve-short', 'quote-short', 'approve-long', 'quote-long-poll', 'quote-long-text']) {
+    const long = mode.includes('long');
+    const quote = mode.startsWith('quote');
+    const exact = mode === 'approve-long' ? 'L'.repeat(8_000) : long ? `Exact suggestion\n  ${'interior spaces '.repeat(20).trimEnd()}` : 'Exact suggestion\n  interior spaces';
     const sourceTurn = `source-${mode}`, predictionTurn = `prediction-${mode}`;
     await f.stop(source, sourceTurn, 'Completed source answer');
     f.bind(sourceTurn, predictionTurn);
     const before = f.calls.length;
-    await f.stop(prediction, predictionTurn, JSON.stringify({ suggestion: '  Exact suggestion\n  interior spaces  ' }));
-    assert.equal(f.calls.length, before + 2);
-    const [message, poll] = f.calls.slice(before);
-    assert.equal(message.url, '/send'); assert.equal(poll.url, '/send-poll');
+    await f.stop(prediction, predictionTurn, JSON.stringify({ suggestion: `  ${exact}  ` }));
+    assert.equal(f.calls.length, before + (long ? 2 : 1));
+    const messages = f.calls.slice(before);
+    const poll = messages.at(-1);
+    assert.equal(poll.url, '/send-poll');
+    assert.equal(poll.body.context, null);
+    assert.equal(poll.body.question, long ? 'Send this suggestion?' : exact);
+    if (long) { assert.equal(messages[0].url, '/send'); assert.equal(messages[0].body.message, exact); assert.equal(messages[0].body.singleMessage, true); }
     assert.deepEqual(poll.body.options, ['Send suggestion', 'Dismiss']);
     const route = f.state().routes.find(x => x.predictionTurnId === predictionTurn);
     assert.equal(route.sessionId, source); assert.equal(route.turnId, sourceTurn);
-    assert.equal(route.suggestionText, 'Exact suggestion\n  interior spaces');
+    assert.equal(route.suggestionText, exact);
     await f.stop(source, `advanced-${mode}`, 'The original chat has advanced');
-    const submitted = mode === 'approve'
+    const submitted = !quote
       ? await f.broker('suggestion-poll-vote', { chatId: chat, senderId: sender, messageId: `IN.${mode}`, pollMessageId: poll.id, selectedOptions: ['Send suggestion'] })
-      : await f.broker('ingest', { chatId: chat, senderId: sender, messageId: `IN.${mode}`, quotedMessageId: message.id, text: '  Added detail\nkeep this  ' });
+      : await f.broker('ingest', { chatId: chat, senderId: sender, messageId: `IN.${mode}`, quotedMessageId: mode === 'quote-long-text' ? messages[0].id : poll.id, text: '  Added detail\nkeep this  ' });
     assert.equal(submitted.status, 'queued');
     const claimed = await f.broker('claim', { originHost: 'fixture-host' });
     assert.equal(claimed.reply.sessionId, source);
     assert.equal(claimed.reply.turnId, sourceTurn);
-    assert.equal(claimed.reply.body, 'Exact suggestion\n  interior spaces' + (mode === 'quote' ? '\n\n  Added detail\nkeep this  ' : ''));
+    assert.equal(claimed.reply.body, exact + (quote ? '\n\n  Added detail\nkeep this  ' : ''));
     await f.broker('release', { originHost: 'fixture-host', deliveryId: claimed.deliveryId });
     await f.deliver();
     const started = f.starts().at(-1);
@@ -125,9 +132,9 @@ for (const desktopOwned of [false, true]) test(`actual third-message approval an
     assert.equal(f.state().replies.find(x => x.id === claimed.reply.id).status, 'completed');
     assert.ok(f.calls.some(x => x.url === '/send' && JSON.stringify(x.body).includes('Fixture response returned to WhatsApp')));
   }
-  assert.equal(f.starts().length, 2);
+  assert.equal(f.starts().length, 5);
   await f.deliver();
-  assert.equal(f.starts().length, 2, 'completed approval is never queued twice');
+  assert.equal(f.starts().length, 5, 'completed approval is never queued twice');
 });
 
 test('known abstained or malformed predictions are suppressed while ordinary suggestion JSON stays an answer', async t => {
