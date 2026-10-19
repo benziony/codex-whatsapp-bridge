@@ -265,11 +265,17 @@ export function routineCandidateForTurn({ task, transcriptText, finalText, finge
   };
 }
 
+function isInternalEmptySuggestionsEnvelope(value) {
+  const parsed = parseJson(String(value).trim());
+  return parsed.ok && parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value) &&
+    Object.keys(parsed.value).length === 1 && Array.isArray(parsed.value.suggestions) && parsed.value.suggestions.length === 0;
+}
+
 export function isInternalSuggestionsEnvelope(value) {
   const parsed = parseJson(String(value).trim());
   if (!parsed.ok || !parsed.value || typeof parsed.value !== "object" || Array.isArray(parsed.value)) return false;
   const suggestions = parsed.value.suggestions;
-  if (Array.isArray(suggestions) && suggestions.length === 0 && Object.keys(parsed.value).length === 1) return true;
+  if (isInternalEmptySuggestionsEnvelope(value)) return true;
   return Array.isArray(suggestions) && suggestions.length > 0 && suggestions.every((suggestion) =>
     suggestion && typeof suggestion === "object" && !Array.isArray(suggestion) &&
     typeof suggestion.title === "string" && typeof suggestion.description === "string" &&
@@ -341,7 +347,7 @@ export function turnFromStopPayload(payload, transcriptReader = readTail, sessio
     ? normalized.lastAssistantMessage
     : persistedFinal;
   if (!finalText.trim()) return { status: "no-assistant-message" };
-  if (!allowInternal && isInternalSelectionEnvelope(finalText) && !sessionFinder(normalized.sessionId)) return { status: "ignored-internal" };
+  if (!allowInternal && (isInternalEmptySuggestionsEnvelope(finalText) || (isInternalSelectionEnvelope(finalText) && !sessionFinder(normalized.sessionId)))) return { status: "ignored-internal" };
   return {
     status: "ready",
     sessionId: normalized.sessionId,

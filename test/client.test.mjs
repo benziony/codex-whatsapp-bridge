@@ -234,6 +234,8 @@ test("hidden Codex suggestion envelopes are not mirrored to WhatsApp", () => {
   assert.equal(isInternalSuggestionsEnvelope('{"suggestions":[],"note":"ordinary JSON"}'), false);
   assert.equal(isInternalSuggestionsEnvelope('{"ordinary":[]}'), false);
   assert.equal(turnFromStopPayload({ session_id: sessionId, turn_id: "turn", last_assistant_message: '{"suggestions":[]}' }, undefined, () => false).status, "ignored-internal");
+  assert.equal(turnFromStopPayload({ session_id: sessionId, turn_id: "turn", last_assistant_message: '{"suggestions":[]}' }, undefined, () => true).status, "ignored-internal");
+  assert.equal(turnFromStopPayload({ session_id: sessionId, turn_id: "turn", last_assistant_message: '{"suggestions":[],"note":"ordinary JSON"}' }, undefined, () => true).status, "ready");
   assert.equal(turnFromStopPayload({ session_id: sessionId, turn_id: "turn", last_assistant_message: suggestions }, undefined, () => false).status, "ignored-internal");
   assert.equal(turnFromStopPayload({ session_id: sessionId, turn_id: "turn", transcript_path: "/transcript", last_assistant_message: suggestions }, () => transcript, () => false).status, "ignored-internal");
   assert.equal(turnFromStopPayload({ session_id: sessionId, turn_id: "turn", last_assistant_message: suggestions }, undefined, () => true).status, "ready");
