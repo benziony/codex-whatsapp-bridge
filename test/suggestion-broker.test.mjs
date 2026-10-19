@@ -64,6 +64,34 @@ test("suggestion prompt and independent notification/poll phases survive restart
   assert.equal(pollRouteId, created.route.id);
 });
 
+test("suggestion poll previews bounded content while stored and quoted suggestion text stays exact", (t) => {
+  const { broker, source, suggest, sent } = fixture(t);
+  source("turn-preview");
+  const exactText = "Distinctive opening.\n" + "suggestion body ".repeat(100);
+  const created = suggest("turn-preview", exactText);
+  broker.finishNotification({ routeId: created.route.id, notificationDeliveryId: created.notificationDeliveryId, sent: true, messageIds: ["WA.suggestion"] });
+  const poll = broker.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-preview", predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-preview", suggestionText: exactText });
+  assert.equal(poll.phase, "poll");
+  assert.ok(poll.poll.context.includes("Distinctive opening."));
+  assert.ok(poll.poll.context.includes("[preview truncated]"));
+  assert.ok(poll.poll.context.length <= 1_200);
+  assert.equal(broker.store.load().routes.find((route) => route.id === created.route.id).suggestionText, exactText);
+  assert.equal(created.notification.messages[0].endsWith(exactText), true);
+});
+
+test("existing suggestion routes keep their original poll context across upgrade", (t) => {
+  const { broker, options, source, suggest } = fixture(t);
+  source("turn-legacy-context");
+  const created = suggest("turn-legacy-context", "legacy exact suggestion");
+  broker.finishNotification({ routeId: created.route.id, notificationDeliveryId: created.notificationDeliveryId, sent: true, messageIds: ["WA.legacy-suggestion"] });
+  const state = broker.store.load();
+  delete state.routes.find((route) => route.id === created.route.id).suggestionPollContext;
+  broker.store.save(state);
+  const upgraded = new CodexWhatsAppBroker(options);
+  const poll = upgraded.createSuggestion({ originHost: "regular-mac", sessionId: sourceSession, turnId: "turn-legacy-context", predictionSessionId: predictionSession, predictionTurnId: "prediction-turn-legacy-context", suggestionText: "legacy exact suggestion" });
+  assert.equal(poll.poll.context, "Codex composer suggestion. Quoting the suggestion message sends it with your added text.");
+});
+
 test("source turns are scoped to the original Codex session inside one shared WhatsApp group", (t) => {
   const { broker, options } = fixture(t);
   const otherSession = "33333333-3333-4333-8333-333333333333";
